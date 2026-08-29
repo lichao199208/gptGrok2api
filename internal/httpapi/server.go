@@ -131,6 +131,7 @@ func New(cfg config.Config) *Server {
 		registerRuntime:    registerruntime.NewRuntime(),
 	}
 	server.openAIChat = provider.NewOpenAIChat(server.openAIImage)
+	server.accountPool.SetInvalidCallback(server.maybeAutoRemoveInvalidAccount)
 	server.loadEditableFileTasks()
 	server.chatProvider.SetProxyManager(proxyManager)
 	server.consoleProvider.SetProxyManager(proxyManager)
@@ -152,6 +153,28 @@ func New(cfg config.Config) *Server {
 		go server.openAISurvivalScheduler()
 	}
 	return server
+}
+
+// maybeAutoRemoveInvalidAccount removes browser/session accounts only after a
+// provider explicitly rejects their credential. OAuth accounts with a refresh
+// token remain available for the normal AT refresh flow, and the setting is
+// checked on every event so changes take effect without restarting the server.
+func (s *Server) maybeAutoRemoveInvalidAccount(account accounts.Account) {
+	if strings.TrimSpace(account.Token) == "" || strings.TrimSpace(stringValue(account.Fields["refresh_token"])) != "" {
+		return
+	}
+	settings, err := s.store.Config()
+	if err != nil || !boolValue(settings["auto_remove_invalid_accounts"], false) {
+		return
+	}
+	removed, _, err := s.store.DeleteAccounts([]string{account.Token})
+	if err != nil {
+		log.Printf("auto remove invalid account failed: %v", err)
+		return
+	}
+	if removed > 0 {
+		log.Printf("auto removed invalid account %s", accountPublicRef(account.Fields))
+	}
 }
 
 func (s *Server) Handler() http.Handler {

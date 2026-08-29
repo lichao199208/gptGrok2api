@@ -31,11 +31,21 @@ type Lease struct {
 
 type Pool struct {
 	repository *store.Store
+	onInvalid  func(Account)
 	mu         sync.Mutex
 	next       uint64
 	inflight   map[string]int
 	cooldowns  map[string]time.Time
 	failures   map[string]int
+}
+
+// SetInvalidCallback registers a callback for definitive credential failures.
+// The callback is invoked after account state has been persisted and is kept
+// outside the pool package so the HTTP layer can apply its configured policy.
+func (p *Pool) SetInvalidCallback(callback func(Account)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onInvalid = callback
 }
 
 func New(repository *store.Store) *Pool {
@@ -158,6 +168,14 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 		updates["last_error_message"] = truncate(err.Error(), 300)
 	}
 	_, _, _ = p.repository.UpdateAccount(account.Token, updates)
+	if status == 401 || status == 403 {
+		p.mu.Lock()
+		callback := p.onInvalid
+		p.mu.Unlock()
+		if callback != nil {
+			callback(account)
+		}
+	}
 }
 
 func retryAfterDuration(err error) time.Duration {

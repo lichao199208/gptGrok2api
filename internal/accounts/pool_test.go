@@ -57,3 +57,28 @@ func TestPoolFeedbackHonorsUpstreamRetryWindow(t *testing.T) {
 		t.Fatalf("expected persisted cooldown_until, got %#v", items)
 	}
 }
+
+func TestPoolFeedbackInvokesInvalidCallbackOnlyForAuthFailures(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "pool": "basic", "enabled": true, "status": "正常"}}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(repository)
+	called := 0
+	p.SetInvalidCallback(func(account Account) {
+		called++
+		if account.Token != "one" {
+			t.Errorf("unexpected callback account: %#v", account)
+		}
+	})
+	account := Account{Token: "one", Pool: "basic", Fields: map[string]any{"email": "one@example.test"}}
+	p.Feedback(account, 502, errors.New("upstream error"))
+	if called != 0 {
+		t.Fatalf("temporary upstream error invoked invalid callback %d times", called)
+	}
+	p.Feedback(account, 401, errors.New("unauthorized"))
+	if called != 1 {
+		t.Fatalf("expected one invalid callback, got %d", called)
+	}
+}
