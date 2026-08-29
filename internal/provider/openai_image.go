@@ -188,6 +188,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	results := make([]ImageResult, 0, len(fileIDs))
 	seen := map[string]bool{}
 	inputFileIDs := map[string]bool{}
+	var lastDownloadErr error
 	for _, ref := range references {
 		if ref.FileID != "" {
 			inputFileIDs[ref.FileID] = true
@@ -204,7 +205,8 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		downloadStarted := time.Now()
 		raw, mime, err := o.downloadFile(ctx, account, fileID)
 		if err != nil {
-			return nil, err
+			lastDownloadErr = err
+			continue
 		}
 		notifyOpenAIImageStage(ctx, "download_ms", downloadStarted)
 		results = append(results, ImageResult{
@@ -216,6 +218,9 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		notifyOpenAIImageStage(ctx, "total_ms", inputStarted)
 	}
 	if len(results) == 0 {
+		if lastDownloadErr != nil {
+			return nil, lastDownloadErr
+		}
 		return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 	}
 	return results, nil

@@ -104,6 +104,84 @@ func TestOpenAIImageGenerationFlowConversationIDVariant(t *testing.T) {
 	}
 }
 
+func TestOpenAIImageGenerationKeepsDownloadableResultWhenAnotherFileHasNoURL(t *testing.T) {
+	goodFileID := "file_000000001234567890abcdef12345678"
+	staleFileID := "file_000000009999999999abcdef12345678"
+	pngBytes := onePixelPNG(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-mixed\",\"message\":{\"content\":{\"parts\":[\"file-service://" + goodFileID + "\",\"file-service://" + staleFileID + "\"]}}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/files/" + goodFileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
+		case "/backend-api/files/" + staleFileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	account := accounts.Account{Token: "jwt.header.payload", Fields: map[string]any{"source_type": "chatgpt_web"}}
+	results, err := client.Generate(context.Background(), account, "一只猫", "gpt-image-2", "1024x1024", "auto", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Base64 == "" {
+		t.Fatalf("expected one downloadable image, got %#v", results)
+	}
+}
+
+func TestOpenAIImageGenerationFailsWhenEveryFileHasNoURL(t *testing.T) {
+	fileID := "file_000000009999999999abcdef12345678"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-stale\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/files/" + fileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	account := accounts.Account{Token: "jwt.header.payload", Fields: map[string]any{"source_type": "chatgpt_web"}}
+	_, err := client.Generate(context.Background(), account, "一只猫", "gpt-image-2", "1024x1024", "auto", nil)
+	if err == nil || !strings.Contains(err.Error(), "download returned no URL") {
+		t.Fatalf("expected no URL error, got %v", err)
+	}
+}
+
 func TestNormalizeOpenAIImageSize(t *testing.T) {
 	tests := map[string]string{
 		"1024x1365": "1024x1360",
