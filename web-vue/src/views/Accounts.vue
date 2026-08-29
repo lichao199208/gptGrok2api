@@ -507,11 +507,39 @@
                     </label>
                     <label class="text-xs">
                       <span class="ui-field-label">账户密码</span>
-                      <Input v-model="form.login_password" type="password" block autocomplete="new-password" placeholder="没有则留空" />
+                      <div class="flex gap-2">
+                        <Input v-model="form.login_password" type="password" block autocomplete="new-password" placeholder="没有则留空" />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          root-class="shrink-0"
+                          :disabled="!form.login_password"
+                          title="复制账户密码"
+                          @click="copyCredential(form.login_password, '账户密码')"
+                        >
+                          <Icon icon="lucide:copy" class="h-3.5 w-3.5" />
+                          复制
+                        </Button>
+                      </div>
                     </label>
                     <label class="text-xs">
                       <span class="ui-field-label">2FA Secret</span>
-                      <Input v-model="form.two_factor_secret" type="password" block autocomplete="off" placeholder="没有则留空" />
+                      <div class="flex gap-2">
+                        <Input v-model="form.two_factor_secret" type="password" block autocomplete="off" placeholder="没有则留空" />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          root-class="shrink-0"
+                          :disabled="!form.two_factor_secret"
+                          title="复制 2FA Secret"
+                          @click="copyCredential(form.two_factor_secret, '2FA Secret')"
+                        >
+                          <Icon icon="lucide:copy" class="h-3.5 w-3.5" />
+                          复制
+                        </Button>
+                      </div>
                     </label>
                   </div>
                   <label class="mt-2.5 block text-xs">
@@ -1022,6 +1050,17 @@ defineOptions({ name: 'Accounts' })
 const RemoteAccountImportPanel = defineAsyncComponent(() => import('@/components/ai/RemoteAccountImportPanel.vue'))
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
+
+async function copyCredential(value: string, label: string) {
+  const text = String(value || '').trim()
+  if (!text) return
+  try {
+    await navigator.clipboard.writeText(text)
+    toast.success(`${label}已复制`)
+  } catch {
+    toast.error(`${label}复制失败`)
+  }
+}
 
 const {
   loading,
