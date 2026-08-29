@@ -508,10 +508,24 @@ func (s *Server) accountCleanup(w http.ResponseWriter, r *http.Request) {
 	}
 	accounts, _ := s.store.AccountList()
 	candidates := []string{}
+	invalidCandidates := 0
+	limitedCandidates := 0
 	for _, account := range accounts {
 		category := accountStatusCategory(account)
-		if (removeInvalid && category == "abnormal") || (removeLimited && category == "limited") {
+		// Only remove an abnormal account when the upstream has explicitly
+		// rejected its credential (or marked the access token expired) and no
+		// refresh token is available. Transient upstream errors must not delete
+		// an otherwise recoverable account.
+		invalid := removeInvalid && accountAutoRemoveInvalid(account)
+		limited := removeLimited && category == "limited"
+		if invalid || limited {
 			candidates = append(candidates, accountToken(account))
+			if invalid {
+				invalidCandidates++
+			}
+			if limited {
+				limitedCandidates++
+			}
 		}
 	}
 	dryRun := strings.HasSuffix(r.URL.Path, "/preview")
@@ -519,7 +533,21 @@ func (s *Server) accountCleanup(w http.ResponseWriter, r *http.Request) {
 	if !dryRun {
 		removed, _, _ = s.store.DeleteAccounts(candidates)
 	}
-	writeJSON(w, 200, map[string]any{"dry_run": dryRun, "checked": len(accounts), "candidates": len(candidates), "removed": removed, "remove_invalid": removeInvalid, "remove_rate_limited": removeLimited})
+	total := len(candidates)
+	if !dryRun {
+		total = removed
+	}
+	writeJSON(w, 200, map[string]any{
+		"dry_run":             dryRun,
+		"checked":             len(accounts),
+		"candidates":          len(candidates),
+		"removed":             removed,
+		"total_removed":       total,
+		"invalid":             invalidCandidates,
+		"rate_limited":        limitedCandidates,
+		"remove_invalid":      removeInvalid,
+		"remove_rate_limited": removeLimited,
+	})
 }
 
 func (s *Server) imageTasksAPI(w http.ResponseWriter, r *http.Request) {

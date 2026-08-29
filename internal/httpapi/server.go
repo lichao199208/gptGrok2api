@@ -1725,7 +1725,7 @@ func normalizeJSONBytes(raw []byte, contentEncoding string) ([]byte, bool) {
 	if encoding == "gzip" || encoding == "x-gzip" || isGzip {
 		reader, err := gzip.NewReader(bytes.NewReader(raw))
 		if err == nil {
-		decompressed, readErr := io.ReadAll(io.LimitReader(reader, maxJSONBodyBytes))
+			decompressed, readErr := io.ReadAll(io.LimitReader(reader, maxJSONBodyBytes))
 			_ = reader.Close()
 			if readErr != nil {
 				return nil, false
@@ -1823,6 +1823,31 @@ func accountStatusCategory(account map[string]any) string {
 		return "abnormal"
 	}
 	return "normal"
+}
+
+// accountAutoRemoveInvalid reports whether an abnormal account is definitely
+// unrecoverable by the automated token refresh path. An account with a
+// refresh token is retained so it can still be rotated, while browser/session
+// accounts with an expired or explicitly rejected access token are removable.
+func accountAutoRemoveInvalid(account map[string]any) bool {
+	if accountStatusCategory(account) != "abnormal" {
+		return false
+	}
+	if strings.TrimSpace(stringValue(account["refresh_token"])) != "" {
+		return false
+	}
+
+	status := strings.ToLower(strings.TrimSpace(stringValue(account["status"])))
+	reason := strings.ToLower(strings.TrimSpace(stringValue(account["status_reason_code"])))
+	errorKind := strings.ToLower(strings.TrimSpace(stringValue(account["last_error_kind"])))
+	errorStatus := intValue(account["last_error_status"])
+	if reason == "auth_invalid" || reason == "account_invalid" {
+		return true
+	}
+	if status == "invalid" || status == "expired" || status == "unauthorized" {
+		return true
+	}
+	return errorKind == "auth_invalid" && (errorStatus == http.StatusUnauthorized || errorStatus == http.StatusForbidden)
 }
 
 func accountStatusMatches(account map[string]any, filter string) bool {

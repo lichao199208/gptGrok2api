@@ -116,3 +116,34 @@ func TestAccountStatusCategoryIgnoresClearedMarkers(t *testing.T) {
 		t.Fatalf("expected healthy account, got %q", category)
 	}
 }
+
+func TestAccountAutoRemoveInvalidRequiresDefinitiveExpiredToken(t *testing.T) {
+	tests := []struct {
+		name string
+		item map[string]any
+		want bool
+	}{
+		{
+			name: "expired browser token without refresh token",
+			item: map[string]any{"access_token": "expired", "status": "异常", "status_reason_code": "auth_invalid", "last_error_status": 401},
+			want: true,
+		},
+		{
+			name: "oauth token retained for refresh",
+			item: map[string]any{"access_token": "expired", "refresh_token": "refresh", "status": "异常", "status_reason_code": "auth_invalid", "last_error_status": 401},
+			want: false,
+		},
+		{
+			name: "temporary upstream error retained",
+			item: map[string]any{"access_token": "temporary", "status": "正常", "last_error_kind": "upstream_error", "last_error_status": 503},
+			want: false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := accountAutoRemoveInvalid(test.item); got != test.want {
+				t.Fatalf("accountAutoRemoveInvalid() = %v, want %v: %#v", got, test.want, test.item)
+			}
+		})
+	}
+}
