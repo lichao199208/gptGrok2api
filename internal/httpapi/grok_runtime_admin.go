@@ -24,7 +24,13 @@ func (s *Server) grokRuntimeAdminAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "success"})
 	case path == "status" && r.Method == http.MethodGet:
 		accounts, _ := s.store.AccountList()
-		writeJSON(w, 200, map[string]any{"status": "ok", "size": len(accounts), "revision": fileRevision(s.cfg.AccountsPath), "selection_strategy": "least_busy"})
+		size := 0
+		for _, account := range accounts {
+			if isGrokAccountFields(account) {
+				size++
+			}
+		}
+		writeJSON(w, 200, map[string]any{"status": "ok", "size": size, "revision": fileRevision(s.cfg.AccountsPath), "selection_strategy": "least_busy"})
 	case path == "storage" && r.Method == http.MethodGet:
 		writeJSON(w, 200, map[string]any{"type": "json"})
 	case path == "config" && r.Method == http.MethodGet:
@@ -151,6 +157,9 @@ func (s *Server) grokRuntimeTokens(w http.ResponseWriter) {
 	accounts, _ := s.store.AccountList()
 	tokens := make([]map[string]any, 0, len(accounts))
 	for _, account := range accounts {
+		if !isGrokAccountFields(account) {
+			continue
+		}
 		token := firstNonEmpty(stringValue(account["sso"]), stringValue(account["access_token"]), stringValue(account["token"]))
 		if token == "" {
 			continue
@@ -175,26 +184,34 @@ func (s *Server) grokRuntimeDeleteTokens(w http.ResponseWriter, r *http.Request)
 	if !decodeJSON(w, r, &tokens) {
 		return
 	}
-	accounts, _ := s.store.AccountList()
+	accounts, err := s.store.AccountList()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
 	remove := map[string]bool{}
 	for _, token := range tokens {
 		remove[strings.TrimSpace(token)] = true
 	}
-	filtered := make([]map[string]any, 0, len(accounts))
-	deleted := 0
+	actualTokens := make([]string, 0, len(tokens))
+	seen := map[string]bool{}
 	for _, account := range accounts {
-		token := firstNonEmpty(stringValue(account["sso"]), stringValue(account["access_token"]), stringValue(account["token"]))
-		if remove[token] || remove[runtimeTokenID(token)] {
-			deleted++
+		if !isGrokAccountFields(account) {
 			continue
 		}
-		filtered = append(filtered, account)
+		token := firstNonEmpty(stringValue(account["sso"]), stringValue(account["access_token"]), stringValue(account["token"]))
+		if token == "" || (!remove[token] && !remove[runtimeTokenID(token)]) || seen[token] {
+			continue
+		}
+		seen[token] = true
+		actualTokens = append(actualTokens, token)
 	}
-	if err := s.store.SaveAccounts(filtered); err != nil {
-		writeError(w, 500, err.Error(), "server_error")
+	removed, _, err := s.store.DeleteAccounts(actualTokens)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": deleted})
+	writeJSON(w, http.StatusOK, map[string]any{"deleted": removed})
 }
 
 func (s *Server) grokRuntimeDisabled(w http.ResponseWriter, r *http.Request) {
@@ -206,30 +223,39 @@ func (s *Server) grokRuntimeDisabled(w http.ResponseWriter, r *http.Request) {
 	if !decodeJSON(w, r, &body) {
 		return
 	}
-	accounts, _ := s.store.AccountList()
-	found := false
+	accounts, err := s.store.AccountList()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
+	token := ""
 	for _, account := range accounts {
-		token := firstNonEmpty(stringValue(account["sso"]), stringValue(account["access_token"]), stringValue(account["token"]))
-		if !runtimeTokenMatches(token, body.Token, body.TokenID) {
+		if !isGrokAccountFields(account) {
 			continue
 		}
-		found = true
-		account["enabled"] = !body.Disabled
-		if body.Disabled {
-			account["status"] = "disabled"
-		} else {
-			account["status"] = "正常"
+		candidate := firstNonEmpty(stringValue(account["sso"]), stringValue(account["access_token"]), stringValue(account["token"]))
+		if runtimeTokenMatches(candidate, body.Token, body.TokenID) {
+			token = candidate
+			break
 		}
 	}
-	if !found {
-		writeError(w, 404, "token not found", "not_found")
+	if token == "" {
+		writeError(w, http.StatusNotFound, "token not found", "not_found")
 		return
 	}
-	if err := s.store.SaveAccounts(accounts); err != nil {
-		writeError(w, 500, err.Error(), "server_error")
+	status := "正常"
+	if body.Disabled {
+		status = "disabled"
+	}
+	if _, _, err := s.store.UpdateAccount(token, map[string]any{"enabled": !body.Disabled, "status": status}); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			writeError(w, http.StatusNotFound, "token not found", "not_found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"status": "success", "token_id": firstNonEmpty(strings.TrimSpace(body.TokenID), runtimeTokenID(strings.TrimSpace(body.Token))), "disabled": body.Disabled})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "success", "token_id": firstNonEmpty(strings.TrimSpace(body.TokenID), runtimeTokenID(strings.TrimSpace(body.Token))), "disabled": body.Disabled})
 }
 
 // runtimeTokenID is a stable opaque selector. It lets the admin UI operate on

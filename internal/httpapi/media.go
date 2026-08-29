@@ -126,7 +126,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
 	accountStarted := time.Now()
-	lease, err := s.accountPool.Reserve(r.Context(), mediaPools(request.Model), nil)
+	lease, err := s.accountPool.ReserveMatching(r.Context(), mediaPools(request.Model), nil, isGrokAccount)
 	if err != nil {
 		writeError(w, http.StatusTooManyRequests, err.Error(), "rate_limit_error")
 		return
@@ -906,12 +906,34 @@ func validOpenAIImageSize(size string) bool {
 func isOpenAIAccount(account accounts.Account) bool {
 	source := strings.ToLower(strings.TrimSpace(stringValue(account.Fields["source_type"])))
 	switch source {
-	case "chatgpt_web", "oauth_login", "openai", "codex", "openai_oauth":
+	case "chatgpt_web", "oauth_login", "openai", "codex", "openai_oauth", "web":
 		return true
+	case "grok", "grok_sso", "xai", "xai_sso":
+		return false
 	}
-	// Older imports did not persist source_type. ChatGPT access tokens are JWTs;
-	// Grok SSO tokens are opaque values.
-	return strings.Count(strings.TrimSpace(account.Token), ".") == 2
+	if strings.EqualFold(strings.TrimSpace(stringValue(account.Fields["type"])), "grok") {
+		return false
+	}
+	// Older OpenAI imports did not persist source_type. Treat an unclassified
+	// value as OpenAI for backwards compatibility, but never infer Grok from
+	// an opaque token: sending an unknown credential to the Grok upstream is
+	// unsafe. Grok records are explicitly marked during registration sync.
+	return true
+}
+
+func isGrokAccountFields(item map[string]any) bool {
+	source := strings.ToLower(strings.TrimSpace(stringValue(item["source_type"])))
+	switch source {
+	case "grok", "grok_sso", "xai", "xai_sso":
+		return true
+	case "chatgpt_web", "oauth_login", "openai", "codex", "openai_oauth", "web":
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(stringValue(item["type"])), "grok")
+}
+
+func isGrokAccount(account accounts.Account) bool {
+	return isGrokAccountFields(account.Fields)
 }
 
 func collectImageEvents(reader io.Reader) []provider.ImageResult {

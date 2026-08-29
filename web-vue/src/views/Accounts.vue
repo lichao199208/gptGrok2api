@@ -1055,10 +1055,40 @@ async function copyCredential(value: string, label: string) {
   const text = String(value || '').trim()
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text)
+      } catch {
+        copyTextWithExecCommand(text)
+      }
+    } else {
+      copyTextWithExecCommand(text)
+    }
     toast.success(`${label}已复制`)
   } catch {
     toast.error(`${label}复制失败`)
+  }
+}
+
+function copyTextWithExecCommand(text: string) {
+  const input = document.createElement('textarea')
+  input.value = text
+  input.setAttribute('readonly', 'readonly')
+  input.style.position = 'fixed'
+  input.style.left = '-9999px'
+  input.style.top = '0'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+
+  try {
+    input.focus()
+    input.select()
+    input.setSelectionRange(0, input.value.length)
+    if (!document.execCommand('copy')) {
+      throw new Error('Unable to copy text')
+    }
+  } finally {
+    document.body.removeChild(input)
   }
 }
 

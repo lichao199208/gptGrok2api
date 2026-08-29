@@ -760,7 +760,7 @@ func (s *Server) completeChat(w http.ResponseWriter, r *http.Request, request pr
 	var text, thinking string
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.Reserve(r.Context(), route.PoolCandidates, excluded)
+		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isGrokAccount)
 		if err != nil {
 			lastErr = err
 			break
@@ -902,7 +902,7 @@ func (s *Server) streamChat(w http.ResponseWriter, r *http.Request, request prot
 	emitted := false
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.Reserve(r.Context(), route.PoolCandidates, excluded)
+		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isGrokAccount)
 		if err != nil {
 			lastErr = err
 			break
@@ -1281,6 +1281,12 @@ func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 	groupID := strings.TrimSpace(query.Get("group_id"))
 	filtered := make([]map[string]any, 0, len(items))
 	for _, item := range items {
+		// The OpenAI account page must not expose Grok SSO credentials.
+		// Both providers share the runtime store for backwards compatibility,
+		// but their pools are intentionally separated by source/type.
+		if !isOpenAIAccountFields(item) {
+			continue
+		}
 		if keyword != "" && !accountContains(item, keyword) {
 			continue
 		}
@@ -1304,7 +1310,7 @@ func (s *Server) listAccounts(w http.ResponseWriter, r *http.Request) {
 		"items":     filtered[start:end],
 		"accounts":  filtered[start:end],
 		"total":     len(filtered),
-		"all_total": len(items),
+		"all_total": len(filtered),
 		"page":      page,
 		"page_size": pageSize,
 	})
@@ -1811,6 +1817,27 @@ func accountsForAPI(items []map[string]any) []map[string]any {
 		result = append(result, accountForAPI(item))
 	}
 	return result
+}
+
+func isOpenAIAccountFields(item map[string]any) bool {
+	token := accountToken(item)
+	if token == "" {
+		return false
+	}
+	source := strings.ToLower(strings.TrimSpace(stringValue(item["source_type"])))
+	switch source {
+	case "grok", "grok_sso", "xai", "xai_sso":
+		return false
+	case "chatgpt_web", "oauth_login", "openai", "codex", "openai_oauth":
+		return true
+	}
+	if strings.EqualFold(strings.TrimSpace(stringValue(item["type"])), "grok") {
+		return false
+	}
+	// Legacy records did not always persist source_type. Keep those records
+	// visible for compatibility; newly synchronized Grok records are explicitly
+	// marked above and are therefore excluded.
+	return true
 }
 
 func accountStatusCategory(account map[string]any) string {

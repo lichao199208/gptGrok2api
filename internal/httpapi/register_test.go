@@ -66,8 +66,8 @@ func TestRegisterRuntimeSnapshotImportsOnlyEnabledSSOAccounts(t *testing.T) {
 		t.Fatalf("unexpected snapshot summary: %s", response.Body.String())
 	}
 	accounts, err := New(cfg).store.AccountList()
-	if err != nil || len(accounts) != 1 || stringValue(accounts[0]["access_token"]) != secret {
-		t.Fatalf("snapshot did not import expected runtime account: %#v %v", accounts, err)
+	if err != nil || len(accounts) != 1 || stringValue(accounts[0]["access_token"]) != secret || stringValue(accounts[0]["source_type"]) != "grok_sso" {
+		t.Fatalf("snapshot did not import expected Grok runtime account: %#v %v", accounts, err)
 	}
 }
 
@@ -110,5 +110,27 @@ func TestRegisterRuntimeSnapshotRefreshesRealGrokQuota(t *testing.T) {
 	}
 	if !strings.Contains(string(runtimeRaw), `"fast_quota"`) {
 		t.Fatalf("quota was not persisted to runtime account: %s", runtimeRaw)
+	}
+}
+
+func TestOpenAIAccountListHidesSynchronizedGrokAccounts(t *testing.T) {
+	root := t.TempDir()
+	cfg := adminTestConfig(root)
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	server := New(cfg)
+	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
+		{"access_token": "legacy-openai-token", "source_type": "web"},
+		{"access_token": "grok-sso-token", "source_type": "grok_sso", "type": "grok"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	response := adminRequest(server.Handler(), http.MethodGet, "/api/accounts", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("account list failed: %d %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"total":1`) || strings.Contains(response.Body.String(), "grok-sso-token") {
+		t.Fatalf("Grok account leaked into OpenAI list: %s", response.Body.String())
 	}
 }

@@ -122,3 +122,41 @@ func TestRotateAccountTokensClearsStaleErrorMarkers(t *testing.T) {
 		}
 	}
 }
+
+func TestDeletedAccountTombstoneNormalizesSSOPrefix(t *testing.T) {
+	root := t.TempDir()
+	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if added, _, _, err := repository.AddAccounts(nil, []map[string]any{{"sso": "sso=opaque-token", "source_type": "grok_sso"}}); err != nil || added != 1 {
+		t.Fatalf("initial SSO add failed: added=%d err=%v", added, err)
+	}
+	if removed, _, err := repository.DeleteAccounts([]string{"opaque-token"}); err != nil || removed != 1 {
+		t.Fatalf("SSO delete failed: removed=%d err=%v", removed, err)
+	}
+	added, skipped, _, err := repository.AddAccounts(nil, []map[string]any{{"sso": "sso=opaque-token", "source_type": "grok_sso"}})
+	if err != nil || added != 0 || skipped != 1 {
+		t.Fatalf("SSO tombstone was bypassed: added=%d skipped=%d err=%v", added, skipped, err)
+	}
+}
+
+func TestDeletedAccountCannotBeReaddedByAutomaticImport(t *testing.T) {
+	root := t.TempDir()
+	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if added, _, _, err := repository.AddAccounts([]string{"deleted-token"}, nil); err != nil || added != 1 {
+		t.Fatalf("initial add failed: added=%d err=%v", added, err)
+	}
+	removed, _, err := repository.DeleteAccounts([]string{"deleted-token"})
+	if err != nil || removed != 1 {
+		t.Fatalf("delete failed: removed=%d err=%v", removed, err)
+	}
+	added, skipped, items, err := repository.AddAccounts([]string{"deleted-token"}, []map[string]any{{"access_token": "deleted-token", "source_type": "grok_sso"}})
+	if err != nil || added != 0 || skipped != 2 || len(items) != 0 {
+		t.Fatalf("deleted token was re-added: added=%d skipped=%d items=%#v err=%v", added, skipped, items, err)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, "deleted_accounts.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) == "" || string(raw) == "[\"deleted-token\"]" {
+		t.Fatalf("deletion tombstone is missing or contains plaintext token: %s", raw)
+	}
+}

@@ -17,12 +17,21 @@ func TestGrokRuntimeAdminMasksTokensAndSupportsOpaqueSelectors(t *testing.T) {
 	}
 	raw, err := json.Marshal([]map[string]any{{
 		"sso":          secret,
+		"source_type":  "grok_sso",
+		"type":         "grok",
 		"pool":         "basic",
 		"status":       "active",
 		"enabled":      true,
 		"use_count":    3,
 		"fail_count":   1,
 		"last_used_at": "2030-01-01T00:00:00Z",
+	}, {
+		"access_token": "openai-token",
+		"source_type":  "web",
+		"type":         "openai",
+		"pool":         "basic",
+		"status":       "正常",
+		"enabled":      true,
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -61,9 +70,18 @@ func TestGrokRuntimeAdminMasksTokensAndSupportsOpaqueSelectors(t *testing.T) {
 		t.Fatalf("opaque disable failed or leaked token: %d %s", disabled.Code, disabled.Body.String())
 	}
 
-	removed := adminRequest(handler, http.MethodDelete, "/api/grok/runtime/admin/tokens", strings.NewReader(`[`+`"`+payload.Tokens[0].TokenID+`"`+`]`))
+	openAIRemoved := adminRequest(handler, http.MethodDelete, "/api/grok/runtime/admin/tokens", strings.NewReader(`["`+runtimeTokenID("openai-token")+`"]`))
+	if openAIRemoved.Code != http.StatusOK || !strings.Contains(openAIRemoved.Body.String(), `"deleted":0`) {
+		t.Fatalf("Grok runtime endpoint touched an OpenAI account: %d %s", openAIRemoved.Code, openAIRemoved.Body.String())
+	}
+
+	removed := adminRequest(handler, http.MethodDelete, "/api/grok/runtime/admin/tokens", strings.NewReader(`["`+payload.Tokens[0].TokenID+`"]`))
 	if removed.Code != http.StatusOK || !strings.Contains(removed.Body.String(), `"deleted":1`) {
 		t.Fatalf("opaque delete failed: %d %s", removed.Code, removed.Body.String())
+	}
+	remaining, err := New(cfg).store.AccountList()
+	if err != nil || len(remaining) != 1 || stringValue(remaining[0]["access_token"]) != "openai-token" {
+		t.Fatalf("OpenAI account was removed by Grok runtime endpoint: %#v %v", remaining, err)
 	}
 }
 
