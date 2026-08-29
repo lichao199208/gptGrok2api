@@ -164,7 +164,7 @@ curl -fsS http://127.0.0.1:8000/health
 CHATGPT2API_AUTH_KEY=replace-with-a-long-random-key
 CHATGPT2API_ADMIN_KEY=replace-with-a-different-admin-key
 CHATGPT2API_GO_PORT=8000
-GO_PUBLIC_BASE_URL=http://23.148.212.231:8000
+GO_PUBLIC_BASE_URL=https://gpt.qkmss.com
 GO_VERSION=1.2.1-go
 ~~~
 
@@ -198,4 +198,3 @@ logs/
 ## 许可证
 
 请保留 `LICENSE` 和 `GROK2API_LICENSE`。项目基于 [yukkcat/chatgpt2api](https://github.com/yukkcat/chatgpt2api) 开发，并包含 GPTGrok2API Go 自有修改。
-
