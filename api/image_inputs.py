@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import json
 import mimetypes
+import os
 import re
+import socket
 from pathlib import PurePosixPath
 from typing import Any, TypeGuard
-from urllib.parse import unquote, unquote_to_bytes, urlparse
+from urllib.parse import unquote, unquote_to_bytes, urljoin, urlparse
 
 from curl_cffi import requests
 from fastapi import HTTPException, Request
@@ -20,6 +23,8 @@ ImageInput = tuple[bytes, str, str]
 ImageSource = str | UploadFile | ImageInput
 
 MAX_IMAGE_REFERENCE_BYTES = 50 * 1024 * 1024
+IMAGE_DOWNLOAD_CHUNK_BYTES = 64 * 1024
+MAX_IMAGE_REDIRECTS = 5
 IMAGE_REFERENCE_FIELDS = {"image", "image[]", "images", "images[]", "image_url", "image_url[]"}
 MASK_REFERENCE_FIELDS = {"mask", "mask[]"}
 
@@ -255,36 +260,97 @@ def _filename_from_url(parsed_path: str, mime_type: str) -> str:
     return _safe_filename(raw_name, mime_type, "image_url")
 
 
+def _allow_private_image_urls() -> bool:
+    return str(os.getenv("CHATGPT2API_ALLOW_PRIVATE_IMAGE_URLS") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _validate_remote_image_url(source: str) -> None:
+    parsed = urlparse(source)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or not parsed.hostname:
+        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
+    if parsed.username or parsed.password:
+        raise HTTPException(status_code=400, detail={"error": "image_url must not include credentials"})
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={"error": "image_url contains an invalid port"}) from exc
+    if _allow_private_image_urls():
+        return
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        raise HTTPException(status_code=400, detail={"error": "image_url points to a private network address"})
+    try:
+        addresses = {ipaddress.ip_address(hostname.split("%", 1)[0])}
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0].split("%", 1)[0])
+                for item in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            }
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"error": "image_url hostname could not be resolved"}) from exc
+    if not addresses or any(not address.is_global for address in addresses):
+        raise HTTPException(status_code=400, detail={"error": "image_url points to a private network address"})
+
+
+def _read_limited_image_response(response: requests.Response) -> bytes:
+    content_length = _clean(response.headers.get("content-length"))
+    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
+        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+    payload = bytearray()
+    for chunk in response.iter_content(chunk_size=IMAGE_DOWNLOAD_CHUNK_BYTES):
+        if not chunk:
+            continue
+        payload.extend(chunk)
+        if len(payload) > MAX_IMAGE_REFERENCE_BYTES:
+            raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
+    return bytes(payload)
+
+
 def _download_image_url(url: str) -> ImageInput:
     """下载远程图片：把 http/https 图片链接转成标准图片输入元组。"""
     source = _clean(url)
     if source.startswith("data:"):
         return _decode_data_url(source)
-    parsed = urlparse(source)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise HTTPException(status_code=400, detail={"error": "image_url must be an http or https URL"})
-    try:
-        response = requests.get(
-            source,
-            headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
-            timeout=60,
-            allow_redirects=True,
-            **proxy_settings.build_session_kwargs(),
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
-    if not 200 <= response.status_code < 300:
-        raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
-    content_length = _clean(response.headers.get("content-length"))
-    if content_length and content_length.isdigit() and int(content_length) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    data = response.content
-    if not data:
-        raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
-    if len(data) > MAX_IMAGE_REFERENCE_BYTES:
-        raise HTTPException(status_code=400, detail={"error": "image_url exceeds 50MB limit"})
-    mime_type = _response_mime_type(response, parsed.path)
-    return data, _filename_from_url(parsed.path, mime_type), mime_type
+    current_url = source
+    for redirect_count in range(MAX_IMAGE_REDIRECTS + 1):
+        _validate_remote_image_url(current_url)
+        response = None
+        try:
+            response = requests.get(
+                current_url,
+                headers={"Accept": "image/*,*/*;q=0.8", "User-Agent": "chatgpt2api image fetcher"},
+                timeout=60,
+                allow_redirects=False,
+                stream=True,
+                **proxy_settings.build_session_kwargs(),
+            )
+            if response.status_code in {301, 302, 303, 307, 308}:
+                location = _clean(response.headers.get("location"))
+                if not location:
+                    raise HTTPException(status_code=400, detail={"error": "image_url redirect is missing a location"})
+                if redirect_count >= MAX_IMAGE_REDIRECTS:
+                    raise HTTPException(status_code=400, detail={"error": "image_url has too many redirects"})
+                current_url = urljoin(current_url, location)
+                continue
+            if not 200 <= response.status_code < 300:
+                raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: HTTP {response.status_code}"})
+            data = _read_limited_image_response(response)
+            if not data:
+                raise HTTPException(status_code=400, detail={"error": "image_url returned empty content"})
+            parsed = urlparse(current_url)
+            mime_type = _response_mime_type(response, parsed.path)
+            return data, _filename_from_url(parsed.path, mime_type), mime_type
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail={"error": f"image_url fetch failed: {exc}"}) from exc
+        finally:
+            if response is not None:
+                response.close()
+    raise HTTPException(status_code=400, detail={"error": "image_url has too many redirects"})
 
 
 async def read_image_sources(sources: list[ImageSource]) -> list[ImageInput]:

@@ -106,8 +106,8 @@ const emit = defineEmits<{
 }>()
 
 const token = computed(() => tokenLabel(props.item))
-const account = computed(() => props.item.accountEmail || props.item.accountId)
-const accountTitle = computed(() => [props.item.accountEmail, props.item.accountId].filter(Boolean).join(' / '))
+const account = computed(() => props.item.accountEmail || props.item.accountId || props.item.keyName || props.item.keyId)
+const accountTitle = computed(() => [props.item.accountEmail, props.item.accountId, props.item.keyName, props.item.keyId].filter(Boolean).join(' / '))
 const summary = computed(() => summaryText(props.item))
 const failed = computed(() => isFailed(props.item))
 

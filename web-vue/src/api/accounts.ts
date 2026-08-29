@@ -9,11 +9,15 @@ export type CheckoutLinkStatus = 'ready' | 'failed' | 'pending' | 'processing' |
 export interface Account {
   id: string
   access_token?: string
+  has_access_token?: boolean
+  token_preview?: string
   backend_status?: string
   status_category?: AccountStatusCategory
   status_label?: string
   email?: string
   user_id?: string
+  login_password?: string
+  two_factor_secret?: string
   type?: string
   source_type?: string
   agent_identity_status?: string
@@ -311,7 +315,9 @@ function isMaskedToken(value: string): boolean {
 
 function displayIdForAccount(item: BackendAccount, index: number, usedIds: Set<string>): string {
   const base = (
-    cleanString(item.email)
+    cleanString(item.account_ref)
+    || cleanString(item.id)
+    || cleanString(item.email)
     || cleanString(item.user_id)
     || cleanString(item.account_id)
     || `account-${index + 1}`
@@ -331,6 +337,7 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
   'enabled' | 'status' | 'status_reason' | 'status_reason_code' | 'last_error_kind'
 > {
   const rawStatus = cleanString(item.status)
+  const category = normalizeAccountStatusCategory(item.status_category)
   const quota = Number(item.quota ?? 0)
   const imageQuotaUnknown = Boolean(item.image_quota_unknown)
   const lastRefreshError = cleanString(item.last_refresh_error || item.last_token_refresh_error)
@@ -341,6 +348,16 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
       status: 'disabled',
       status_reason: '账号禁用',
       status_reason_code: 'disabled',
+      last_error_kind: '',
+    }
+  }
+
+  if (category === 'normal') {
+    return {
+      enabled: true,
+      status: 'ready',
+      status_reason: '',
+      status_reason_code: '',
       last_error_kind: '',
     }
   }
@@ -413,8 +430,12 @@ function optionalBoolean(value: unknown): boolean | undefined {
 
 function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<string>): Account {
   const accessToken = cleanString(item.access_token || item.accessToken)
+  const tokenPreview = cleanString(item.token_preview)
+  const hasAccessToken = item.has_access_token === true || Boolean(accessToken) || Boolean(tokenPreview)
+  const accountRef = cleanString(item.account_ref || item.id)
   const id = displayIdForAccount(item, index, usedIds)
-  if (accessToken) accountTokenById.set(id, accessToken)
+  if (accountRef) accountTokenById.set(id, accountRef)
+  else if (accessToken) accountTokenById.set(id, accessToken)
 
   const quota = Math.max(0, Number(item.quota ?? 0) || 0)
   const imageQuotaUnknown = Boolean(item.image_quota_unknown)
@@ -436,11 +457,15 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
   return {
     id,
     access_token: accessToken,
+    has_access_token: hasAccessToken,
+    token_preview: tokenPreview || maskToken(accessToken),
     backend_status: rawStatus || STATUS_NORMAL,
     status_category: normalizeAccountStatusCategory(item.status_category),
     status_label: cleanString(item.status_label),
     email,
     user_id: userId,
+    login_password: cleanString(item.login_password),
+    two_factor_secret: cleanString(item.two_factor_secret),
     type,
     source_type: sourceType,
     agent_identity_status: cleanString(item.agent_identity_status),
@@ -491,7 +516,7 @@ function mapBackendAccount(item: BackendAccount, index: number, usedIds: Set<str
     quota,
     image_quota_unknown: imageQuotaUnknown,
     name: email || `${type} / ${sourceType}`,
-    cookie: maskToken(accessToken),
+    cookie: tokenPreview || maskToken(accessToken),
     snlm0e: '',
     push_id: '',
     enabled: status.enabled,
@@ -594,6 +619,10 @@ function accountFromPayload(payload: Partial<Account>) {
     group_id: payload.group_id,
     quota: payload.quota,
     status: backendStatusForPayload(payload),
+    email: payload.email,
+    user_id: payload.user_id,
+    login_password: payload.login_password,
+    two_factor_secret: payload.two_factor_secret,
   }
 }
 
@@ -750,6 +779,10 @@ export const accountsApi = {
           quota?: number
           proxy?: string
           group_id?: string
+          email?: string
+          user_id?: string
+          login_password?: string
+          two_factor_secret?: string
         },
         BackendAccountMutationResponse
       >('/api/accounts/update', {
@@ -760,6 +793,10 @@ export const accountsApi = {
         quota: account.quota,
         proxy: account.proxy,
         group_id: account.group_id,
+        email: account.email,
+        user_id: account.user_id,
+        login_password: account.login_password,
+        two_factor_secret: account.two_factor_secret,
       })
       return {
         status: 'ok',
@@ -905,6 +942,13 @@ export const accountsApi = {
     onProgress?: (progress: AccountRefreshProgress) => void,
   ) => refreshAndPollWithProgress(accountIdsOrTokens, onProgress),
 
+  refreshAccessTokens: (accountIdsOrTokens: string[]) => apiClient.post<
+    { access_tokens: string[] },
+    { updated?: number; success_count?: number; errors?: unknown[] }
+  >('/api/accounts/refresh-at', {
+    access_tokens: Array.from(new Set(accountIdsOrTokens.map(resolveToken).filter(Boolean))),
+  }),
+
   refreshAllAccountsWithProgress: (
     onProgress?: (progress: AccountRefreshProgress) => void,
   ) => refreshAndPollWithProgress([], onProgress, { all: true }),
@@ -916,6 +960,30 @@ export const accountsApi = {
     }, {
       responseType: 'blob',
     }),
+
+  getAccountToken: async (accountIdOrToken: string) => {
+    const response = await apiClient.post<
+      { access_token: string },
+      { access_token?: string; account_ref?: string; token_preview?: string }
+    >('/api/accounts/token', {
+      access_token: resolveToken(accountIdOrToken),
+    })
+    return cleanString(response.access_token)
+  },
+
+  getAccountSecrets: async (accountIdOrToken: string) => {
+    const response = await apiClient.post<
+      { access_token: string },
+      { access_token?: string; account_ref?: string; email?: string; user_id?: string; login_password?: string; two_factor_secret?: string }
+    >('/api/accounts/token', { access_token: resolveToken(accountIdOrToken) })
+    return {
+      access_token: cleanString(response.access_token),
+      email: cleanString(response.email),
+      user_id: cleanString(response.user_id),
+      login_password: cleanString(response.login_password),
+      two_factor_secret: cleanString(response.two_factor_secret),
+    }
+  },
 
   resetAccountState: async (accountId: string) => {
     return updateStatus(accountId, STATUS_NORMAL)

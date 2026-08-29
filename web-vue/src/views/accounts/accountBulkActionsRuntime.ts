@@ -6,7 +6,7 @@ import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import type { useAccountBulkProgressRuntime } from './accountBulkProgressRuntime'
 
-export type AccountBulkAction = 'refresh' | 'reset' | 'enable' | 'disable' | 'delete'
+export type AccountBulkAction = 'refresh' | 'refresh_at' | 'reset' | 'enable' | 'disable' | 'delete'
 
 type AccountSelectionAdapter = {
   selectedIds: Ref<string[]>
@@ -69,6 +69,7 @@ function normalizeErrorList(errors: unknown) {
 function bulkActionMeta(action: AccountBulkAction) {
   return {
     refresh: { title: '批量刷新账号信息', confirmText: '确认刷新', successText: '批量刷新完成' },
+    refresh_at: { title: '批量刷新 Access Token', confirmText: '开始刷新 AT', successText: 'Access Token 批量刷新完成' },
     reset: { title: '批量重置账号状态', confirmText: '确认重置', successText: '批量重置完成' },
     enable: { title: '批量启用账号', confirmText: '确认启用', successText: '批量启用完成' },
     disable: { title: '批量禁用账号', confirmText: '确认禁用', successText: '批量禁用完成' },
@@ -155,6 +156,13 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
 
   async function refreshSelectedAccounts() {
     await refreshAccountsWithProgress(options.accountSelection.selectedIds.value, '刷新选中账号信息和额度')
+  }
+
+  async function refreshSelectedAccessTokens() {
+    await refreshAccountsWithProgress(
+      options.accountSelection.selectedIds.value,
+      '协议登录刷新选中账号 AT',
+    )
   }
 
   async function refreshAllAccounts() {
@@ -281,7 +289,9 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
 
     try {
       let result: AccountBulkMutationSummary
-      if (action === 'enable') {
+      if (action === 'refresh_at') {
+        result = await runBulkMutationWithProgress(actionMeta.title, targetIds, accountsApi.refreshAccessTokens)
+      } else if (action === 'enable') {
         result = await runBulkMutationWithProgress(actionMeta.title, targetIds, accountsApi.bulkEnable)
       } else if (action === 'disable') {
         result = await runBulkMutationWithProgress(actionMeta.title, targetIds, accountsApi.bulkDisable)
@@ -365,6 +375,7 @@ export function useAccountBulkActionsRuntime(options: AccountBulkActionsRuntimeO
   return {
     refreshAllAccounts,
     refreshSelectedAccounts,
+    refreshSelectedAccessTokens,
     requestStopRefreshProgress,
     runBulkAction,
     bindSelectedAccountsToGroup,

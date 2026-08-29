@@ -54,6 +54,7 @@ export const providerTypeOptions = [
   { value: 'yyds_mail', label: 'YYDS Mail' },
   { value: 'ddg_mail', label: 'DDG + CF 收件箱' },
   { value: 'outlook_token', label: 'Microsoft 邮箱凭据池' },
+  { value: 'mailcom_mother', label: 'Mail.com 母号（自动子号）' },
 ]
 
 export const providerTypeGroups = [{ options: providerTypeOptions }]
@@ -136,10 +137,12 @@ export const providerTypeKeys: Record<string, string[]> = {
   yyds_mail: ['api_base', 'api_key', 'domain', 'subdomain', 'wildcard'],
   ddg_mail: ['api_base', 'ddg_token', 'cf_inbox_jwt', 'admin_password', 'cf_api_key', 'cf_auth_mode', 'cf_create_path', 'cf_messages_path'],
   outlook_token: ['mailboxes', 'mode', 'imap_host', 'message_limit', 'alias_enabled', 'alias_per_email', 'alias_prefix', 'alias_include_original'],
+  mailcom_mother: ['accounts', 'imap_host', 'domains', 'max_active', 'pool_batch', 'proxy', 'proxies'],
 }
 
 export const providerLocalOnlyKeys: Record<string, string[]> = {
   outlook_token: ['mailboxes_count', 'mailboxes_base_count', 'mailboxes_alias_count', 'mailboxes_preview', 'mailboxes_stats', 'mailboxes_parse_stats', 'mailboxes_failed'],
+  mailcom_mother: ['accounts_count', 'accounts_preview'],
 }
 
 export const defaultGrokRegisterConfig: GrokRegisterConfig = {
@@ -405,6 +408,52 @@ export function defaultProvider(type = 'cloudmail_gen'): RegisterProvider {
         alias_per_email: 5,
         alias_prefix: 'c2api',
         alias_include_original: true,
+      }
+    case 'mailcom_mother':
+      return {
+        ...base,
+        accounts: '',
+        imap_host: 'imap.mail.com',
+        domains: [
+'mail.com', 'email.com', 'usa.com', 'myself.com', 'consultant.com', 'post.com',
+        'europe.com', 'asia.com', 'iname.com', 'writeme.com', 'dr.com', 'cheerful.com',
+        'execs.com', 'groupmail.com', 'homemail.com', 'housemail.com', 'workmail.com', 'inorbit.com',
+        'mail-me.com', 'planetmail.com', 'solution4u.com', 'tech-center.com', 'webname.com', 'cash4u.com',
+        'accountant.com', 'activist.com', 'adexec.com', 'allergist.com', 'alumni.com', 'alumnidirector.com',
+        'archaeologist.com', 'birdlover.com', 'chemist.com', 'columnist.com', 'comic.com', 'computer4u.com',
+        'counsellor.com', 'cyberservices.com', 'deliveryman.com', 'disposable.com', 'fastservice.com', 'financier.com',
+        'gardener.com', 'geologist.com', 'graphic-designer.com', 'hot-shot.com', 'instruction.com', 'insurer.com',
+        'job4u.com', 'journalist.com', 'legislator.com', 'lobbyist.com', 'minister.com', 'net-shopping.com',
+        'optician.com', 'pediatrician.com', 'politician.com', 'presidency.com', 'priest.com', 'publicist.com',
+        'qualityservice.com', 'realtyagent.com', 'registerednurses.com', 'repairman.com', 'representative.com', 'rescueteam.com',
+        'sociologist.com', 'techie.com', 'technologist.com', 'theplate.com', 'toothfairy.com', 'tvstar.com',
+        'umpire.com', 'worker.com', 'aircraftmail.com', 'blader.com', 'boardermail.com', 'brew-meister.com',
+        'brew-master.com', 'bsdmail.com', 'cutey.com', 'hackermail.com', 'hilarious.com', 'keromail.com',
+        'nonpartisan.com', 'rocketship.com', 'cyberdude.com', 'cybergal.com', 'cyber-wizard.com', 'appraiser.com',
+        'auctioneer.com', 'fireman.com', 'photographer.com', 'physicist.com', 'programmer.com', 'radiologist.com',
+        'salesperson.com', 'secretary.com', 'socialworker.com', 'songwriter.com', 'artlover.com', 'bikerider.com',
+        'catlover.com', 'dbzmail.com', 'doglover.com', 'doramail.com', 'galaxyhit.com', 'kittymail.com',
+        'lovecat.com', 'marchmail.com', 'petlover.com', 'snakebite.com', 'toke.com', 'uymail.com',
+        'acdcfan.com', 'discofan.com', 'elvisfan.com', 'hiphopfan.com', 'kissfans.com', 'madonnafan.com',
+        'metalfan.com', 'ninfan.com', 'ravemail.com', 'reborn.com', 'reggaefan.com', 'arcticmail.com',
+        '2trom.com', 'bellair.com', 'californiamail.com', 'dallasmail.com', 'nycmail.com', 'pacific-ocean.com',
+        'pacificwest.com', 'sanfranmail.com', 'africamail.com', 'asia-mail.com', 'australiamail.com', 'berlin.com',
+        'brazilmail.com', 'chinamail.com', 'dublin.com', 'dutchmail.com', 'englandmail.com', 'europemail.com',
+        'germanymail.com', 'irelandmail.com', 'israelmail.com', 'italymail.com', 'koreamail.com', 'mexicomail.com',
+        'moscowmail.com', 'munich.com', 'polandmail.com', 'safrica.com', 'samerica.com', 'scotlandmail.com',
+        'spainmail.com', 'swedenmail.com', 'swissmail.com', 'torontomail.com', 'appraiser.net', 'auctioneer.net',
+        'bartender.net', 'chef.net', 'contractor.net', 'coolsite.net', 'fireman.net', 'hairdresser.net',
+        'instructor.net', 'orthodontist.net', 'photographer.net', 'physicist.net', 'planetmail.net', 'programmer.net',
+        'radiologist.net', 'salesperson.net', 'secretary.net', 'socialworker.net', 'songwriter.net', 'surgical.net',
+        'therapist.net', 'greenmail.net', 'humanoid.net', 'null.net', 'bellair.net', 'angelic.com',
+        'atheist.com', 'disciples.com', 'innocent.com', 'muslim.com', 'protestant.com', 'reincarnate.com',
+        'religious.com', 'saintly.com', 'clubmember.org', 'collector.org', 'graduate.org', 'musician.org',
+        'teachers.org', 'linuxmail.org',
+        ],
+        max_active: 9,
+        pool_batch: 3,
+        proxy: 'http://privoxy:8118',
+        proxies: ['http://privoxy:8118'],
       }
     default:
       return base
@@ -824,6 +873,11 @@ export function providerRequirementMessages(provider: RegisterProvider) {
       requireValue(provider.ddg_token, 'DDG Token')
       requireValue(provider.cf_inbox_jwt, 'CF Inbox JWT')
       break
+    case 'mailcom_mother': {
+      const savedCount = Number(provider.accounts_count || 0)
+      if (savedCount <= 0 && !isFilled(provider.accounts)) missing.push('Mail.com 母号池')
+      break
+    }
     case 'outlook_token': {
       const savedCount = Number(provider.mailboxes_count || 0)
       if (savedCount <= 0 && pendingOutlookCount(provider) <= 0) missing.push('Microsoft 邮箱凭据池')

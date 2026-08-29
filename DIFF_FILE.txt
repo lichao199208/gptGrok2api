@@ -1,0 +1,93 @@
+warning: in the working copy of 'docker-compose.go.yml.orig', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'docker-compose.go.yml', LF will be replaced by CRLF the next time Git touches it
+diff --git a/docker-compose.go.yml.orig b/docker-compose.go.yml
+index daeea9a..e26494b 100644
+--- a/docker-compose.go.yml.orig
++++ b/docker-compose.go.yml
+@@ -26,26 +26,8 @@ services:
+       GO_UPSTREAM_URL: ${GO_UPSTREAM_URL:-}
+       GO_UPSTREAM_API_KEY: ${GO_UPSTREAM_API_KEY:-}
+       GO_PUBLIC_BASE_URL: ${GO_PUBLIC_BASE_URL:-}
+-      GO_TRUST_REQUEST_PUBLIC_BASE: ${GO_TRUST_REQUEST_PUBLIC_BASE:-false}
+-      GO_GROK_CHAT_URL: ${GO_GROK_CHAT_URL:-https://grok.com/rest/app-chat/conversations/new}
+-      GO_CONSOLE_RESPONSES_URL: ${GO_CONSOLE_RESPONSES_URL:-https://console.x.ai/v1/responses}
+-      GO_REQUEST_TIMEOUT_SECONDS: ${GO_REQUEST_TIMEOUT_SECONDS:-600}
+-      GO_CHAT_MAX_RETRIES: ${GO_CHAT_MAX_RETRIES:-5}
+-      GO_CHAT_RETRY_CODES: ${GO_CHAT_RETRY_CODES:-401,403,429,500,502,503}
+-      GO_ACCOUNT_REFRESH_CONCURRENCY: ${GO_ACCOUNT_REFRESH_CONCURRENCY:-3}
+-      GO_ALLOW_ANONYMOUS: ${GO_ALLOW_ANONYMOUS:-false}
+       GO_QUEUE_BACKEND: ${GO_QUEUE_BACKEND:-redis}
+       GO_REDIS_ADDR: ${GO_REDIS_ADDR:-redis:6379}
+-      GO_REDIS_PASSWORD: ${GO_REDIS_PASSWORD:-}
+-      GO_REDIS_DB: ${GO_REDIS_DB:-0}
+-      GO_PROXY_URL: ${GO_PROXY_URL:-}
+-      GO_PROXY_POOL: ${GO_PROXY_POOL:-}
+-      GO_RESOURCE_PROXY_URL: ${GO_RESOURCE_PROXY_URL:-}
+-      GO_RESOURCE_PROXY_POOL: ${GO_RESOURCE_PROXY_POOL:-}
+-      GO_ALLOW_PRIVATE_IMAGE_URLS: ${GO_ALLOW_PRIVATE_IMAGE_URLS:-false}
+-      GO_FLARESOLVERR_URL: ${GO_FLARESOLVERR_URL:-}
+-      GO_CLEARANCE_ENABLED: ${GO_CLEARANCE_ENABLED:-false}
+-      GO_CLEARANCE_TIMEOUT_SECONDS: ${GO_CLEARANCE_TIMEOUT_SECONDS:-60}
+       TZ: ${TZ:-Asia/Shanghai}
+     networks:
+       default:
+@@ -53,6 +35,59 @@ services:
+         aliases:
+           - gptgrok2api-go
+ 
++  image-queue-redis:
++    image: redis:7.4-alpine
++    container_name: chatgpt2api-image-queue-redis
++    restart: unless-stopped
++    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "2gb", "--maxmemory-policy", "noeviction"]
++    volumes:
++      - ./data/go-image-redis:/data
++    healthcheck:
++      test: ["CMD", "redis-cli", "ping"]
++      interval: 5s
++      timeout: 3s
++      retries: 10
++
++  image-gateway:
++    build:
++      context: ./go-image-gateway
++    image: chatgpt2api/go-image-gateway:local
++    container_name: chatgpt2api-image-gateway
++    restart: unless-stopped
++    depends_on:
++      image-queue-redis:
++        condition: service_healthy
++      app:
++        condition: service_started
++    environment:
++      IMAGE_GATEWAY_REDIS_ADDR: image-queue-redis:6379
++      IMAGE_GATEWAY_BACKEND_URL: http://app/v1/images/generations
++      IMAGE_GATEWAY_SCHEDULER_URL: http://app/internal/image-scheduler
++      IMAGE_GATEWAY_SCHEDULER_KEY: ${IMAGE_SCHEDULER_INTERNAL_KEY:-}
++      IMAGE_GATEWAY_AUTH_KEYS_FILE: /etc/image-gateway/auth_keys.json
++      IMAGE_GATEWAY_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
++      # Defaults sized for a small host; raise workers for higher throughput.
++      IMAGE_GATEWAY_WORKERS: ${IMAGE_GATEWAY_WORKERS:-8}
++      IMAGE_GATEWAY_QUEUE_CAPACITY: ${IMAGE_GATEWAY_QUEUE_CAPACITY:-1000}
++      IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS: ${IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS:-900}
++      IMAGE_GATEWAY_TASK_TTL_SECS: ${IMAGE_GATEWAY_TASK_TTL_SECS:-86400}
++      IMAGE_GATEWAY_MAX_ATTEMPTS: ${IMAGE_GATEWAY_MAX_ATTEMPTS:-1}
++      # 25 MiB accepts typical image requests while limiting memory pressure.
++      IMAGE_GATEWAY_MAX_BODY_MB: ${IMAGE_GATEWAY_MAX_BODY_MB:-25}
++    ports:
++      - "127.0.0.1:${IMAGE_GATEWAY_PORT:-3001}:8080"
++    volumes:
++      - ./data/auth_keys.json:/etc/image-gateway/auth_keys.json:ro
++    networks:
++      default:
++        aliases:
++          - image-gateway
++    healthcheck:
++      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
++      interval: 10s
++      timeout: 3s
++      retries: 5
++
+ networks:
+   upstream:
+     external: true

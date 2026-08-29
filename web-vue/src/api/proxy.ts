@@ -47,6 +47,8 @@ export interface ProxyNode {
   last_error_at?: string
   cooldown_until?: string
   notes?: string
+  source?: string
+  subscription_managed?: boolean
 }
 
 export interface ProxyGroup {
@@ -57,6 +59,14 @@ export interface ProxyGroup {
   enabled: boolean
   notes?: string
   nodes: ProxyNode[]
+  subscription_url?: string
+  subscription_enabled?: boolean
+  subscription_interval_minutes?: number
+  subscription_node_image_concurrency_limit?: number
+  subscription_last_updated_at?: string
+  subscription_last_attempt_at?: string
+  subscription_last_error?: string
+  subscription_node_count?: number
 }
 
 export type ProxyGroupPayload = Partial<ProxyGroup> & {
@@ -150,6 +160,12 @@ export const proxyApi = {
       { id?: string; node_id?: string; url?: string },
       { result?: ProxyTestResult | null; results?: Array<{ node_id: string; result: ProxyTestResult }>; groups?: ProxyGroup[] }
     >('/api/proxy/groups/test', payload),
+
+  refreshGroupSubscription: (id: string) =>
+    apiClient.post<Record<string, never>, { group: ProxyGroup; groups: ProxyGroup[]; node_count: number }>(
+      `/api/proxy/groups/${encodeURIComponent(id)}/subscription/refresh`,
+      {},
+    ),
 
   getRuntime: () =>
     apiClient.get<never, { runtime: ProxyRuntimeSettings; status: ProxyRuntimeStatus }>('/api/proxy/runtime'),

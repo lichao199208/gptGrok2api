@@ -153,7 +153,23 @@ curl http://127.0.0.1:8000/v1/images/edits \
 - macOS 隐藏有头浏览器：[Captcha Solver Docker/Xvfb Compose](deploy/docker-compose.captcha-solver.yml)
 - Ubuntu：[主程序 systemd unit](deploy/systemd/chatgpt2api.service.example) / [Captcha Solver systemd unit](deploy/systemd/captcha-solver.service.example)
 
-## Docker 部署
+## Docker 部署`r`n`r`n### Go image gateway deployment
+
+Use the canonical `docker-compose.go.yml`, which includes `app`, the image queue Redis, and the image gateway on the same Compose `default` network. `docker-compose.go-image.yml` is a deprecated redirect stub. Defaults are `IMAGE_GATEWAY_WORKERS=8` and `IMAGE_GATEWAY_MAX_BODY_MB=25`; override in `.env` for larger workloads.
+
+```bash
+docker compose -f docker-compose.go.yml up -d --build
+docker compose -f docker-compose.go.yml ps
+docker compose -f docker-compose.go exec image-gateway wget -qO- http://127.0.0.1:8080/health
+curl -fsS http://127.0.0.1:3001/health
+```
+
+Smoke-test routing with an authorized request:
+
+```bash
+curl -fsS http://127.0.0.1:3001/v1/images/generations -H "Authorization: Bearer $CHATGPT2API_AUTH_KEY" -H 'Content-Type: application/json' -d '{"prompt":"smoke test","size":"1024x1024"}'
+```
+
 
 ### 环境要求
 
@@ -391,3 +407,6 @@ uv run --with pytest --with pytest-asyncio python -m pytest -q
 许可证和来源声明必须随分发内容保留。运行时、版本检查、安装地址和容器发布均使用 GPTGrok2API 自有仓库与服务。
 
 本项目基于 [yukkcat/chatgpt2api](https://github.com/yukkcat/chatgpt2api) 二开。
+
+
+

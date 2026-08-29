@@ -103,6 +103,8 @@ export function accountRowSignature(item: Account): string {
     item.id,
     rowClass(item),
     accountTokenPreview(item),
+    item.token_preview,
+    item.has_access_token ? 1 : 0,
     accountSourceText(item),
     statusText(item),
     statusClass(item),
@@ -485,7 +487,7 @@ export function rowClass(item: Account): string {
   if (category === 'disabled') return 'bg-muted/50'
   if (category === 'abnormal') return 'bg-rose-500/5'
   if (category === 'limited') return 'bg-amber-500/5'
-  if (!item.access_token && !item.cookie) return 'bg-muted/30'
+  if (!item.has_access_token && !item.access_token && !item.cookie && !item.token_preview) return 'bg-muted/30'
   return ''
 }
 
@@ -589,10 +591,12 @@ export function accountProxyText(item: Account): string {
 }
 
 export function accountTokenPreview(item: Account): string {
+  const preview = cleanString(item.token_preview)
+  if (preview) return preview
   const masked = cleanString(item.cookie)
   if (masked) return masked
   const token = cleanString(item.access_token)
-  if (!token) return '缺失'
+  if (!token) return item.has_access_token ? '已保存' : '缺失'
   if (token.length <= 12) return '********'
   return `${token.slice(0, 6)}...${token.slice(-4)}`
 }

@@ -56,6 +56,14 @@
           <span class="file-countdown">{{ timeRemaining }}</span>
         </Tooltip>
       </div>
+      <div class="file-meta" v-if="file.source_type">
+        <span>{{ file.source_type === 'generated_output' ? '生成结果' : '历史结果' }}</span>
+        <span v-if="file.model">{{ file.model }}</span>
+      </div>
+      <div class="file-meta" v-if="file.call_id">
+        <span :title="file.call_id">请求 {{ file.call_id.slice(0, 12) }}</span>
+        <span v-if="file.endpoint">{{ file.endpoint }}</span>
+      </div>
       <div v-if="file.tags.length" class="tag-row">
         <button
           v-for="tag in file.tags"

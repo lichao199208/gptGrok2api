@@ -599,6 +599,108 @@
         </div>
       </details>
     </div>
+    <div v-if="currentType === 'mailcom_mother'" class="register-provider-section register-provider-section--soft">
+      <div class="register-provider-section-title">Mail.com 母号配置</div>
+      <div class="register-form-grid register-form-grid--three">
+        <label class="register-field">
+          <span class="register-label">IMAP Host</span>
+          <Input
+            :model-value="provider.imap_host"
+            block
+            root-class="font-mono"
+            :disabled="disabled"
+            placeholder="imap.mail.com"
+            @update:model-value="value => emit('update-field', index, 'imap_host', String(value || '').trim())"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">每母号最大激活子号</span>
+          <Input
+            :model-value="provider.max_active"
+            type="number"
+            min="1"
+            max="50"
+            block
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'max_active', numberModelValue(value))"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">主代理（建议 WARP）</span>
+          <Input
+            :model-value="provider.proxy"
+            block
+            root-class="font-mono"
+            :disabled="disabled"
+            placeholder="http://privoxy:8118"
+            @update:model-value="value => emit('update-field', index, 'proxy', String(value || '').trim())"
+          />
+        </label>
+
+        <label class="register-field">
+          <span class="register-label">每次登录预建子号数</span>
+          <Input
+            :model-value="provider.pool_batch"
+            type="number"
+            min="1"
+            max="6"
+            block
+            :disabled="disabled"
+            @update:model-value="value => emit('update-field', index, 'pool_batch', numberModelValue(value))"
+          />
+        </label>
+      </div>
+
+      <label class="register-field">
+        <span class="register-label">备用代理（每行一个，自动轮换）</span>
+        <textarea
+          class="register-textarea"
+          :disabled="disabled"
+          :value="mailcomProxiesText"
+          placeholder="http://privoxy:8118&#10;http://user:pass@host:port"
+          @input="mailcomProxiesText = ($event.target as HTMLTextAreaElement).value"
+        ></textarea>
+      </label>
+
+      <label class="register-field">
+        <span class="register-label">母号池导入</span>
+        <textarea
+          class="register-textarea register-textarea--tall"
+          :disabled="disabled"
+          :value="String(provider.accounts || '')"
+          placeholder="每行一个：邮箱----密码"
+          @input="emit('update-field', index, 'accounts', ($event.target as HTMLTextAreaElement).value)"
+        ></textarea>
+      </label>
+
+      <div v-if="Number(provider.accounts_count || 0) > 0" class="register-mailcom-summary">
+        <MetaChip size="xs" tone="success">已保存 {{ provider.accounts_count }} 个母号</MetaChip>
+        <MetaChip
+          v-for="preview in (provider.accounts_preview || [])"
+          :key="preview"
+          size="xs"
+          tone="muted"
+        >{{ preview }}</MetaChip>
+      </div>
+
+      <label class="register-field">
+        <span class="register-label">子号域名白名单</span>
+        <textarea
+          class="register-textarea"
+          :disabled="disabled"
+          :value="mailcomDomainsText"
+          placeholder="每行一个域名，如 mail.com / humanoid.net / salesperson.net"
+          @input="mailcomDomainsText = ($event.target as HTMLTextAreaElement).value"
+        ></textarea>
+      </label>
+
+      <p class="register-preview-line">
+        免费 mail.com 母号每个最多 9 个可删激活子号；配额满时自动删除最旧子号后创建新子号。
+        注册遇到“邮箱已使用”会自动重新生成子邮箱；验证码通过母号 IMAP 收取。
+      </p>
+    </div>
   </FormSection>
 </template>
 
@@ -675,6 +777,13 @@ const emit = defineEmits<{
 const currentType = computed(() => providerType(props.provider))
 const requirementMessages = computed(() => providerRequirementMessages(props.provider))
 const outlookSummary = computed(() => outlookPoolSummary(props.provider))
+const mailcomDomainsText = computed({
+  get: () => arrayText(props.provider.domains),
+  set: (value: string) => {
+    const list = value.split(/[\n,]/).map((item: string) => item.trim()).filter(Boolean)
+    emit('update-field', props.index, 'domains', list)
+  },
+})
 const failedMailboxes = computed<OutlookFailedMailbox[]>(() => (
   Array.isArray(props.provider.mailboxes_failed) ? props.provider.mailboxes_failed : []
 ))

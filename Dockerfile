@@ -1,73 +1,36 @@
-ARG TARGETARCH
-
 FROM node:22-alpine AS web-build
 
-WORKDIR /app/web-vue
-
+WORKDIR /src/web-vue
 COPY web-vue/package.json web-vue/package-lock.json ./
 RUN npm ci
-
-COPY VERSION /app/VERSION
-COPY CHANGELOG.md /app/CHANGELOG.md
+COPY VERSION /src/VERSION
+COPY CHANGELOG.md /src/CHANGELOG.md
 COPY web-vue ./
+COPY web-vue/tsconfig.json /src/web-vue/tsconfig.json
 RUN npm run build
 
+FROM golang:1.23-alpine AS go-build
+WORKDIR /src
+COPY go.mod ./
+COPY go.sum ./
+COPY cmd ./cmd
+COPY internal ./internal
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gptgrok2api ./cmd/gptgrok2api
 
-FROM node:22-alpine AS protocol-node-deps
-
+FROM alpine:3.21
+RUN adduser -D -H -u 10001 app
 WORKDIR /app
-
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev --ignore-scripts && npm cache clean --force
-
-
-FROM python:3.13-slim AS app
-
-ARG TARGETARCH
-
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    UV_LINK_MODE=copy \
-    TZ=Asia/Shanghai \
-    CHATGPT2API_THREAD_TOKENS=80
-
-WORKDIR /app
-
-# 安装系统依赖
-# - git: Git 存储后端需要
-# - libpq-dev: PostgreSQL 客户端库
-# - gcc: 编译 psycopg2-binary 需要
-# - nodejs: 无浏览器执行 Castle SDK；npm 仅在 protocol-node-deps 阶段使用
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git \
-    libpq-dev \
-    gcc \
-    nodejs \
-    openssl \
-    tzdata \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir uv
-
-COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev --no-install-project
-
-COPY package.json package-lock.json ./
-COPY --from=protocol-node-deps /app/node_modules ./node_modules
-
-COPY main.py ./
-COPY config.example.yaml ./
-COPY config.defaults.toml ./
-COPY VERSION ./
-COPY CHANGELOG.md ./
-COPY GROK2API_LICENSE ./
-COPY app ./app
-COPY api ./api
-COPY services ./services
-COPY utils ./utils
-COPY scripts ./scripts
-COPY --from=web-build /app/web-vue/dist ./web_dist
-
+COPY --from=go-build /gptgrok2api /app/gptgrok2api
+COPY --from=web-build /src/web-vue/dist /app/web_dist
+COPY VERSION CHANGELOG.md config.example.yaml ./
+COPY services/default_prompt_library.json /app/services/default_prompt_library.json
+RUN mkdir -p /app/data /app/logs && chown -R app:app /app
+USER app
+ENV GO_LISTEN_ADDR=:80 \
+    GO_STATIC_DIR=/app/web_dist \
+    GO_CONFIG_PATH=/app/data/config.json \
+    GO_AUTH_KEYS_PATH=/app/data/auth_keys.json \
+    GROK_DATA_DIR=/app/data \
+    GO_QUEUE_BACKEND=json
 EXPOSE 80
-
-CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "80", "--access-log"]
+ENTRYPOINT ["/app/gptgrok2api"]

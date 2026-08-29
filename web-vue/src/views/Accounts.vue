@@ -496,14 +496,31 @@
                 </FormSection>
 
                 <FormSection surface="plain">
-                  <label class="block text-xs">
+                  <div class="grid grid-cols-1 gap-2.5 md:grid-cols-2">
+                    <label class="text-xs">
+                      <span class="ui-field-label">登录账号 / 邮箱</span>
+                      <Input v-model="form.email" block autocomplete="username" placeholder="name@example.com" />
+                    </label>
+                    <label class="text-xs">
+                      <span class="ui-field-label">账户 ID</span>
+                      <Input v-model="form.user_id" block placeholder="ChatGPT account / user ID" />
+                    </label>
+                    <label class="text-xs">
+                      <span class="ui-field-label">账户密码</span>
+                      <Input v-model="form.login_password" type="password" block autocomplete="new-password" placeholder="没有则留空" />
+                    </label>
+                    <label class="text-xs">
+                      <span class="ui-field-label">2FA Secret</span>
+                      <Input v-model="form.two_factor_secret" type="password" block autocomplete="off" placeholder="没有则留空" />
+                    </label>
+                  </div>
+                  <label class="mt-2.5 block text-xs">
                     <span class="ui-field-label">Access Token（必填）</span>
                     <textarea
                       v-model.trim="form.access_token"
                       rows="3"
                       class="ui-textarea-sm font-mono"
                       placeholder="粘贴完整 access token"
-                      :disabled="!!editingId"
                     ></textarea>
                   </label>
                 </FormSection>
@@ -1170,6 +1187,7 @@ const {
   removeAccount: removeGrokAccount,
   runBulkAction: runGrokBulkAction,
   exportAccounts: exportGrokAccounts,
+  exportSsoAccounts: grokExportSsoAccounts,
 } = useGrokAccountsPage()
 
 type AccountPlatformView = 'gpt' | 'grok'
@@ -1211,6 +1229,7 @@ const grokExportMenuItems = computed(() => [
     children: [
       { key: 'selected_sub2api', label: 'Sub2API 格式 (.json)' },
       { key: 'selected_cpa', label: 'CPA 格式 (.zip)' },
+      { key: 'selected_sso', label: 'SSO 格式 (.txt)' },
     ],
   },
   {
@@ -1221,6 +1240,7 @@ const grokExportMenuItems = computed(() => [
     children: [
       { key: 'all_sub2api', label: 'Sub2API 格式 (.json)' },
       { key: 'all_cpa', label: 'CPA 格式 (.zip)' },
+      { key: 'all_sso', label: 'SSO 格式 (.txt)' },
     ],
   },
 ])
@@ -1359,8 +1379,12 @@ watch(
 )
 
 async function handleGrokExportAction(action: string) {
-  const match = action.match(/^(selected|all)_(sub2api|cpa)$/)
+  const match = action.match(/^(selected|all)_(sub2api|cpa|sso)$/)
   if (!match) return
+  if (match[2] === 'sso') {
+    await grokExportSsoAccounts(match[1] as 'selected' | 'all')
+    return
+  }
   await exportGrokAccounts(
     match[1] as 'selected' | 'all',
     match[2] as 'sub2api' | 'cpa',

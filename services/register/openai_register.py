@@ -173,6 +173,7 @@ register_checkout_retry_sink: Callable[[dict[str, Any]], None] | None = None
 # re-populate a cleared task table.
 register_checkout_task_run_id = ""
 OPENAI_EXISTING_EMAIL_RETRY_LIMIT = 20
+MAIL_DELIVERY_RETRY_LIMIT = 3
 CF_MAILBOX_WAIT_TIMEOUT_SECONDS = 60.0
 
 
@@ -191,6 +192,16 @@ class OpenAIEmailAlreadyRegistered(RuntimeError):
         else:
             message = f"当前邮箱已进入 OpenAI 登录分支，不能作为新账号继续注册: {self.email}"
         super().__init__(message)
+
+
+def _is_openai_invalid_auth_step(error: Exception | str | None) -> bool:
+    """create_account 返回 invalid_auth_step：OpenAI 判定当前会话处于登录态而非注册态。
+
+    通常意味着该邮箱已被判为已有账号（或在 OTP 验证后授权上下文过期）。
+    上层将其视为“邮箱已使用”，自动更换子号重试。
+    """
+    text = str(error or "").strip().lower()
+    return "invalid_auth_step" in text or "invalid authorization step" in text
 
 
 class OpenAIMailboxDeliveryTimeout(RuntimeError):
@@ -1859,6 +1870,10 @@ class PlatformRegistrar:
             mail_provider.mark_mailbox_result(mailbox, success=True)
             raise
         except Exception as error:
+            if _is_openai_invalid_auth_step(error):
+                step(index, f"{email} 授权状态异常（invalid_auth_step），判定为邮箱已使用，自动更换子号", "yellow")
+                mail_provider.mark_mailbox_result(mailbox, success=True)
+                raise OpenAIEmailAlreadyRegistered(email, reason="invalid_auth_step") from error
             if _is_openai_account_deactivated_error(error):
                 mail_provider.mark_mailbox_result(mailbox, success=True)
                 raise OpenAIEmailAlreadyRegistered(
@@ -2841,6 +2856,10 @@ class TraditionalChatGPTRegistrar(ChatGPTWebRegistrar):
             mail_provider.mark_mailbox_result(mailbox, success=True)
             raise
         except Exception as error:
+            if _is_openai_invalid_auth_step(error):
+                step(index, f"{email} 授权状态异常（invalid_auth_step），判定为邮箱已使用，自动更换子号", "yellow")
+                mail_provider.mark_mailbox_result(mailbox, success=True)
+                raise OpenAIEmailAlreadyRegistered(email, reason="invalid_auth_step") from error
             mail_provider.mark_mailbox_result(mailbox, success=False, error=error)
             raise
         mail_provider.mark_mailbox_result(mailbox, success=True)
@@ -3013,6 +3032,7 @@ def _enabled_mail_provider_count() -> int:
 def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
     skipped = 0
     delivery_failures = 0
+    delivery_failures_by_provider: dict[str, int] = {}
     excluded_provider_refs: set[str] = set()
     provider_count = max(1, _enabled_mail_provider_count())
     while True:
@@ -3023,16 +3043,20 @@ def _register_with_fresh_email(index: int) -> tuple[PlatformRegistrar, dict]:
         except OpenAIMailboxDeliveryTimeout as error:
             registrar.close()
             delivery_failures += 1
-            if error.provider_ref:
-                excluded_provider_refs.add(error.provider_ref)
-            remaining = provider_count - max(delivery_failures, len(excluded_provider_refs))
+            provider_ref = str(error.provider_ref or "").strip()
+            if provider_ref:
+                delivery_failures_by_provider[provider_ref] = delivery_failures_by_provider.get(provider_ref, 0) + 1
+                if delivery_failures_by_provider[provider_ref] >= MAIL_DELIVERY_RETRY_LIMIT:
+                    excluded_provider_refs.add(provider_ref)
+            remaining = provider_count - len(excluded_provider_refs)
             if remaining <= 0:
                 raise RuntimeError(
-                    f"所有启用邮箱来源均未收到 ChatGPT 验证码，最后失败来源：{error.label}"
+                    f"所有启用邮箱来源均多次未收到 ChatGPT 验证码（同一来源最多重试 {MAIL_DELIVERY_RETRY_LIMIT} 次），任务停止；最后失败来源：{error.label}"
                 ) from error
+            same_provider_attempts = delivery_failures_by_provider.get(provider_ref, 0)
             step(
                 index,
-                f"{error.label} 未收到验证码，正在切换下一个邮箱来源（剩余 {remaining} 个）",
+                f"{error.label} 未收到验证码，自动更换邮箱重试（同来源第 {same_provider_attempts} 次，剩余来源 {remaining} 个）",
                 "yellow",
             )
         except OpenAIEmailAlreadyRegistered as error:

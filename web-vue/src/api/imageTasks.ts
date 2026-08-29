@@ -160,8 +160,8 @@ export const STANDARD_IMAGE_SIZE_PRESETS: ImageSizePreset[] = [
   createSizePreset('1024x1024', '1:1', '1K'),
   createSizePreset('1024x1536', '2:3', '1K'),
   createSizePreset('1536x1024', '3:2', '1K'),
-  createSizePreset('1024x1365', '3:4', '1K'),
-  createSizePreset('1365x1024', '4:3', '1K'),
+  createSizePreset('1024x1360', '3:4', '1K'),
+  createSizePreset('1360x1024', '4:3', '1K'),
   createSizePreset('1088x1920', '9:16', '1K'),
   createSizePreset('1920x1088', '16:9', '1K'),
 ]

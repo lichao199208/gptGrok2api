@@ -382,6 +382,9 @@ async def health():
 
 
 def _xai_http_error(error: Exception) -> HTTPException:
+    import logging, traceback
+    logging.getLogger('xai').error('xai browser flow error: %s', error, exc_info=True)
+    traceback.print_exc()
     from xai_browser.flow import XaiBrowserFlowError
 
     if isinstance(error, XaiBrowserFlowError):

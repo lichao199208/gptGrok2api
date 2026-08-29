@@ -649,9 +649,9 @@ def create_router() -> APIRouter:
         )
 
     @router.get("/files/{file_path:path}")
-    async def download_editable_file(file_path: str):
+    async def download_editable_file(file_path: str, signature: str = ""):
         try:
-            path = await run_in_threadpool(editable_file_task_service.public_file_path, file_path)
+            path = await run_in_threadpool(editable_file_task_service.public_file_path, file_path, signature)
         except Exception as exc:
             raise HTTPException(status_code=404, detail={"error": "file not found"}) from exc
         return FileResponse(path, filename=path.name)

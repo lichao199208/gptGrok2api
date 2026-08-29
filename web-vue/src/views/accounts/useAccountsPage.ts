@@ -260,13 +260,15 @@ export function useAccountsPage() {
   const bindSelectedAccountsToGroup = accountBulkActions.bindSelectedAccountsToGroup
 
   async function copyAccountToken(item: Account) {
-    const token = String(item.access_token || item.cookie || '').trim()
-    if (!token) {
-      toast.warning('当前账号没有可复制的 Token')
-      return
-    }
-
     try {
+      let token = String(item.access_token || '').trim()
+      if (!token && item.has_access_token !== false) {
+        token = await accountsApi.getAccountToken(item.id)
+      }
+      if (!token) {
+        toast.warning('当前账号没有可复制的 Token')
+        return
+      }
       await navigator.clipboard.writeText(token)
       toast.success('Token 已复制')
     } catch (error) {

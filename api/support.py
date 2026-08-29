@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import ipaddress
+import os
 from pathlib import Path
 from threading import Event, Thread
+from urllib.parse import urlsplit, urlunsplit
 
 from fastapi import HTTPException, Request
 
@@ -47,7 +50,50 @@ def require_admin(authorization: str | None) -> dict[str, object]:
 
 
 def resolve_image_base_url(request: Request) -> str:
-    return config.base_url or f"{request.url.scheme}://{request.headers.get('host', request.url.netloc)}"
+    configured = _normalize_public_base_url(config.base_url)
+    if configured:
+        return configured
+    scheme = str(request.url.scheme or "").strip().lower()
+    host = str(request.headers.get("host") or request.url.netloc or "").strip()
+    candidate = _normalize_public_base_url(f"{scheme}://{host}")
+    if not candidate:
+        return ""
+    hostname = urlsplit(candidate).hostname or ""
+    if _trust_request_host() or _is_local_hostname(hostname):
+        return candidate
+    return ""
+
+
+def _normalize_public_base_url(value: object) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    try:
+        parsed = urlsplit(text)
+        _ = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        return ""
+    if parsed.query or parsed.fragment:
+        return ""
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def _trust_request_host() -> bool:
+    return str(os.getenv("CHATGPT2API_TRUST_REQUEST_HOST") or "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _is_local_hostname(hostname: str) -> bool:
+    normalized = str(hostname or "").strip().rstrip(".").lower()
+    if normalized == "localhost" or normalized.endswith(".localhost") or normalized.endswith(".local"):
+        return True
+    try:
+        return not ipaddress.ip_address(normalized.split("%", 1)[0]).is_global
+    except ValueError:
+        return False
 
 
 def raise_image_quota_error(exc: Exception) -> None:

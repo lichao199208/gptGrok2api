@@ -83,6 +83,8 @@ class EditTokenRequest(BaseModel):
     old_token: str
     token: str
     pool: str = "basic"
+    login_password: str | None = None
+    two_factor_secret: str | None = None
 
 
 class ToggleTokenDisabledRequest(BaseModel):
@@ -152,6 +154,9 @@ def _serialize_record(r) -> dict:
         "refresh_status": str(r.ext.get("refresh_status") or ""),
         "refresh_at": r.ext.get("refresh_at"),
         "refresh_error": str(r.ext.get("refresh_error") or "")[:300],
+        # Credential metadata is admin-only and stored in the extensible account record.
+        "login_password": str(r.ext.get("login_password") or ""),
+        "two_factor_secret": str(r.ext.get("two_factor_secret") or ""),
     }
 
 
@@ -418,11 +423,16 @@ async def edit_token(
                 status=409,
             )
 
+    ext = dict(record.ext or {})
+    if req.login_password is not None:
+        ext["login_password"] = req.login_password
+    if req.two_factor_secret is not None:
+        ext["two_factor_secret"] = req.two_factor_secret
     await repo.upsert_accounts([AccountUpsert(
         token=new_token,
         pool=pool,
         tags=record.tags,
-        ext=record.ext,
+        ext=ext,
     )])
 
     if old_token == new_token:

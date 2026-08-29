@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import itertools
+import os
 import re
 import threading
 import time
@@ -13,6 +15,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import HTTPException
+from starlette.background import BackgroundTask
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -31,6 +34,58 @@ LOG_IMAGE_URL_RE = re.compile(r"(?:!\[[^\]]*\]\()(?P<url>(?:https?://|/images/|/
 PERF_WAIT_WARN_MS = 1000
 REQUEST_TEXT_EXCERPT_LIMIT = 1000
 REQUEST_TEXT_FULL_LIMIT = 50000
+
+
+def _image_inflight_limit() -> int:
+    try:
+        return max(1, min(256, int(os.getenv("CHATGPT2API_IMAGE_MAX_INFLIGHT", "12"))))
+    except (TypeError, ValueError):
+        return 12
+
+
+IMAGE_MAX_INFLIGHT = _image_inflight_limit()
+try:
+    IMAGE_QUEUE_TIMEOUT_SECS = max(1.0, min(300.0, float(os.getenv("CHATGPT2API_IMAGE_QUEUE_TIMEOUT_SECS", "30"))))
+except (TypeError, ValueError):
+    IMAGE_QUEUE_TIMEOUT_SECS = 30.0
+IMAGE_INFLIGHT_GATE: asyncio.Semaphore | None = None
+IMAGE_INFLIGHT_LOOP: asyncio.AbstractEventLoop | None = None
+IMAGE_INFLIGHT_GATE_LOCK = threading.Lock()
+
+
+def _image_gate_for_current_loop() -> asyncio.Semaphore:
+    global IMAGE_INFLIGHT_GATE, IMAGE_INFLIGHT_LOOP
+    loop = asyncio.get_running_loop()
+    with IMAGE_INFLIGHT_GATE_LOCK:
+        if IMAGE_INFLIGHT_GATE is None or IMAGE_INFLIGHT_LOOP is not loop:
+            IMAGE_INFLIGHT_GATE = asyncio.Semaphore(IMAGE_MAX_INFLIGHT)
+            IMAGE_INFLIGHT_LOOP = loop
+        return IMAGE_INFLIGHT_GATE
+
+
+async def _acquire_image_slot() -> bool:
+    gate = _image_gate_for_current_loop()
+    try:
+        await asyncio.wait_for(gate.acquire(), timeout=IMAGE_QUEUE_TIMEOUT_SECS)
+        return True
+    except asyncio.TimeoutError:
+        return False
+
+
+def _release_image_slot_from_any_context() -> None:
+    with IMAGE_INFLIGHT_GATE_LOCK:
+        gate = IMAGE_INFLIGHT_GATE
+        loop = IMAGE_INFLIGHT_LOOP
+    if gate is None or loop is None or loop.is_closed():
+        return
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+    if current_loop is loop:
+        gate.release()
+    elif loop.is_running():
+        loop.call_soon_threadsafe(gate.release)
 
 
 class LogService:
@@ -854,6 +909,42 @@ class LoggedCall:
         if args and isinstance(args[0], dict):
             self.attach_trace_metadata(args[0])
         trace_perf = self._trace_image_perf()
+        image_slot_acquired = False
+        image_slot_released = False
+        image_slot_lock = threading.Lock()
+
+        def release_image_slot() -> None:
+            nonlocal image_slot_released
+            with image_slot_lock:
+                if not image_slot_acquired or image_slot_released:
+                    return
+                image_slot_released = True
+                _release_image_slot_from_any_context()
+
+        if trace_perf:
+            image_slot_acquired = await _acquire_image_slot()
+            if not image_slot_acquired:
+                logger.warning({
+                    "event": "image_global_concurrency_timeout",
+                    "call_id": self.call_id,
+                    "endpoint": self.endpoint,
+                    "model": self.model,
+                    "limit": IMAGE_MAX_INFLIGHT,
+                })
+                self.log(
+                    "调用拒绝",
+                    status="rejected",
+                    error="image generation queue timeout",
+                    extra={
+                        "error_code": "image_concurrency_queue_timeout",
+                        "limit": IMAGE_MAX_INFLIGHT,
+                        "queue_timeout_secs": IMAGE_QUEUE_TIMEOUT_SECS,
+                    },
+                )
+                return openai_error_response(
+                    "image generation queue is busy; retry later",
+                    429,
+                )
         if trace_perf:
             realtime_monitor_service.start(
                 self.call_id,
@@ -894,22 +985,40 @@ class LoggedCall:
         try:
             result = await run_in_threadpool(_call_handler)
         except ImageGenerationError as exc:
+            release_image_slot()
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      conversation_id=getattr(exc, "conversation_id", ""), extra=_exception_log_fields(exc))
             return _image_error_response(exc)
         except HTTPException as exc:
+            release_image_slot()
             self.log("调用失败", status="failed", error=str(exc.detail))
             raise
         except Exception as exc:
+            release_image_slot()
             self.log("调用失败", status="failed", error=str(exc), account_email=getattr(exc, "account_email", ""),
                      extra=_exception_log_fields(exc))
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
+        except BaseException:
+            release_image_slot()
+            raise
 
         if isinstance(result, dict):
+            release_image_slot()
             self.log("调用完成", result)
             return _strip_internal_response_fields(result)
+
+        if image_slot_acquired:
+            original_result = result
+
+            def release_after_stream():
+                try:
+                    yield from original_result
+                finally:
+                    release_image_slot()
+
+            result = release_after_stream()
 
         if self.endpoint.startswith("/v1/images"):
             sender = image_sse_stream
@@ -958,10 +1067,18 @@ class LoggedCall:
             if self.endpoint.startswith("/v1/images"):
                 return _image_error_response(exc)
             return _protocol_error_response(exc, 502, sse)
+        except BaseException:
+            release_image_slot()
+            raise
         if not has_first:
+            release_image_slot()
             self.log("流式调用结束")
             return StreamingResponse(sender(()), media_type="text/event-stream")
-        return StreamingResponse(sender(self.stream(itertools.chain([first], result))), media_type="text/event-stream")
+        return StreamingResponse(
+            sender(self.stream(itertools.chain([first], result))),
+            media_type="text/event-stream",
+            background=BackgroundTask(release_image_slot),
+        )
 
     def _trace_image_perf(self) -> bool:
         model = str(self.model or "").strip().lower()

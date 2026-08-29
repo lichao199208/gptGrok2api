@@ -76,6 +76,9 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
         progress_callback=progress_callback,
         call_id=str(body.get("_call_id") or ""),
         trace_image_perf=bool(body.get("_trace_image_perf")),
+        reservation_managed=bool(body.get("_reservation_managed")),
+        reserved_account_token=str(body.get("_reserved_account_token") or ""),
+        reserved_proxy_profile=body.get("_reserved_proxy_profile"),
     ))
     if body.get("stream"):
         input_text_tokens = count_text_tokens(prompt, model)

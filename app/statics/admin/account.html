@@ -1084,6 +1084,8 @@
         <span class="dialog-label" data-i18n="account.labelType">类型</span>
         <select class="input" id="edit-pool" style="flex:1"></select>
       </div>
+      <div class="dialog-field"><span class="dialog-label">密码</span><input class="input" id="edit-login-password" type="password" autocomplete="new-password" placeholder="没有则留空"></div>
+      <div class="dialog-field"><span class="dialog-label">2FA Secret</span><input class="input" id="edit-two-factor-secret" type="password" autocomplete="off" placeholder="没有则留空"></div>
     </div>
     <div class="dialog-actions">
       <button onclick="closeModal('modal-edit')" class="dialog-btn" data-i18n="account.cancel">取消</button>
@@ -1716,6 +1718,8 @@ function openEdit(token) {
   document.getElementById('edit-token').value = item.token;
   fillPoolOptions('edit-pool');
   document.getElementById('edit-pool').value = item.pool || 'basic';
+  document.getElementById('edit-login-password').value = item.login_password || '';
+  document.getElementById('edit-two-factor-secret').value = item.two_factor_secret || '';
   openModal('modal-edit');
 }
 
@@ -1778,11 +1782,13 @@ async function doImport() {
 async function doEdit() {
   const token = document.getElementById('edit-token').value.trim();
   const pool = document.getElementById('edit-pool').value;
+  const login_password = document.getElementById('edit-login-password').value;
+  const two_factor_secret = document.getElementById('edit-two-factor-secret').value;
   if (!_editingToken) return;
   if (!token) return showToast(tr('account.enterToken', null, '请输入 Token'), 'error');
   try {
     showToast(tr('account.saving', null, '正在保存修改…'), 'info');
-    await _api('PUT', '/tokens/edit', { old_token: _editingToken, token, pool });
+    await _api('PUT', '/tokens/edit', { old_token: _editingToken, token, pool, login_password, two_factor_secret });
     closeModal('modal-edit');
     _editingToken = '';
     showToast(tr('account.editDone', null, '编辑完成'), 'success');

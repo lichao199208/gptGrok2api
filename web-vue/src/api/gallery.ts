@@ -20,6 +20,12 @@ export interface GalleryFile {
   webdav: boolean
   width: number | null
   height: number | null
+  source_type?: string
+  role?: string
+  call_id?: string
+  endpoint?: string
+  model?: string
+  generated_at?: string
 }
 
 export interface GalleryResponse {
@@ -77,6 +83,10 @@ type BackendImagesResponse = {
   page_size?: number
   page_count?: number
   has_more?: boolean
+}
+
+type BackendStorageResponse = Partial<ImageStorageStats> & {
+  images?: { count?: number; size_bytes?: number }
 }
 
 type BackendTagsResponse = {
@@ -200,7 +210,7 @@ function expiryForItem(item: BackendImageItem, createdAtMs: number, retentionDay
 function mapFile(item: BackendImageItem, retentionDays: number): GalleryFile {
   const path = cleanString(item.path || item.rel || item.name)
   const name = cleanString(item.filename || item.name || path.split('/').pop() || path)
-  const createdAt = cleanString(item.created_at)
+  const createdAt = cleanString(item.created_at || item.generated_at || item.updated_at)
   const createdAtMs = parseTimeMs(createdAt)
   const expiry = expiryForItem(item, createdAtMs, retentionDays)
   const safePath = path || name
@@ -222,6 +232,12 @@ function mapFile(item: BackendImageItem, retentionDays: number): GalleryFile {
     webdav: Boolean(item.webdav ?? false),
     width: Number.isFinite(Number(item.width)) ? Number(item.width) : null,
     height: Number.isFinite(Number(item.height)) ? Number(item.height) : null,
+    source_type: cleanString(item.source_type),
+    role: cleanString(item.role),
+    call_id: cleanString(item.call_id),
+    endpoint: cleanString(item.endpoint),
+    model: cleanString(item.model),
+    generated_at: cleanString(item.generated_at || createdAt),
   }
 }
 
@@ -384,8 +400,19 @@ export const galleryApi = {
   deleteTag: (tag: string) =>
     apiClient.delete<never, { ok: boolean; removed_from: number }>(`/api/images/tags/${encodeURIComponent(tag)}`),
 
-  getStorage: () =>
-    apiClient.get<never, ImageStorageStats>('/api/images/storage'),
+  getStorage: async (): Promise<ImageStorageStats> => {
+    const response = await apiClient.get<never, BackendStorageResponse>('/api/images/storage')
+    const images = response.images || {}
+    const imageSizeBytes = Number(response.image_size_bytes ?? images.size_bytes ?? 0)
+    return {
+      disk_total_mb: Number(response.disk_total_mb || 0),
+      disk_used_mb: Number(response.disk_used_mb || 0),
+      disk_free_mb: Number(response.disk_free_mb || 0),
+      image_count: Number(response.image_count ?? images.count ?? 0),
+      image_size_mb: Number(response.image_size_mb ?? (imageSizeBytes / (1024 * 1024))),
+      image_size_bytes: imageSizeBytes,
+    }
+  },
 
   compressStorage: () =>
     apiClient.post<never, ImageCompressResult>('/api/images/storage/compress'),

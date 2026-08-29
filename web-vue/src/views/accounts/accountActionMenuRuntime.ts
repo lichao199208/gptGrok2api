@@ -53,6 +53,7 @@ const accountImportActions = new Set<AccountImportMode>([
 
 const accountBulkActions = new Set<AccountBulkAction>([
   'refresh',
+  'refresh_at',
   'reset',
   'enable',
   'disable',
@@ -141,6 +142,7 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
   const batchMenuItems = computed<AccountActionMenuItem[]>(() => actionMenuGroups<AccountActionMenuItem>(
     [
       { key: 'extract_checkout', label: '批量持续提链' },
+      { key: 'refresh_at', label: '协议登录批量刷新 AT' },
       { key: 'refresh', label: '批量刷新账号信息和额度' },
       { key: 'reset', label: '批量重置' },
     ],
@@ -166,6 +168,11 @@ export function useAccountActionMenuRuntime(options: AccountActionMenuRuntimeOpt
         {
           key: 'extract_checkout',
           label: `持续提链选中账号${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
+          disabled: noSelection,
+        },
+        {
+          key: 'refresh_at',
+          label: `协议登录刷新选中 AT${options.selectedCount.value ? ` (${options.selectedCount.value})` : ''}`,
           disabled: noSelection,
         },
         {

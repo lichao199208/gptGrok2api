@@ -37,6 +37,38 @@
         </div>
       </FormSection>
 
+      <FormSection title="账号导入 API" subtitle="生成一个独立密钥，外部系统可用它调用接口直接向 GPT 账号管理添加账号（也可用管理员 Bearer 调用）。">
+        <div class="settings-check-grid settings-check-grid--single">
+          <div class="settings-check-item">
+            <div class="settings-check-control">
+              <Checkbox :model-value="apiImportEnabled" @update:model-value="setApiImportEnabled">启用账号导入 API</Checkbox>
+            </div>
+          </div>
+        </div>
+        <FormField label="API 密钥">
+          <div class="flex gap-2">
+            <Input
+              :model-value="apiImportKey"
+              block
+              readonly
+              placeholder="未设置，点击右侧生成"
+            />
+            <Button variant="secondary" @click="generateApiKey">生成</Button>
+          </div>
+        </FormField>
+        <FormField label="接口地址（POST）">
+          <p class="break-all rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs text-foreground">
+            {{ serviceBaseUrl }}/api/accounts/import-api
+          </p>
+        </FormField>
+        <FormField label="调用示例（curl）">
+          <pre class="overflow-x-auto rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs leading-5 text-foreground">curl -X POST {{ serviceBaseUrl }}/api/accounts/import-api \
+  -H "X-API-Key: {{ apiImportKey || '<你的密钥>' }}" \
+  -H "Content-Type: application/json" \
+  -d '{"accounts":[{"access_token":"...","refresh_token":"...","email":"...","password":"...","two_factor_secret":"...","status":"正常"}]}'</pre>
+        </FormField>
+      </FormSection>
+
       <FormSection title="当前模型" subtitle="模型来自统一目录，会按实际 GPT/Grok 账号能力自动更新。">
         <div class="grid gap-3 md:grid-cols-3">
           <SurfaceBox v-for="item in modelItems" :key="item.label" density="compact">
@@ -73,7 +105,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted } from 'vue'
-import { Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
+import { Button, Checkbox, FormField, FormSection, Input } from 'nanocat-ui'
 import SurfaceBox from '@/components/ai/SurfaceBox.vue'
 import { getAuthToken } from '@/api/client'
 import { useModelCatalog } from '@/composables/useModelCatalog'
@@ -112,6 +144,21 @@ const apiDocItems = computed(() => (
       })
     : []
 ))
+
+const apiImportEnabled = computed<boolean>(() => Boolean(props.settings.account_import_api?.enabled))
+function setApiImportEnabled(value: boolean) {
+  if (!props.settings.account_import_api) props.settings.account_import_api = { enabled: false, key: '' }
+  props.settings.account_import_api.enabled = value
+  if (value && !props.settings.account_import_api.key) generateApiKey()
+}
+const apiImportKey = computed<string>(() => props.settings.account_import_api?.key || '')
+function generateApiKey() {
+  const bytes = new Uint8Array(24)
+  crypto.getRandomValues(bytes)
+  const key = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  if (!props.settings.account_import_api) props.settings.account_import_api = { enabled: false, key: '' }
+  props.settings.account_import_api.key = key
+}
 
 onMounted(() => {
   void loadModelCatalog()

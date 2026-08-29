@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import hmac
 import threading
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
 from services.account_service import account_service
-from services.config import DATA_DIR
+from services.config import DATA_DIR, config
 from services.content_filter import request_text
 from services.json_file import read_json_file, write_json_file
 from services.log_service import LOG_TYPE_CALL, log_service
@@ -47,10 +49,35 @@ def _elapsed_seconds(task: dict[str, Any]) -> int:
     return max(0, int(end - start)) if start else 0
 
 
+def _download_signature(relative_path: str) -> str:
+    secret = str(config.auth_key or "").encode("utf-8")
+    return hmac.new(secret, relative_path.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _storage_component(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
+
+
 def _file_url(path: Path, base_url: str) -> str:
     rel = path.resolve().relative_to(EDITABLE_FILE_ROOT.resolve()).as_posix()
     prefix = str(base_url or "").strip().rstrip("/")
-    return f"{prefix}/files/{quote(rel, safe='/')}" if prefix else f"/files/{quote(rel, safe='/')}"
+    query = urlencode({"signature": _download_signature(rel)})
+    download_path = f"/files/{quote(rel, safe='/')}?{query}"
+    return f"{prefix}{download_path}" if prefix else download_path
+
+
+def _refresh_file_url(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = urlsplit(text)
+    marker = "/files/"
+    if marker not in parsed.path:
+        return text
+    relative_path = unquote(parsed.path.split(marker, 1)[1]).replace("\\", "/").lstrip("/")
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query["signature"] = _download_signature(relative_path)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, urlencode(query), parsed.fragment))
 
 
 def _editable_access_token() -> str:
@@ -77,9 +104,15 @@ def _public_task(task: dict[str, Any]) -> dict[str, Any]:
         "updated_at": task.get("updated_at"),
         "elapsed_seconds": _elapsed_seconds(task),
     }
-    for key in ("result", "error"):
-        if task.get(key):
-            item[key] = task[key]
+    result = task.get("result")
+    if isinstance(result, dict):
+        public_result = dict(result)
+        for key in ("primary_url", "zip_url"):
+            if result.get(key):
+                public_result[key] = _refresh_file_url(result.get(key))
+        item["result"] = public_result
+    if task.get("error"):
+        item["error"] = task["error"]
     return item
 
 
@@ -137,7 +170,11 @@ class EditableFileTaskService:
             token = _editable_access_token()
             account = account_service.get_account(token) or {}
             account_email = _clean(account.get("email"))
-            output_dir = EDITABLE_FILE_ROOT / kind / key.rsplit(":", 1)[-1]
+            with self._lock:
+                task = dict(self._tasks.get(key) or {})
+            owner_component = _storage_component(_clean(task.get("owner_id"), "anonymous"))
+            task_component = _storage_component(_clean(task.get("id"), key))
+            output_dir = EDITABLE_FILE_ROOT / kind / owner_component / task_component
             with OpenAIBackendAPI(token) as backend:
                 result = backend.export_psd_zip(base64_images, prompt, output_dir) if kind == "psd" else backend.export_ppt_zip(base64_images, prompt, output_dir)
             account_service.mark_text_used(token)
@@ -149,8 +186,12 @@ class EditableFileTaskService:
             self._update_task(key, status=TASK_STATUS_ERROR, error=error, account_email=account_email, ended_ts=time.time())
             self._log_call(identity, kind, started, request_text(prompt), status="failed", error=error, account_email=account_email)
 
-    def public_file_path(self, relative_path: str) -> Path:
+    def public_file_path(self, relative_path: str, signature: str) -> Path:
         raw = str(relative_path or "").replace("\\", "/").lstrip("/")
+        provided_signature = str(signature or "").strip()
+        expected_signature = _download_signature(raw)
+        if not provided_signature or not hmac.compare_digest(provided_signature, expected_signature):
+            raise PermissionError(raw)
         path = (EDITABLE_FILE_ROOT / raw).resolve()
         path.relative_to(EDITABLE_FILE_ROOT.resolve())
         if not path.is_file():

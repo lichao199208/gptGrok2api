@@ -781,6 +781,11 @@ class ConversationRequest:
     progress_callback: Any = None  # Callable[[str], None] | None
     call_id: str = ""
     trace_image_perf: bool = False
+    # Set only by the protected scheduler execution endpoint.  These resources
+    # were already reserved, so the normal pool must not acquire/release them.
+    reservation_managed: bool = False
+    reserved_account_token: str = ""
+    reserved_proxy_profile: Any = None
 
 
 @dataclass
@@ -1887,7 +1892,11 @@ def _generate_single_image(
         stream_started = 0.0
         try:
             _raise_if_request_cancelled(request)
-            if retry_token:
+            if request.reservation_managed:
+                token = str(request.reserved_account_token or "").strip()
+                if not token:
+                    raise RuntimeError("reservation is missing its account")
+            elif retry_token:
                 token = retry_token
                 retry_token = ""
             else:
@@ -1938,6 +1947,10 @@ def _generate_single_image(
             if image_slot_finalized:
                 return
             image_slot_finalized = True
+            if request.reservation_managed:
+                # The protected execution endpoint owns the final, idempotent
+                # release so every outcome returns both reserved resources.
+                return
             account_service.mark_image_result(
                 token,
                 success,
@@ -1977,10 +1990,10 @@ def _generate_single_image(
         egress_acquired = False
         try:
             egress_started = time.perf_counter()
-            fallback_profile = None
+            fallback_profile = request.reserved_proxy_profile if request.reservation_managed else None
             using_fallback_profile = fallback_retry_pending
             fallback_retry_pending = False
-            if using_fallback_profile:
+            if using_fallback_profile and not request.reservation_managed:
                 fallback_profile = proxy_settings.get_fallback_profile(
                     upstream=True,
                     reserve_image_egress=True,
@@ -1996,7 +2009,7 @@ def _generate_single_image(
             backend = OpenAIBackendAPI(
                 access_token=token,
                 proxy_profile=fallback_profile,
-                reserve_image_egress=fallback_profile is None,
+                reserve_image_egress=fallback_profile is None and not request.reservation_managed,
             )
             backend.cancel_checker = lambda: _raise_if_request_cancelled(request)
             if request.trace_image_perf:
@@ -2015,8 +2028,10 @@ def _generate_single_image(
                     total=total,
                     **egress_data,
                 )
-            egress_acquire_ms = proxy_settings.acquire_image_egress(backend.proxy_profile)
-            egress_acquired = int(getattr(backend.proxy_profile, "image_concurrency_limit", 0) or 0) > 0
+            egress_acquire_ms = 0
+            if not request.reservation_managed:
+                egress_acquire_ms = proxy_settings.acquire_image_egress(backend.proxy_profile)
+                egress_acquired = int(getattr(backend.proxy_profile, "image_concurrency_limit", 0) or 0) > 0
             egress_wait_ms = int((time.perf_counter() - egress_started) * 1000)
             if request.trace_image_perf:
                 egress_data = _backend_egress_data(backend)
@@ -2344,7 +2359,7 @@ def _generate_single_image(
                 "index": index,
                 **http_timing,
             })
-            if not emitted_for_token and is_token_invalid_error(last_error):
+            if not request.reservation_managed and not emitted_for_token and is_token_invalid_error(last_error):
                 finalize_image_slot(False)
                 refreshed_token = account_service.refresh_access_token(token, force=True, event="image_stream")
                 if refreshed_token and refreshed_token != token:
@@ -2359,7 +2374,7 @@ def _generate_single_image(
                 and (is_tls_connection_error(last_error) or is_connection_timeout_error(last_error))
             )
             fallback_reference = proxy_settings.get_fallback_proxy_reference()
-            if early_connection_failure and fallback_reference and not fallback_retry_used:
+            if not request.reservation_managed and early_connection_failure and fallback_reference and not fallback_retry_used:
                 fallback_retry_used = True
                 fallback_retry_pending = True
                 retry_token = token

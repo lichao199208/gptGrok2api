@@ -243,6 +243,66 @@
               </div>
         </FormSection>
 
+        <FormSection title="代理订阅 / 批量导入" surface="plain">
+          <div class="space-y-2.5">
+            <label class="text-xs">
+              <span class="ui-field-label">订阅 URL</span>
+              <Input
+                :model-value="groupForm.subscription_url"
+                block
+                root-class="font-mono"
+                placeholder="https://example.com/proxies.txt"
+                @update:model-value="groupForm.subscription_url = $event.trim()"
+              />
+            </label>
+            <div class="grid grid-cols-1 gap-2.5 md:grid-cols-[auto_12rem_12rem_auto]">
+              <div class="flex items-end pb-2">
+                <Checkbox v-model="groupForm.subscription_enabled">自动更新订阅</Checkbox>
+              </div>
+              <label class="text-xs">
+                <span class="ui-field-label">更新间隔（分钟）</span>
+                <Input
+                  :model-value="String(groupForm.subscription_interval_minutes)"
+                  block
+                  type="number"
+                  min="5"
+                  max="1440"
+                  @update:model-value="groupForm.subscription_interval_minutes = Math.max(5, Math.min(1440, Number($event || 30)))"
+                />
+              </label>
+              <label class="text-xs">
+                <span class="ui-field-label">订阅节点图片并发</span>
+                <Input
+                  :model-value="String(groupForm.subscription_node_image_concurrency_limit)"
+                  block
+                  type="number"
+                  min="0"
+                  @update:model-value="groupForm.subscription_node_image_concurrency_limit = normalizeImageConcurrencyLimit($event)"
+                />
+              </label>
+              <div class="flex items-end pb-1">
+                <Button
+                  size="xs"
+                  variant="outline"
+                  :disabled="!editingGroupId || !groupForm.subscription_url || refreshingGroupId === editingGroupId"
+                  @click="refreshProxyGroupSubscription()"
+                >
+                  {{ refreshingGroupId === editingGroupId ? '拉取中...' : '立即拉取' }}
+                </Button>
+              </div>
+            </div>
+            <p class="text-xs text-muted-foreground">
+              支持 http、https、socks4、socks5；纯 host:port 默认按 HTTP。自动更新只替换订阅节点，手工节点会保留。
+            </p>
+            <p v-if="groupForm.subscription_last_updated_at" class="text-xs text-emerald-600">
+              最近更新：{{ groupForm.subscription_last_updated_at }} · {{ groupForm.subscription_node_count }} 个订阅节点
+            </p>
+            <p v-if="groupForm.subscription_last_error" class="break-all text-xs text-rose-600">
+              最近错误：{{ groupForm.subscription_last_error }}
+            </p>
+          </div>
+        </FormSection>
+
               <div class="space-y-3">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <p class="text-xs font-medium text-foreground">代理节点</p>
@@ -365,6 +425,7 @@ defineOptions({ name: 'Proxy' })
 const proxyGroupsRuntime = useProxyGroupRuntime()
 const savingGroupId = proxyGroupsRuntime.savingGroupId
 const deletingGroupId = proxyGroupsRuntime.deletingGroupId
+const refreshingGroupId = proxyGroupsRuntime.refreshingGroupId
 const testingKey = proxyGroupsRuntime.testingKey
 const groupKeyword = proxyGroupsRuntime.groupKeyword
 const showGroupModal = proxyGroupsRuntime.showGroupModal
@@ -380,6 +441,7 @@ const closeGroupModal = proxyGroupsRuntime.closeGroupModal
 const addGroupNode = proxyGroupsRuntime.addGroupNode
 const removeGroupNode = proxyGroupsRuntime.removeGroupNode
 const saveProxyGroup = proxyGroupsRuntime.saveProxyGroup
+const refreshProxyGroupSubscription = proxyGroupsRuntime.refreshProxyGroupSubscription
 const handleProxyGroupAction = proxyGroupsRuntime.handleProxyGroupAction
 const testProxyGroupNode = proxyGroupsRuntime.testProxyGroupNode
 const nodeTestSummary = proxyGroupsRuntime.nodeTestSummary

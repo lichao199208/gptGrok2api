@@ -1,0 +1,44 @@
+services:
+  image-queue-redis:
+    image: redis:7.4-alpine
+    container_name: chatgpt2api-image-queue-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec", "--maxmemory", "512mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - ./data/go-image-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  image-gateway:
+    build:
+      context: ./go-image-gateway
+    image: chatgpt2api/go-image-gateway:local
+    container_name: chatgpt2api-image-gateway
+    restart: unless-stopped
+    depends_on:
+      image-queue-redis:
+        condition: service_healthy
+    environment:
+      IMAGE_GATEWAY_REDIS_ADDR: image-queue-redis:6379
+      IMAGE_GATEWAY_BACKEND_URL: http://app/v1/images/generations
+      IMAGE_GATEWAY_SCHEDULER_URL: http://app/internal/image-scheduler
+      IMAGE_GATEWAY_SCHEDULER_KEY: ${IMAGE_SCHEDULER_INTERNAL_KEY:-}
+      IMAGE_GATEWAY_AUTH_KEYS_FILE: /etc/image-gateway/auth_keys.json
+      IMAGE_GATEWAY_AUTH_KEY: ${CHATGPT2API_AUTH_KEY:-}
+      IMAGE_GATEWAY_WORKERS: ${IMAGE_GATEWAY_WORKERS:-100}
+      IMAGE_GATEWAY_QUEUE_CAPACITY: ${IMAGE_GATEWAY_QUEUE_CAPACITY:-10000}
+      IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS: ${IMAGE_GATEWAY_BACKEND_TIMEOUT_SECS:-900}
+      IMAGE_GATEWAY_TASK_TTL_SECS: ${IMAGE_GATEWAY_TASK_TTL_SECS:-86400}
+      IMAGE_GATEWAY_MAX_ATTEMPTS: ${IMAGE_GATEWAY_MAX_ATTEMPTS:-1}
+    ports:
+      - "127.0.0.1:${IMAGE_GATEWAY_PORT:-3001}:8080"
+    volumes:
+      - ./data/auth_keys.json:/etc/image-gateway/auth_keys.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5

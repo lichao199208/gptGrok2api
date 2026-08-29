@@ -4,6 +4,7 @@ from typing import Any, Iterator
 
 from services.protocol.conversation import (
     ConversationRequest,
+    ImageGenerationError,
     collect_image_outputs,
     count_text_tokens,
     stream_image_chunks,
@@ -21,23 +22,29 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
     response_format = str(body.get("response_format") or "b64_json")
     base_url = str(body.get("base_url") or "") or None
     progress_callback = body.get("progress_callback")
-    outputs = stream_image_outputs_with_pool(ConversationRequest(
-        prompt=prompt,
-        model=model,
-        n=n,
-        size=size,
-        quality=quality,
-        response_format=response_format,
-        base_url=base_url,
-        message_as_error=True,
-        progress_callback=progress_callback,
-        call_id=str(body.get("_call_id") or ""),
-        trace_image_perf=bool(body.get("_trace_image_perf")),
-    ))
+
+    def _build_request() -> ConversationRequest:
+        return ConversationRequest(
+            prompt=prompt,
+            model=model,
+            n=n,
+            size=size,
+            quality=quality,
+            response_format=response_format,
+            base_url=base_url,
+            message_as_error=True,
+            progress_callback=progress_callback,
+            call_id=str(body.get("_call_id") or ""),
+            trace_image_perf=bool(body.get("_trace_image_perf")),
+            reservation_managed=bool(body.get("_reservation_managed")),
+            reserved_account_token=str(body.get("_reserved_account_token") or ""),
+            reserved_proxy_profile=body.get("_reserved_proxy_profile"),
+        )
+
     if body.get("stream"):
         input_text_tokens = count_text_tokens(prompt, model)
         return stream_image_chunks(
-            outputs,
+            stream_image_outputs_with_pool(_build_request()),
             event_prefix="image_generation",
             partial_images=body.get("partial_images"),
             usage_builder=lambda data: image_usage(
@@ -45,9 +52,22 @@ def handle(body: dict[str, Any]) -> dict[str, Any] | Iterator[dict[str, Any]]:
                 output_tokens=count_image_output_items_tokens(data, size, quality),
             ),
         )
-    result = collect_image_outputs(outputs)
-    result["usage"] = image_usage(
-        input_text_tokens=count_text_tokens(prompt, model),
-        output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
-    )
-    return result
+
+    # 非流式：上游完成回合但未产出图片（no_image_generated）时，换账号重试一次。
+    last_error: ImageGenerationError | None = None
+    for _attempt in range(2):
+        try:
+            outputs = stream_image_outputs_with_pool(_build_request())
+            result = collect_image_outputs(outputs)
+            result["usage"] = image_usage(
+                input_text_tokens=count_text_tokens(prompt, model),
+                output_tokens=count_image_output_items_tokens(result.get("data"), size, quality),
+            )
+            return result
+        except ImageGenerationError as exc:
+            last_error = exc
+            if exc.code != "no_image_generated":
+                raise
+    if last_error is not None:
+        raise last_error
+    raise ImageGenerationError("upstream completed without generating images", code="no_image_generated")

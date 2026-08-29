@@ -209,7 +209,7 @@ function normalizeLevel(item: SystemLog): LogEntry['level'] {
   return 'INFO'
 }
 
-const LOG_IMAGE_URL_RE = /!\[[^\]]*\]\(((?:https?:\/\/|\/images\/|\/image-thumbnails\/)[^\s)"']+)\)/g
+const LOG_IMAGE_URL_RE = /!\[[^\]]*\]\(((?:https?:\/\/|\/images\/|\/image-thumbnails\/|\/v1\/files\/image(?:\?|\/)|\/upimg\/v1\/files\/image(?:\?|\/))[^\s)"']+)\)/g
 
 function isImageChatLog(endpoint: string, model: string): boolean {
   return endpoint.includes('/v1/chat') && isImageModelId(model)
@@ -277,12 +277,12 @@ function collectUrls(value: unknown): string[] {
 function normalizePreviewUrl(url: string, apiBaseUrl = ''): string {
   const value = cleanString(url)
   if (!value || value.startsWith('file-service://')) return ''
-  if (value.startsWith('/images/') || value.startsWith('/image-thumbnails/')) return value
+  if (value.startsWith('/images/') || value.startsWith('/image-thumbnails/') || value.startsWith('/v1/files/image') || value.startsWith('/upimg/v1/files/image')) return value
   if (value.startsWith('images/') || value.startsWith('image-thumbnails/')) return `/${value}`
   if (/^https?:\/\//i.test(value)) {
     try {
       const parsed = new URL(value)
-      if (parsed.pathname.startsWith('/images/') || parsed.pathname.startsWith('/image-thumbnails/')) {
+      if (parsed.pathname.startsWith('/images/') || parsed.pathname.startsWith('/image-thumbnails/') || parsed.pathname === '/v1/files/image' || parsed.pathname === '/upimg/v1/files/image') {
         return `${parsed.pathname}${parsed.search}${parsed.hash}`
       }
     } catch {
@@ -410,8 +410,8 @@ export function normalizeSystemLogRow(item: SystemLog, index: number, options: N
     keyId: detailValue(detail, 'key_id'),
     keyName: detailValue(detail, 'key_name'),
     role: detailValue(detail, 'role'),
-    accountEmail: detailValue(detail, 'account_email'),
-    accountId: detailValue(detail, 'provider_account_id'),
+    accountEmail: detailValue(detail, 'account_email') || detailValue(monitor, 'account_email'),
+    accountId: detailValue(detail, 'provider_account_id') || detailValue(detail, 'account_id') || detailValue(monitor, 'account_id'),
     conversationId: detailValue(detail, 'conversation_id'),
     proxySource: detailValue(detail, 'proxy_source') || formatDetailValue(monitor.proxy_source),
     proxyHash: detailValue(detail, 'proxy_hash') || formatDetailValue(monitor.proxy_hash),

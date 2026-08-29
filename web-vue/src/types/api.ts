@@ -186,6 +186,10 @@ export interface Settings {
       url: string
     }
   }
+  account_import_api?: {
+    enabled: boolean
+    key: string
+  }
   proxy_profiles?: Array<{
     id: string
     name: string

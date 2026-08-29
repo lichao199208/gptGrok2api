@@ -132,6 +132,7 @@ const SETTINGS_SAVE_KEYS = [
   'backup',
   'chat_completion_cache',
   'third_party_apps',
+  'account_import_api',
 ] as const
 
 function cleanString(value: unknown): string {
@@ -234,6 +235,9 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
   const backupInclude = backup.include && typeof backup.include === 'object' ? backup.include : {}
   const thirdPartyApps = normalizeThirdPartyApps(source.third_party_apps)
   const proxyRuntime = normalizeProxyRuntime(source.proxy_runtime)
+  const accountImportAPI = source.account_import_api && typeof source.account_import_api === 'object'
+    ? source.account_import_api as RawSettings
+    : {}
 
   const normalized = {
     ...source,
@@ -346,6 +350,10 @@ export function normalizeSettings(raw: RawSettings | null | undefined): Settings
         url: thirdPartyApps.infinite_canvas.url,
       },
     },
+    account_import_api: {
+      enabled: boolValue(accountImportAPI.enabled, false),
+      key: cleanString(accountImportAPI.key),
+    },
     proxy_profiles: Array.isArray(source.proxy_profiles) ? source.proxy_profiles : [],
   } as Settings
 
@@ -390,6 +398,7 @@ function toBackendSettings(settings: Settings): RawSettings {
     backup: cloneRawSettings(normalized.backup),
     chat_completion_cache: cloneRawSettings(normalized.chat_completion_cache),
     third_party_apps: cloneRawSettings(normalized.third_party_apps),
+    account_import_api: cloneRawSettings(normalized.account_import_api),
   }
   payload.image_retention_days = numberValue(
     normalized.image_retention_days,

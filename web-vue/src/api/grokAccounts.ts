@@ -324,4 +324,12 @@ export const grokAccountsApi = {
       responseType: 'blob',
     })
   },
+
+  exportSso(ids: string[]) {
+    return apiClient.post<{ ids: string[] }, Blob>(`${GROK_ACCOUNTS_PATH}/export-sso`, {
+      ids: Array.from(new Set(ids.map((id) => String(id || '').trim()).filter(Boolean))),
+    }, {
+      responseType: 'blob',
+    })
+  },
 }

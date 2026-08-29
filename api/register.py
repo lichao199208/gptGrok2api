@@ -390,6 +390,44 @@ def create_router() -> APIRouter:
             },
         )
 
+    @router.post("/api/register/grok/accounts/export-sso")
+    async def export_selected_grok_accounts_sso(
+        body: GrokAccountExportRequest,
+        authorization: str | None = Header(default=None),
+    ):
+        require_admin(authorization)
+        ids = _grok_account_ids(body.ids)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        try:
+            payload = register_service.export_grok_accounts_sso(ids or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(
+            payload,
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="grok-sso-{timestamp}.txt"',
+            },
+        )
+
+    @router.get("/api/register/grok/accounts/export-sso")
+    async def export_all_grok_accounts_sso(authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        try:
+            payload = register_service.export_grok_accounts_sso()
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return Response(
+            payload,
+            media_type="text/plain",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": f'attachment; filename="grok-sso-{timestamp}.txt"',
+            },
+        )
+
     @router.get("/api/register/events")
     async def register_events(token: str = ""):
         require_admin(f"Bearer {token}")

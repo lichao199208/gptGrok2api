@@ -44,6 +44,16 @@ loginwithpassword_*/
 logwithemailverifycode_*/
 test_batch_output/
 
+# Local deployment archives, binaries, caches, and copied source snapshots
+*.tar.gz
+*.exe
+.gocache*/
+.tmp-*/
+.tmp_*.tsv
+.tmp_*.txt
+go-current-code/
+artifacts/
+
 # 本地实验/生成物
 skills/
 standalone/

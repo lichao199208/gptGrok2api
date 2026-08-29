@@ -242,14 +242,17 @@
               <span>按目标剩余空间清理</span>
               <p>输入希望保留的磁盘剩余空间，系统会从旧图片开始清理。</p>
             </div>
-            <Input
-              :model-value="targetFreeMb"
-              type="number"
-              min="1"
-              placeholder="500"
-              root-class="gallery-storage-target-input"
-              @update:model-value="targetFreeMb = String($event)"
-            />
+            <div class="gallery-storage-target-field">
+              <Input
+                :model-value="targetFreeMb"
+                type="number"
+                min="1"
+                placeholder="500"
+                root-class="gallery-storage-target-input"
+                @update:model-value="targetFreeMb = String($event)"
+              />
+              <span class="gallery-storage-target-unit">MB</span>
+            </div>
             <div class="gallery-storage-target-actions">
               <Button size="sm" variant="ghost" :disabled="isStorageBusy" @click="handleCleanupToTarget(true)">
                 预估
@@ -733,6 +736,19 @@ pageRuntime.onShow(() => {
 
 :deep(.gallery-storage-target-input) {
   min-width: 0;
+}
+
+.gallery-storage-target-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.gallery-storage-target-unit {
+  flex: none;
+  color: hsl(var(--muted-foreground));
+  font-size: 0.75rem;
+  font-weight: 600;
 }
 
 .gallery-storage-target-actions {

@@ -18,6 +18,7 @@ export type GrokRuntimeQuotaWindow = {
 
 export type GrokRuntimeToken = {
   token: string
+  token_id: string
   pool: string
   status: string
   quota?: Partial<Record<'auto' | 'fast' | 'expert' | 'heavy' | 'console', GrokRuntimeQuotaWindow>>
@@ -76,9 +77,9 @@ export const grokRuntimeApi = {
   },
 
   setTokenDisabled(token: string, disabled: boolean) {
-    return apiClient.post<{ token: string; disabled: boolean }, { status: string; disabled: boolean }>(
+    return apiClient.post<{ token_id: string; disabled: boolean }, { status: string; token_id: string; disabled: boolean }>(
       `${GROK_RUNTIME_ADMIN_PATH}/tokens/disabled`,
-      { token, disabled },
+      { token_id: token, disabled },
     )
   },
 

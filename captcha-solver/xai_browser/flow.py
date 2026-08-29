@@ -225,18 +225,21 @@ async def send_email(session_id: str, email: str) -> dict[str, Any]:
     async with current.lock:
         page = current.page
         await _click_any(page, ("全部拒绝", "接受全部", "Reject all", "Accept all"))
-        email_field = await _first_visible(
-            page,
-            ('input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]'),
-        )
+        email_selectors = ('input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]')
+        email_field = await _first_visible(page, email_selectors)
+        clicked_toggle = False
+        deadline = asyncio.get_running_loop().time() + 20
+        while email_field is None and asyncio.get_running_loop().time() < deadline:
+            if not clicked_toggle:
+                if await _click_any(page, ("使用邮箱注册", "Sign up with email")):
+                    clicked_toggle = True
+            await _pause(page, 500)
+            email_field = await _first_visible(page, email_selectors)
         if email_field is None:
-            if not await _click_any(page, ("使用邮箱注册", "Sign up with email")):
-                raise XaiBrowserFlowError("未找到“使用邮箱注册”按钮", stage="send_email")
-            email_field = await _first_visible(
-                page,
-                ('input[type="email"]', 'input[name="email"]', 'input[autocomplete="email"]'),
-            )
-        if email_field is None:
+            try:
+                await page.screenshot(path=f"/tmp/xai-sendemail-{current.session_id}.png", full_page=True)
+            except Exception:
+                pass
             raise XaiBrowserFlowError("未找到注册邮箱输入框", stage="send_email")
         await email_field.fill(str(email).strip())
         if not await _click_submit(page, ("注册", "继续", "Sign up", "Continue")):
@@ -569,7 +572,23 @@ async def authorize_device(
     current = await _session(session_id)
     async with current.lock:
         target = _allowed_url(verification_url, stage="device_consent")
-        await current.page.goto(target, wait_until="domcontentloaded", timeout=60_000)
+        goto_error = ""
+        for _goto_attempt in range(3):
+            try:
+                await current.page.goto(target, wait_until="domcontentloaded", timeout=60_000)
+                goto_error = ""
+                break
+            except Exception as _exc:
+                _msg = str(_exc)
+                if "ERR_ABORTED" not in _msg:
+                    raise
+                goto_error = _msg
+                await _pause(current.page, 1500)
+        if goto_error:
+            try:
+                await current.page.wait_for_load_state("domcontentloaded", timeout=10_000)
+            except Exception:
+                pass
         code_input = current.page.locator(
             'input[name="user_code"], input[autocomplete="one-time-code"], input[inputmode="text"]'
         )

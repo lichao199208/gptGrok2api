@@ -85,6 +85,14 @@ export type RegisterProvider = {
   mode?: 'graph' | 'imap' | 'auto' | string
   imap_host?: string
   message_limit?: number
+  accounts?: string
+  accounts_count?: number
+  accounts_preview?: string[]
+  domains?: string[]
+  max_active?: number
+  pool_batch?: number
+  proxy?: string
+  proxies?: string[]
   [key: string]: unknown
 }
 

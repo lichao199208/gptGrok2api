@@ -641,10 +641,22 @@ class ConfigStore:
             data["chat_completion_cache"] = self.get_chat_completion_cache_settings()
             data["proxy_runtime"] = self.get_public_proxy_runtime_settings()
             data["fallback_proxy"] = self.get_proxy_fallback_settings()
+            data["account_import_api"] = self.get_account_import_api_settings()
             data["third_party_apps"] = self.get_third_party_apps_settings()
             data["basic"] = _legacy_basic_from_settings(data.get("basic"), data)
             data.pop("auth-key", None)
             return data
+
+    def get_account_import_api_settings(self) -> dict[str, object]:
+        raw = self.data.get("account_import_api")
+        if not isinstance(raw, dict):
+            raw = {}
+        key = str(raw.get("key") or "").strip()
+        return {
+            "enabled": bool(raw.get("enabled")),
+            "key": key,
+            "has_key": bool(key),
+        }
 
     def get_proxy_settings(self) -> str:
         return str(self.data.get("proxy") or "").strip()
@@ -687,6 +699,13 @@ class ConfigStore:
                 )
             if "third_party_apps" in next_data:
                 next_data["third_party_apps"] = _normalize_third_party_apps_settings(next_data.get("third_party_apps"))
+            if "account_import_api" in next_data:
+                incoming_api = next_data.get("account_import_api")
+                if isinstance(incoming_api, dict):
+                    next_data["account_import_api"] = {
+                        "enabled": bool(incoming_api.get("enabled")),
+                        "key": str(incoming_api.get("key") or "").strip(),
+                    }
             if "proxy_runtime" in next_data:
                 incoming_runtime = next_data.get("proxy_runtime")
                 if isinstance(incoming_runtime, dict):

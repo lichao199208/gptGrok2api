@@ -7,6 +7,10 @@ import { useToast } from '@/composables/useToast'
 export type AccountForm = {
   id: string
   access_token: string
+  email: string
+  user_id: string
+  login_password: string
+  two_factor_secret: string
   type: string
   source_type: string
   group_id: string
@@ -33,6 +37,10 @@ function createDefaultForm(): AccountForm {
   return {
     id: '',
     access_token: '',
+    email: '',
+    user_id: '',
+    login_password: '',
+    two_factor_secret: '',
     type: 'free',
     source_type: 'web',
     group_id: '',
@@ -77,10 +85,14 @@ export function useAccountCrudRuntime(options: AccountCrudRuntimeOptions) {
     showModal.value = true
   }
 
-  function openEditModal(item: Account) {
+  async function openEditModal(item: Account) {
     editingId.value = item.id
     form.id = item.id
     form.access_token = item.access_token || ''
+    form.email = item.email || ''
+    form.user_id = item.user_id || ''
+    form.login_password = item.login_password || ''
+    form.two_factor_secret = item.two_factor_secret || ''
     form.type = item.type || 'free'
     form.source_type = item.source_type || 'web'
     form.group_id = item.group_id || ''
@@ -90,6 +102,17 @@ export function useAccountCrudRuntime(options: AccountCrudRuntimeOptions) {
     syncProxyControlsFromValue(form.proxy)
     void options.loadAccountGroups({ silentErrorToast: true })
     showModal.value = true
+    try {
+      const secrets = await accountsApi.getAccountSecrets(item.id)
+      if (editingId.value !== item.id) return
+      form.access_token = secrets.access_token
+      form.email = secrets.email || form.email
+      form.user_id = secrets.user_id || form.user_id
+      form.login_password = secrets.login_password
+      form.two_factor_secret = secrets.two_factor_secret
+    } catch (error) {
+      options.setError('读取账号凭据失败', error)
+    }
   }
 
   function closeModal() {
@@ -112,6 +135,10 @@ export function useAccountCrudRuntime(options: AccountCrudRuntimeOptions) {
       await accountsApi.upsert({
         id: payloadId,
         access_token: form.access_token.trim(),
+        email: form.email.trim() || undefined,
+        user_id: form.user_id.trim() || undefined,
+        login_password: form.login_password,
+        two_factor_secret: form.two_factor_secret.trim(),
         type: form.type.trim() || undefined,
         source_type: form.source_type.trim() || undefined,
         group_id: form.group_id.trim(),

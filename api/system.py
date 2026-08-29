@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import hmac
+import os
 import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Header, HTTPException, Query, Request
+from fastapi import APIRouter, File, Header, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from api.support import require_admin, require_identity, resolve_image_base_url
@@ -35,7 +37,12 @@ from services.dashboard_metrics_service import dashboard_metrics_service
 from services.log_service import LOG_TYPE_CALL, log_service
 from services.model_catalog_service import get_model_catalog
 from services.proxy_service import proxy_settings, test_clearance, test_proxy, test_proxy_list_sample
+from services.proxy_subscription_service import refresh_proxy_group_subscription
 from services.provider_account_stats import get_provider_account_stats
+from services.image_scheduler_service import image_scheduler_service
+from services.protocol.conversation import ImageGenerationError
+from services.protocol.openai_v1_image_generations import handle as handle_image_generation
+from services.protocol.openai_v1_image_edit import handle as handle_image_edit
 from services.realtime_monitor_service import realtime_monitor_service
 from services.runtime_log_service import list_runtime_logs
 from utils.timezone import beijing_now, parse_to_beijing_naive
@@ -53,6 +60,7 @@ SETTINGS_UPDATE_KEYS = {
     "proxy",
     "fallback_proxy",
     "proxy_runtime",
+    "account_import_api",
     "base_url",
     "refresh_account_interval_minute",
     "image_retention_days",
@@ -121,6 +129,10 @@ class ProxyGroupRequest(BaseModel):
     enabled: bool = True
     notes: str = ""
     nodes: list[dict[str, Any]] = Field(default_factory=list)
+    subscription_url: str = ""
+    subscription_enabled: bool = False
+    subscription_interval_minutes: float = 30
+    subscription_node_image_concurrency_limit: int = 30
     create_only: bool = False
 
 
@@ -357,7 +369,17 @@ def _upsert_proxy_group(body: ProxyGroupRequest) -> dict[str, Any]:
         "enabled": body.enabled,
         "notes": body.notes,
         "nodes": nodes,
+        "subscription_url": _clean_text(body.subscription_url),
+        "subscription_enabled": bool(body.subscription_enabled and _clean_text(body.subscription_url)),
+        "subscription_interval_minutes": max(5.0, min(float(body.subscription_interval_minutes or 30), 1440.0)),
+        "subscription_node_image_concurrency_limit": _coerce_proxy_node_image_concurrency_limit(
+            body.subscription_node_image_concurrency_limit
+        ),
     }
+    previous = next((group for group in groups if group.get("id") == group_id), {})
+    for key in ("subscription_last_updated_at", "subscription_last_attempt_at", "subscription_last_error", "subscription_node_count"):
+        if key in previous:
+            item[key] = previous[key]
     next_groups = [group for group in groups if group.get("id") != group_id]
     next_groups.append(item)
     updated = config.update({"proxy_groups": next_groups})
@@ -843,6 +865,18 @@ def create_router(app_version: str) -> APIRouter:
             raise HTTPException(status_code=500, detail={"error": _config_write_error_message(exc)}) from exc
         return {"deleted": normalized, "groups": updated.get("proxy_groups", [])}
 
+    @router.post("/api/proxy/groups/{group_id}/subscription/refresh")
+    async def refresh_proxy_group_subscription_endpoint(group_id: str, authorization: str | None = Header(default=None)):
+        require_admin(authorization)
+        try:
+            return await run_in_threadpool(refresh_proxy_group_subscription, group_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail={"error": str(exc)}) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=502, detail={"error": "proxy subscription request failed"}) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail={"error": "proxy subscription refresh failed"}) from exc
+
     @router.post("/api/proxy/groups/test")
     async def test_proxy_group_endpoint(body: ProxyGroupTestRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)
@@ -1134,5 +1168,204 @@ td{{padding:8px 12px;border-top:1px solid #2a2d3a;font-size:14px}}tr:hover td{{b
 </table>
 <div class="refresh">JSON: <span class="api-url">/health?format=json</span></div>
 </div></body></html>""")
+
+    def require_internal_scheduler_key(value: str | None) -> None:
+        expected = str(os.getenv("IMAGE_SCHEDULER_INTERNAL_KEY") or "").strip()
+        provided = str(value or "").strip()
+        if not expected or not provided or not hmac.compare_digest(expected, provided):
+            raise HTTPException(status_code=401, detail={"error": "invalid internal scheduler key"})
+
+    @router.post("/internal/image-scheduler/reserve")
+    async def reserve_image_scheduler_slot(
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        try:
+            return await run_in_threadpool(image_scheduler_service.reserve, model=str(payload.get("model") or "gpt-image-2"))
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail={"error": "no schedulable account or proxy", "reason": str(exc)[:200]}) from exc
+
+    @router.post("/internal/image-scheduler/{reservation_id}/release")
+    async def release_image_scheduler_slot(
+        reservation_id: str,
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        return await run_in_threadpool(image_scheduler_service.release, reservation_id, failed=bool(payload.get("failed")))
+
+    @router.post("/internal/image-scheduler/{reservation_id}/execute")
+    async def execute_reserved_image(
+        reservation_id: str,
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        """Execute one image with the account and proxy attached to a lease."""
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        request_body = payload.get("request") if isinstance(payload.get("request"), dict) else payload
+        request_body = dict(request_body)
+        if request_body.get("stream"):
+            raise HTTPException(status_code=400, detail={"error": "streaming is not supported by the internal executor"})
+        if int(request_body.get("n") or 1) != 1:
+            raise HTTPException(status_code=400, detail={"error": "internal executor accepts exactly one image"})
+        try:
+            lease = await run_in_threadpool(image_scheduler_service.claim, reservation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+        failed = True
+        try:
+            request_body.update({
+                "_reservation_managed": True,
+                "_reserved_account_token": lease["account_token"],
+                "_reserved_proxy_profile": lease["proxy_profile"],
+            })
+            result = await run_in_threadpool(handle_image_generation, request_body)
+            if not isinstance(result, dict):
+                raise RuntimeError("internal executor returned an unexpected streaming response")
+            failed = False
+            return result
+        except ImageGenerationError as exc:
+            # A reserved account can occasionally finish the turn with a text
+            # reply (or no image artifact) even though the request is valid.
+            # Mark these scheduler failures as retryable so the Go worker can
+            # release this lease and reserve a different account/proxy.  Keep
+            # policy and parameter errors as 4xx responses.
+            error_code = getattr(exc, "code", None)
+            response_status = int(getattr(exc, "status_code", 502) or 502)
+            if error_code in {"upstream_text_reply", "no_image_generated"}:
+                response_status = 503
+            return JSONResponse(
+                status_code=response_status,
+                content={"error": {"message": str(exc), "type": getattr(exc, "error_type", "server_error"), "code": getattr(exc, "code", None)}},
+            )
+        finally:
+            await run_in_threadpool(image_scheduler_service.release, reservation_id, failed=failed)
+
+    @router.post("/internal/image-scheduler/{reservation_id}/execute-edit")
+    async def execute_reserved_image_edit(
+        reservation_id: str,
+        request: Request,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        """Execute a multipart image edit using the reserved account/proxy."""
+        require_internal_scheduler_key(x_image_scheduler_key)
+        try:
+            lease = await run_in_threadpool(image_scheduler_service.claim, reservation_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail={"error": str(exc)}) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail={"error": str(exc)}) from exc
+
+        failed = True
+        try:
+            form = await request.form()
+            images: list[tuple[bytes, str, str]] = []
+            masks: list[tuple[bytes, str, str]] = []
+            for key, value in form.multi_items():
+                if isinstance(value, str):
+                    continue
+                if key in {"image", "image[]"}:
+                    images.append((await value.read(), value.filename or "image", value.content_type or "image/png"))
+                elif key == "mask":
+                    masks.append((await value.read(), value.filename or "mask", value.content_type or "image/png"))
+            request_body: dict[str, Any] = {
+                "prompt": str(form.get("prompt") or ""),
+                "model": str(form.get("model") or "gpt-image-2"),
+                "n": int(form.get("n") or 1),
+                "size": str(form.get("size") or "1024x1024"),
+                "quality": str(form.get("quality") or "auto"),
+                "response_format": str(form.get("response_format") or "b64_json"),
+                "images": images,
+                "mask": masks,
+                "stream": False,
+                "_reservation_managed": True,
+                "_reserved_account_token": lease["account_token"],
+                "_reserved_proxy_profile": lease["proxy_profile"],
+                "_call_id": str(form.get("_call_id") or ""),
+                "_trace_image_perf": True,
+            }
+            result = await run_in_threadpool(handle_image_edit, request_body)
+            if not isinstance(result, dict):
+                raise RuntimeError("internal edit executor returned an unexpected streaming response")
+            failed = False
+            return result
+        except ImageGenerationError as exc:
+            status_code = int(getattr(exc, "status_code", 502) or 502)
+            if getattr(exc, "code", None) in {"upstream_text_reply", "no_image_generated"}:
+                status_code = 503
+            return JSONResponse(status_code=status_code, content={"error": {"message": str(exc), "type": getattr(exc, "error_type", "server_error"), "code": getattr(exc, "code", None)}})
+        finally:
+            await run_in_threadpool(image_scheduler_service.release, reservation_id, failed=failed)
+
+    @router.get("/internal/image-scheduler/status")
+    async def image_scheduler_status(x_image_scheduler_key: str | None = Header(default=None)):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        return await run_in_threadpool(image_scheduler_service.status)
+
+    # The public dashboard is served by Python, while image jobs are accepted
+    # by the Go gateway.  These internal endpoints let the gateway create and
+    # finish the same in-memory monitor records used by the dashboard.
+    @router.post("/internal/image-monitor/start")
+    async def start_gateway_image_monitor(
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        realtime_monitor_service.start(
+            str(payload.get("call_id") or ""),
+            endpoint=str(payload.get("endpoint") or "/v1/images/generations"),
+            model=str(payload.get("model") or "gpt-image-2"),
+            summary=str(payload.get("summary") or ""),
+        )
+        return {"ok": True}
+
+    @router.post("/internal/image-monitor/stage")
+    async def stage_gateway_image_monitor(
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        call_id = str(payload.pop("call_id", "") or "")
+        event = str(payload.pop("event", "") or "")
+        realtime_monitor_service.stage(call_id, event, **payload)
+        return {"ok": True}
+
+    @router.post("/internal/image-monitor/finish")
+    async def finish_gateway_image_monitor(
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        realtime_monitor_service.finish(body if isinstance(body, dict) else {})
+        return {"ok": True}
+
+    @router.post("/internal/logs/call")
+    async def add_gateway_call_log(
+        body: dict[str, Any] | None = None,
+        x_image_scheduler_key: str | None = Header(default=None),
+    ):
+        require_internal_scheduler_key(x_image_scheduler_key)
+        payload = body if isinstance(body, dict) else {}
+        detail = payload.get("detail") if isinstance(payload.get("detail"), dict) else {}
+        call_id = str(detail.get("call_id") or "")
+        monitor = realtime_monitor_service.detail(call_id) if call_id else {}
+        if monitor:
+            detail = dict(detail)
+            detail["monitor"] = monitor
+            for key in ("account_email", "conversation_id", "proxy_source", "proxy_hash", "egress_mode", "egress_label", "has_proxy"):
+                if monitor.get(key) and not detail.get(key):
+                    detail[key] = monitor[key]
+        summary = str(payload.get("summary") or "Go 图片任务")
+        log_service.add(LOG_TYPE_CALL, summary, detail)
+        return {"ok": True}
 
     return router

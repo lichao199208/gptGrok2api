@@ -686,6 +686,46 @@ def create_router() -> APIRouter:
             "items": _accounts_for_api(refresh_result.get("items", result.get("items", []))) if body.return_items else [],
         }
 
+    @router.post("/api/accounts/import-api")
+    async def import_accounts_via_api(
+        body: AccountCreateRequest,
+        x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+        authorization: str | None = Header(default=None),
+    ):
+        """外部系统通过 API 密钥添加 GPT 账号（设置里的“账号导入 API”）。
+
+        鉴权二选一：
+        - 设置中启用并填写了密钥，且请求带 X-API-Key 头且值匹配；
+        - 或使用管理员 Bearer（require_admin）。
+        """
+        api_settings = config.get_account_import_api_settings()
+        configured_key = str(api_settings.get("key") or "").strip()
+        provided_key = str(x_api_key or "").strip()
+        api_ok = bool(api_settings.get("enabled")) and bool(configured_key) and provided_key == configured_key
+        if not api_ok:
+            require_admin(authorization)
+
+        account_payloads = [item for item in body.accounts if isinstance(item, dict)]
+        payload_tokens = [_account_payload_token(item) for item in account_payloads]
+        tokens = _unique_tokens([*body.tokens, *payload_tokens])
+        if not tokens:
+            raise HTTPException(status_code=400, detail={"error": "tokens is required"})
+        if account_payloads:
+            result = account_service.add_account_items(account_payloads, return_items=body.return_items)
+            payload_token_set = set(_unique_tokens(payload_tokens))
+            extra_tokens = [token for token in tokens if token not in payload_token_set]
+            if extra_tokens:
+                extra_result = account_service.add_accounts(extra_tokens, return_items=body.return_items)
+                result["added"] = int(result.get("added") or 0) + int(extra_result.get("added") or 0)
+                result["skipped"] = int(result.get("skipped") or 0) + int(extra_result.get("skipped") or 0)
+        else:
+            result = account_service.add_accounts(tokens, return_items=body.return_items)
+        return {
+            "added": result.get("added", 0),
+            "skipped": result.get("skipped", 0),
+            "errors": result.get("errors", []),
+        }
+
     @router.delete("/api/accounts")
     async def delete_accounts(body: AccountDeleteRequest, authorization: str | None = Header(default=None)):
         require_admin(authorization)

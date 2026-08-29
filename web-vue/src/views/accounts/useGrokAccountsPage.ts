@@ -529,6 +529,39 @@ export function useGrokAccountsPage() {
     }
   }
 
+  async function exportSsoAccounts(scope: GrokAccountExportScope) {
+    if (exportBusy.value) return
+    const ids = scope === 'selected' ? [...selectedIds.value] : []
+    if (scope === 'selected' && !ids.length) {
+      toast.warning('请先选择要导出的 Grok 账号')
+      return
+    }
+    if (scope === 'all' && !accountAllTotal.value) {
+      toast.warning('暂无可导出的 Grok 账号')
+      return
+    }
+    const scopeLabel = scope === 'selected' ? `选中的 ${ids.length} 个` : '全部账号'
+    const confirmed = await confirmDialog.ask({
+      title: `导出${scope === 'selected' ? '选中' : '全部'}账号为 SSO (.txt)`,
+      message: `即将导出${scopeLabel} Grok Web SSO 会话凭据。文件包含登录态，请只在可信环境保存。`,
+      confirmText: '确认导出',
+      cancelText: '取消',
+    })
+    if (!confirmed) return
+    exportBusy.value = true
+    try {
+      const blob = await grokAccountsApi.exportSso(ids)
+      if (!blob.size) throw new Error('导出文件为空')
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      saveBlob(blob, `grok-sso-${ts}.txt`)
+      toast.success('Grok SSO 已导出')
+    } catch (error) {
+      toast.error(`导出失败：${errorMessage(error)}`)
+    } finally {
+      exportBusy.value = false
+    }
+  }
+
   watch(keyword, () => {
     clearSelection()
     searchDebounce.schedule()
@@ -601,5 +634,6 @@ export function useGrokAccountsPage() {
     runBulkAction,
     exportBusy,
     exportAccounts,
+    exportSsoAccounts,
   }
 }

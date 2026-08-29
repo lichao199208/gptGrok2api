@@ -64,20 +64,10 @@
             </tr>
           </thead>
           <tbody>
-            <tr v-for="item in tokens" :key="item.token" class="border-t border-border transition-colors hover:bg-muted/20">
+            <tr v-for="item in tokens" :key="item.token_id" class="border-t border-border transition-colors hover:bg-muted/20">
               <td class="max-w-[16rem] px-4 py-3 align-middle">
                 <div class="flex items-center gap-2">
                   <span class="truncate font-mono text-xs text-foreground">{{ tokenPreview(item.token) }}</span>
-                  <Button
-                    size="xs"
-                    variant="ghost"
-                    icon-only
-                    root-class="h-6 w-6 shrink-0"
-                    title="复制完整 Token"
-                    @click="copyToken(item.token)"
-                  >
-                    <Icon icon="lucide:copy" class="h-3.5 w-3.5" />
-                  </Button>
                 </div>
               </td>
               <td class="px-4 py-3 align-middle font-mono text-muted-foreground">{{ item.pool || 'basic' }}</td>
@@ -108,19 +98,19 @@
                     variant="outline"
                     icon-only
                     root-class="h-7 w-7"
-                    :disabled="isTokenBusy(item.token)"
-                    :title="isTokenAction(item.token, 'refresh') ? '正在刷新...' : '刷新状态和额度'"
+                    :disabled="isTokenBusy(item.token_id)"
+                    :title="isTokenAction(item.token_id, 'refresh') ? '正在刷新...' : '刷新状态和额度'"
                     @click="refreshToken(item)"
                   >
-                    <Icon icon="lucide:refresh-cw" class="h-3.5 w-3.5" :class="isTokenAction(item.token, 'refresh') ? 'animate-spin' : ''" />
+                    <Icon icon="lucide:refresh-cw" class="h-3.5 w-3.5" :class="isTokenAction(item.token_id, 'refresh') ? 'animate-spin' : ''" />
                   </Button>
                   <Button
                     size="xs"
                     variant="outline"
                     icon-only
                     root-class="h-7 w-7"
-                    :disabled="isTokenBusy(item.token)"
-                    :title="isTokenAction(item.token, 'disabled') ? '正在更新...' : (isTokenDisabled(item) ? '恢复账号' : '禁用账号')"
+                    :disabled="isTokenBusy(item.token_id)"
+                    :title="isTokenAction(item.token_id, 'disabled') ? '正在更新...' : (isTokenDisabled(item) ? '恢复账号' : '禁用账号')"
                     @click="toggleTokenDisabled(item)"
                   >
                     <Icon :icon="isTokenDisabled(item) ? 'lucide:circle-play' : 'lucide:circle-pause'" class="h-3.5 w-3.5" />
@@ -130,8 +120,8 @@
                     variant="outline"
                     icon-only
                     root-class="h-7 w-7 text-rose-600 hover:text-rose-700"
-                    :disabled="isTokenBusy(item.token)"
-                    :title="isTokenAction(item.token, 'delete') ? '正在删除...' : '删除账号'"
+                    :disabled="isTokenBusy(item.token_id)"
+                    :title="isTokenAction(item.token_id, 'delete') ? '正在删除...' : '删除账号'"
                     @click="removeToken(item)"
                   >
                     <Icon icon="lucide:trash-2" class="h-3.5 w-3.5" />
@@ -419,11 +409,11 @@ async function loadRuntime(options: LoadOptions = {}) {
 }
 
 async function refreshToken(item: GrokRuntimeToken) {
-  if (isTokenBusy(item.token)) return
-  activeToken.value = item.token
+  if (isTokenBusy(item.token_id)) return
+  activeToken.value = item.token_id
   activeTokenAction.value = 'refresh'
   try {
-    const result = await grokRuntimeApi.refreshToken(item.token)
+    const result = await grokRuntimeApi.refreshToken(item.token_id)
     const failed = Number(result.summary?.fail || 0)
     if (failed) toast.warning('Grok Token 刷新完成，但上游未返回有效额度。')
     else toast.success('Grok Token 状态和额度已刷新。')
@@ -437,7 +427,7 @@ async function refreshToken(item: GrokRuntimeToken) {
 }
 
 async function toggleTokenDisabled(item: GrokRuntimeToken) {
-  if (isTokenBusy(item.token)) return
+  if (isTokenBusy(item.token_id)) return
   const disabled = !isTokenDisabled(item)
   const confirmed = await confirmDialog.ask({
     title: disabled ? '禁用 Grok Token' : '恢复 Grok Token',
@@ -449,10 +439,10 @@ async function toggleTokenDisabled(item: GrokRuntimeToken) {
   })
   if (!confirmed) return
 
-  activeToken.value = item.token
+  activeToken.value = item.token_id
   activeTokenAction.value = 'disabled'
   try {
-    await grokRuntimeApi.setTokenDisabled(item.token, disabled)
+    await grokRuntimeApi.setTokenDisabled(item.token_id, disabled)
     toast.success(disabled ? 'Grok Token 已禁用。' : 'Grok Token 已恢复。')
     await loadRuntime()
   } catch (error) {
@@ -464,7 +454,7 @@ async function toggleTokenDisabled(item: GrokRuntimeToken) {
 }
 
 async function removeToken(item: GrokRuntimeToken) {
-  if (isTokenBusy(item.token)) return
+  if (isTokenBusy(item.token_id)) return
   const confirmed = await confirmDialog.ask({
     title: '删除 Grok Token',
     message: `确认从 Grok Runtime 中删除 ${tokenPreview(item.token)} 吗？删除后无法恢复。`,
@@ -473,10 +463,10 @@ async function removeToken(item: GrokRuntimeToken) {
   })
   if (!confirmed) return
 
-  activeToken.value = item.token
+  activeToken.value = item.token_id
   activeTokenAction.value = 'delete'
   try {
-    await grokRuntimeApi.removeToken(item.token)
+    await grokRuntimeApi.removeToken(item.token_id)
     toast.success('Grok Token 已删除。')
     await loadRuntime()
   } catch (error) {
