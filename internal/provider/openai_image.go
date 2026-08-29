@@ -48,6 +48,8 @@ type OpenAIImageInput struct {
 	Data []byte
 }
 
+var openAIImageFileIDPattern = regexp.MustCompile(`(?i)^file_[a-z0-9][a-z0-9_-]{5,}$`)
+
 // OpenAIImageStageFunc receives the elapsed time for a completed image-pipeline
 // stage. It is intentionally kept in the provider package so callers can add
 // observability without coupling the provider to HTTP handlers.
@@ -771,13 +773,13 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 					*conversationID = stringValue(item)
 				}
 			}
-			if key == "asset_pointer" {
+			switch strings.ToLower(strings.TrimSpace(key)) {
+			case "asset_pointer", "assetpointer":
 				pointer := stringValue(item)
 				if strings.HasPrefix(pointer, "file-service://") {
 					*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
 				}
-			}
-			if key == "file_id" {
+			case "file_id", "fileid":
 				id := stringValue(item)
 				if isOpenAIImageFileID(id) {
 					*fileIDs = append(*fileIDs, id)
@@ -800,7 +802,7 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 				*fileIDs = append(*fileIDs, match[1])
 			}
 		}
-		for _, match := range regexp.MustCompile(`\b(file_00000000[a-f0-9]{24})\b`).FindAllStringSubmatch(typed, -1) {
+		for _, match := range regexp.MustCompile(`(?i)\b(file_[a-z0-9][a-z0-9_-]{5,})\b`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
 				*fileIDs = append(*fileIDs, match[1])
 			}
@@ -809,7 +811,11 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 }
 
 func isOpenAIImageFileID(value string) bool {
-	return strings.HasPrefix(value, "file_00000000") || strings.HasPrefix(value, "file-service://")
+	value = strings.TrimSpace(value)
+	if strings.HasPrefix(value, "file-service://") {
+		value = strings.TrimPrefix(value, "file-service://")
+	}
+	return openAIImageFileIDPattern.MatchString(value)
 }
 
 func openAIImageModel(model string) string {

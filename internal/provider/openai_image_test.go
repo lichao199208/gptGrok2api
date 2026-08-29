@@ -118,6 +118,23 @@ func TestNormalizeOpenAIImageSize(t *testing.T) {
 	}
 }
 
+func TestCollectOpenAIImageRefsAcceptsCurrentFileIDShape(t *testing.T) {
+	conversationID := ""
+	fileIDs := []string{}
+	collectOpenAIImageRefs(map[string]any{
+		"conversation_id": "conversation-current",
+		"message": map[string]any{
+			"content": map[string]any{
+				"parts": []any{map[string]any{"file_id": "file_ab12cd34ef56"}},
+			},
+		},
+	}, &conversationID, &fileIDs)
+	fileIDs = uniqueStrings(fileIDs)
+	if conversationID != "conversation-current" || len(fileIDs) != 1 || fileIDs[0] != "file_ab12cd34ef56" {
+		t.Fatalf("unexpected current image reference parsing: conversation=%q files=%#v", conversationID, fileIDs)
+	}
+}
+
 func onePixelPNG(t *testing.T) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
