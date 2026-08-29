@@ -197,42 +197,61 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			accountStarted := time.Now()
-			s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
-			lease, reserveErr := s.accountPool.ReserveMatching(ctx, []string{"basic", "super", "heavy"}, nil, isOpenAIAccount)
-			if reserveErr != nil {
-				sendErr(reserveErr)
-				cancel()
-				return
-			}
-			s.enrichMonitorAccount(r, lease.Account)
-			s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
-			s.stageRequestMonitor(r, "image_egress_ready", 40, map[string]any{"egress_acquire_ms": time.Since(accountStarted).Milliseconds()})
-			defer s.accountPool.Release(lease)
+			excluded := map[string]bool{}
+			for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
+				accountStarted := time.Now()
+				s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
+				lease, reserveErr := s.accountPool.ReserveMatching(ctx, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount)
+				if reserveErr != nil {
+					sendErr(reserveErr)
+					cancel()
+					return
+				}
+				s.enrichMonitorAccount(r, lease.Account)
+				s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
+				s.stageRequestMonitor(r, "image_egress_ready", 40, map[string]any{"egress_acquire_ms": time.Since(accountStarted).Milliseconds()})
 
-			generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
-			if generateErr != nil {
-				s.accountPool.Feedback(lease.Account, upstreamStatus(generateErr), generateErr)
-				sendErr(generateErr)
-				cancel()
-				return
-			}
+				generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
+				if generateErr != nil {
+					s.accountPool.Release(lease)
+					s.accountPool.Feedback(lease.Account, upstreamStatus(generateErr), generateErr)
+					excluded[lease.Account.Token] = true
+					if s.shouldRetry(upstreamStatus(generateErr), attempt) {
+						continue
+					}
+					sendErr(generateErr)
+					cancel()
+					return
+				}
 
-			items := make([]map[string]string, 0, len(generated))
-			for _, image := range generated {
-				value, resolveErr := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
+				items := make([]map[string]string, 0, len(generated))
+				var resolveErr error
+				for _, image := range generated {
+					value, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
+					if err != nil {
+						resolveErr = err
+						break
+					}
+					s.recordGeneratedMedia(ctx, value)
+					items = append(items, value)
+				}
 				if resolveErr != nil {
+					s.accountPool.Release(lease)
 					s.accountPool.Feedback(lease.Account, upstreamStatus(resolveErr), resolveErr)
+					excluded[lease.Account.Token] = true
+					if s.shouldRetry(upstreamStatus(resolveErr), attempt) {
+						continue
+					}
 					sendErr(resolveErr)
 					cancel()
 					return
 				}
-				s.recordGeneratedMedia(ctx, value)
-				items = append(items, value)
+				s.accountPool.Release(lease)
+				s.stageRequestMonitor(r, "image_response_ready", 95, map[string]any{"response_ms": time.Since(accountStarted).Milliseconds()})
+				s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
+				results[index] = items
+				return
 			}
-			s.stageRequestMonitor(r, "image_response_ready", 95, map[string]any{"response_ms": time.Since(accountStarted).Milliseconds()})
-			s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
-			results[index] = items
 		}()
 	}
 	wg.Wait()

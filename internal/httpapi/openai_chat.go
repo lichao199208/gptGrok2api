@@ -24,7 +24,7 @@ func (s *Server) completeOpenAIChat(w http.ResponseWriter, r *http.Request, requ
 	responseID := newChatID()
 	excluded := map[string]bool{}
 	var text, thinking string
-	var lastErr, firstErr error
+	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isOpenAIAccount)
 		if err != nil {
@@ -35,9 +35,6 @@ func (s *Server) completeOpenAIChat(w http.ResponseWriter, r *http.Request, requ
 		text, thinking, err = s.openAIChat.Complete(r.Context(), lease.Account, request)
 		s.accountPool.Release(lease)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
 			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 			excluded[lease.Account.Token] = true
 			lastErr = err
@@ -48,9 +45,6 @@ func (s *Server) completeOpenAIChat(w http.ResponseWriter, r *http.Request, requ
 		}
 		lastErr = nil
 		break
-	}
-	if firstErr != nil {
-		lastErr = firstErr
 	}
 	if lastErr != nil {
 		writeOpenAIChatError(w, lastErr)
@@ -81,7 +75,7 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 	responseID := newChatID()
 	excluded := map[string]bool{}
 	emitted := false
-	var lastErr, firstErr error
+	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isOpenAIAccount)
 		if err != nil {
@@ -112,9 +106,6 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 		})
 		s.accountPool.Release(lease)
 		if err != nil {
-			if firstErr == nil {
-				firstErr = err
-			}
 			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 			excluded[lease.Account.Token] = true
 			lastErr = err
@@ -126,9 +117,6 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 		s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
 		lastErr = nil
 		break
-	}
-	if firstErr != nil {
-		lastErr = firstErr
 	}
 	if lastErr != nil {
 		writeSSE(w, map[string]any{"error": map[string]any{"message": lastErr.Error(), "type": "upstream_error"}})
@@ -190,7 +178,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
 			excluded[lease.Account.Token] = true
 			lastErr = err
-			if attempt < s.cfg.ChatMaxRetries && upstreamStatus(err) >= 500 {
+			if s.shouldRetry(upstreamStatus(err), attempt) {
 				continue
 			}
 			break
