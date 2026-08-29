@@ -145,6 +145,8 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_PROXY_POOL` | 空 | 逗号分隔代理池 |
 | `GO_OPENAI_BASE_URL` | `https://chatgpt.com` | ChatGPT 上游 |
 | `GO_VERSION` | `1.2.1-go` | 版本标识 |
+| `GO_IMAGE_RETENTION_DAYS` | `1` | 本地图片和元数据保留天数 |
+| `GO_IMAGE_CLEANUP_INTERVAL_SECONDS` | `3600` | 自动清理检查间隔，最少 60 秒 |
 
 完整示例见 `.env.example` 和 `config.example.yaml`。
 
@@ -193,7 +195,7 @@ data/
 logs/
 ~~~
 
-`data/` 可能包含账号 Token、Cookie、OAuth 凭据、图片和管理密钥。生产环境请使用随机密钥，不要上传运行时数据，只通过 Nginx/HTTPS 暴露 API，并定期备份 `data/`。
+`data/` 可能包含账号 Token、Cookie、OAuth 凭据、图片和管理密钥。Go 版默认把生成结果及其元数据保留 1 天，后台每小时自动清理过期文件；可通过 `GO_IMAGE_RETENTION_DAYS` 调整。生产环境请使用随机密钥，不要上传运行时数据，只通过 Nginx/HTTPS 暴露 API，并定期备份 `data/`。
 
 ## 许可证
 

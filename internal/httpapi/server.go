@@ -147,6 +147,7 @@ func New(cfg config.Config) *Server {
 	})
 	if cfg.Version != "test" {
 		server.taskQueue.Start(2)
+		go server.imageRetentionScheduler()
 		go server.grokProbeScheduler()
 		go server.openAISurvivalScheduler()
 	}

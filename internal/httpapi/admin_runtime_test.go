@@ -199,6 +199,44 @@ func TestResponseImageOutputsIgnoresMalformedURLs(t *testing.T) {
 	}
 }
 
+func TestCleanupExpiredImagesUsesRetentionDays(t *testing.T) {
+	root := t.TempDir()
+	cfg := adminTestConfig(root)
+	cfg.ImageRetentionDays = 1
+	server := &Server{cfg: cfg}
+	if err := os.MkdirAll(cfg.ImageDataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(cfg.ImageDataDir, "old.png")
+	newPath := filepath.Join(cfg.ImageDataDir, "new.png")
+	metaPath := filepath.Join(cfg.ImageDataDir, "old.png.meta.json")
+	for _, path := range []string{oldPath, newPath, metaPath} {
+		if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-25 * time.Hour)
+	if err := os.Chtimes(oldPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(metaPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	removed, bytes := server.cleanupExpiredImages()
+	if removed != 2 || bytes != 8 {
+		t.Fatalf("unexpected cleanup result: removed=%d bytes=%d", removed, bytes)
+	}
+	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
+		t.Fatalf("old image was not removed: %v", err)
+	}
+	if _, err := os.Stat(metaPath); !os.IsNotExist(err) {
+		t.Fatalf("old metadata was not removed: %v", err)
+	}
+	if _, err := os.Stat(newPath); err != nil {
+		t.Fatalf("new image should remain: %v", err)
+	}
+}
+
 func TestAdminImagesTagsAndBackup(t *testing.T) {
 	root := t.TempDir()
 	cfg := adminTestConfig(root)

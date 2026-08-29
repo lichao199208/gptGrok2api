@@ -68,6 +68,8 @@ type Config struct {
 	RequestTimeout         time.Duration
 	ChatMaxRetries         int
 	ChatRetryCodes         map[int]bool
+	ImageRetentionDays     int
+	ImageCleanupInterval   time.Duration
 }
 
 func Load(root string) (Config, error) {
@@ -95,6 +97,17 @@ func Load(root string) (Config, error) {
 	}
 	if chatMaxRetries > 3 {
 		chatMaxRetries = 3
+	}
+	imageRetentionDays := envInt("GO_IMAGE_RETENTION_DAYS", 1)
+	if imageRetentionDays < 1 {
+		imageRetentionDays = 1
+	}
+	if imageRetentionDays > 3650 {
+		imageRetentionDays = 3650
+	}
+	imageCleanupIntervalSeconds := envInt("GO_IMAGE_CLEANUP_INTERVAL_SECONDS", 3600)
+	if imageCleanupIntervalSeconds < 60 {
+		imageCleanupIntervalSeconds = 60
 	}
 
 	cfg := Config{
@@ -155,6 +168,8 @@ func Load(root string) (Config, error) {
 		RequestTimeout:         time.Duration(requestTimeoutSeconds) * time.Second,
 		ChatMaxRetries:         chatMaxRetries,
 		ChatRetryCodes:         parseStatusCodes(env("GO_CHAT_RETRY_CODES", "401,403,429,500,502,503")),
+		ImageRetentionDays:     imageRetentionDays,
+		ImageCleanupInterval:   time.Duration(imageCleanupIntervalSeconds) * time.Second,
 	}
 
 	rawConfig, err := readMap(cfg.ConfigPath)
