@@ -10,6 +10,8 @@ GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关，使用 Go 运行时�
 - GPT 文本对话、`gpt-image-2` 图片生成和图片编辑。
 - Grok 聊天、Responses、图片、图片编辑和视频。
 - 账号池、限流冷却、失败反馈、代理绑定和并发调度。
+- 请求失败时按状态码排除异常账号并切换账号重试，成功后才向下游返回结果。
+- OAuth 账号支持使用 `refresh_token` 刷新并持久化新的 access token；密码和 2FA Secret 不会被当作自动登录凭据。
 - 图片本地存储、公开下载 URL、图片管理和批量清理。
 - 实时显示入口排队、账号等待、出口代理、上游准备、生成、下载和总耗时。
 - Vue 管理控制台、Redis 队列、健康检查和 Docker Compose 部署。
@@ -121,9 +123,27 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | 实时监控 | `GET /api/monitor/realtime` |
 | 日志管理 | `GET /api/logs` |
 | 图片管理 | `GET /api/images` |
+| 账号异常清理预览 | `POST /api/settings/account-cleanup/preview` |
+| 账号异常清理执行 | `POST /api/settings/account-cleanup/run` |
 | 管理控制台 | `GET /` |
 
 管理路由需要 `CHATGPT2API_ADMIN_KEY`。
+
+## 账号策略
+
+### 失败换号重试
+
+`/v1/chat/completions`、`gpt-image-2` 图片聊天和 `/v1/images/generations` 在上游返回 `401`、`403`、`429`、`500`、`502`、`503` 或网络错误时，会将当前账号加入本次请求的排除列表并尝试下一个账号。只有在重试耗尽或没有可用账号时，才向下游返回错误。流式请求已经发送首个 SSE 事件后才发生断流时，无法再无感切换账号。
+
+### AT 刷新
+
+带 `refresh_token` 的 OAuth 账号可以通过账号刷新接口获取新的 access token，并自动写回 `data/accounts.json`。普通请求遇到过期 AT 时会优先执行请求级重试；当前 Go 版不会使用账户密码或 2FA Secret 自动重新登录生成 AT，没有 `refresh_token` 的过期账号需要重新导入或人工处理。
+
+### 自动移除异常账号
+
+在控制台勾选“自动移除异常账号”后，系统会先执行预览。只有被明确标记为认证失效/过期且没有 `refresh_token` 的账号才会进入异常删除候选；有刷新令牌的账号和临时网络错误会保留。确认“立即移除”后才执行删除，预览不会修改账号数据。
+
+账号编辑弹窗中的“账户密码”和“2FA Secret”支持点击“复制”；字段为空时复制按钮会自动禁用。
 
 ## Go 配置
 
@@ -139,6 +159,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_AUTH_KEYS_PATH` | `data/auth_keys.json` | 用户密钥文件 |
 | `GO_REQUEST_TIMEOUT_SECONDS` | `180` | 上游超时，最大 300 秒 |
 | `GO_CHAT_MAX_RETRIES` | `2` | 聊天/图片最大重试次数 |
+| `GO_CHAT_RETRY_CODES` | `401,403,429,500,502,503` | 触发换号重试的上游 HTTP 状态码 |
 | `GO_QUEUE_BACKEND` | `redis` | `redis` 或 `json` |
 | `GO_REDIS_ADDR` | `redis:6379` | Redis 地址 |
 | `GO_PROXY_URL` | 空 | 默认代理 |
