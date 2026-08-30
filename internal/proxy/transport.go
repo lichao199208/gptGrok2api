@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 type contextKey struct{}
@@ -29,6 +31,11 @@ func URLFromContext(ctx context.Context) string {
 	return strings.TrimSpace(value)
 }
 
+func URLSelectionFromContext(ctx context.Context) (string, bool) {
+	value, ok := ctx.Value(contextKey{}).(string)
+	return strings.TrimSpace(value), ok
+}
+
 func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error) {
 	proxyURL = normalizeURL(proxyURL)
 	if proxyURL == "" {
@@ -38,7 +45,10 @@ func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error)
 	if err != nil || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid proxy URL %q", proxyURL)
 	}
-	if strings.HasPrefix(strings.ToLower(parsed.Scheme), "socks") {
+	switch strings.ToLower(parsed.Scheme) {
+	case "socks4", "socks4a":
+		return (&socks4Dialer{proxy: parsed}).DialContext(ctx, "tcp", target)
+	case "socks", "socks5", "socks5h":
 		return (&socks5Dialer{proxy: parsed}).DialContext(ctx, "tcp", target)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
@@ -86,14 +96,124 @@ func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error)
 
 // Manager resolves an account-specific proxy first, then rotates the global pool.
 type Manager struct {
-	mu             sync.Mutex
-	url            string
-	pool           []string
-	cursor         int
-	resourceURL    string
-	resourcePool   []string
-	resourceCursor int
-	upstreamRouter *UpstreamRouter
+	mu              sync.Mutex
+	url             string
+	pool            []string
+	cursor          int
+	resourceURL     string
+	resourcePool    []string
+	resourceCursor  int
+	upstreamRouter  *UpstreamRouter
+	imageGroups     map[string]*imageGroup
+	imageGroupID    string
+	imageCursor     int
+	imageSelections uint64
+	imageWake       chan struct{}
+	onImageResult   func(ImageNodeRuntimeResult)
+}
+
+type GroupConfig struct {
+	ID, Name, Strategy string
+	Enabled            bool
+	Nodes              []NodeConfig
+}
+
+type NodeConfig struct {
+	ID, Name, URL         string
+	Enabled               bool
+	ImageConcurrencyLimit int
+	LastStatus            int
+	LastError             string
+	RuntimeFailures       int
+	RuntimeSuccesses      int
+	RuntimeLatencyMS      int64
+}
+
+type imageGroup struct {
+	id, name, strategy string
+	nodes              []*imageNode
+}
+
+type imageNode struct {
+	id, name, url                        string
+	limit, inFlight, failures, successes int
+	latencyMS                            int64
+	cooldownUntil                        time.Time
+	evicted                              bool
+}
+
+type Lease struct {
+	manager   *Manager
+	node      *imageNode
+	URL       string
+	Source    string
+	GroupID   string
+	GroupName string
+	NodeID    string
+	NodeName  string
+	once      sync.Once
+	failed    atomic.Bool
+	slow      atomic.Bool
+	latencyMS atomic.Int64
+}
+
+type EgressInfo struct {
+	Source, GroupID, GroupName, NodeID, NodeName string
+}
+
+type ImageNodeRuntimeResult struct {
+	GroupID, GroupName, NodeID, NodeName, URL string
+	Failures, Successes                       int
+	LatencyMS                                 int64
+	Removed                                   bool
+}
+
+const (
+	imageNodeFailureLimit  = 3
+	imageNodeStableSuccess = 3
+	imageNodeCanaryEvery   = 20
+	defaultImageNodeLimit  = 3
+	imageNodeSlowCooldown  = time.Minute
+)
+
+type imageLeaseContextKey struct{}
+
+func WithImageLease(ctx context.Context, lease *Lease) context.Context {
+	if lease == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, imageLeaseContextKey{}, lease)
+}
+
+// MarkImageLeaseFailure remembers a transport failure even when a later
+// stage-level retry succeeds through a different proxy.
+func MarkImageLeaseFailure(ctx context.Context) {
+	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
+	if lease != nil {
+		lease.failed.Store(true)
+	}
+}
+
+// ObserveImageLeaseStage records only proxy-sensitive stage latency. The
+// upstream image-generation duration must not be included in this score.
+func ObserveImageLeaseStage(ctx context.Context, elapsed, slowAfter time.Duration) {
+	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
+	if lease == nil || elapsed <= 0 {
+		return
+	}
+	lease.latencyMS.Add(max(elapsed.Milliseconds(), 1))
+	if slowAfter > 0 && elapsed > slowAfter {
+		lease.slow.Store(true)
+	}
+}
+
+func (m *Manager) SetImageNodeResultCallback(callback func(ImageNodeRuntimeResult)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.onImageResult = callback
+	m.mu.Unlock()
 }
 
 func NewManager(single string, pool []string) *Manager {
@@ -103,7 +223,492 @@ func NewManager(single string, pool []string) *Manager {
 			clean = append(clean, value)
 		}
 	}
-	return &Manager{url: normalizeURL(single), pool: clean}
+	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}, imageWake: make(chan struct{})}
+}
+
+func (m *Manager) SetDefault(single string, pool []string) {
+	if m == nil {
+		return
+	}
+	clean := make([]string, 0, len(pool))
+	for _, item := range pool {
+		if value := normalizeURL(item); value != "" {
+			clean = append(clean, value)
+		}
+	}
+	m.mu.Lock()
+	m.url = normalizeURL(single)
+	m.pool = clean
+	m.cursor = 0
+	m.mu.Unlock()
+}
+
+// ConfigureImageGroups enables request-scoped image egress selection. A
+// fallback group is used as the active image pool; the default proxy remains
+// available when every group node is busy or cooling down.
+func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
+	if m == nil {
+		return
+	}
+	next := map[string]*imageGroup{}
+	for _, group := range groups {
+		id := strings.TrimSpace(group.ID)
+		if id == "" || !group.Enabled {
+			continue
+		}
+		item := &imageGroup{id: id, name: strings.TrimSpace(group.Name), strategy: strings.TrimSpace(group.Strategy)}
+		for _, node := range group.Nodes {
+			proxyURL := normalizeURL(node.URL)
+			if !node.Enabled || proxyURL == "" || !imageProxyCompatible(proxyURL) || !probeAllowsRuntimeValidation(node.LastStatus, node.LastError) {
+				continue
+			}
+			limit := node.ImageConcurrencyLimit
+			if limit < 1 {
+				limit = defaultImageNodeLimit
+			}
+			failures := node.RuntimeFailures
+			if failures < 0 {
+				failures = 0
+			}
+			if failures >= imageNodeFailureLimit {
+				continue
+			}
+			successes := node.RuntimeSuccesses
+			if successes < 0 {
+				successes = 0
+			}
+			latencyMS := node.RuntimeLatencyMS
+			if latencyMS < 0 {
+				latencyMS = 0
+			}
+			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes, latencyMS: latencyMS})
+		}
+		next[id] = item
+	}
+	groupID := ""
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(fallback)), "group:") {
+		groupID = strings.TrimSpace(strings.TrimSpace(fallback)[len("group:"):])
+	}
+	m.mu.Lock()
+	m.imageGroups = next
+	m.imageGroupID = groupID
+	m.imageCursor = 0
+	m.imageSelections = 0
+	m.signalImageLocked()
+	m.mu.Unlock()
+}
+
+func probeAllowsRuntimeValidation(status int, lastError string) bool {
+	if status == http.StatusForbidden || (status >= 200 && status < 400) {
+		return true
+	}
+	return status == 0 && strings.TrimSpace(lastError) == ""
+}
+
+// AcquireImage chooses one proxy for the complete multi-stage image request.
+// The caller must release the lease so node concurrency and cooldown state stay accurate.
+func (m *Manager) AcquireImage(fields map[string]any) *Lease {
+	if m == nil {
+		return &Lease{}
+	}
+	if fields != nil {
+		for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+			value := strings.TrimSpace(stringValue(fields[key]))
+			if value == "" {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(value), "group:") {
+				if lease := m.acquireGroup(strings.TrimSpace(value[len("group:"):])); lease != nil {
+					return lease
+				}
+				break
+			}
+			if normalized := normalizeURL(value); normalized != "" && imageProxyCompatible(normalized) {
+				return &Lease{URL: normalized, Source: "account"}
+			}
+		}
+	}
+	m.mu.Lock()
+	groupID := m.imageGroupID
+	m.mu.Unlock()
+	if groupID != "" {
+		if lease := m.acquireGroup(groupID); lease != nil {
+			return lease
+		}
+	}
+	proxyURL, configured := m.resolveImageFallback()
+	if proxyURL == "" && configured {
+		return &Lease{Source: "unavailable"}
+	}
+	return &Lease{URL: proxyURL, Source: "default"}
+}
+
+// AcquireImageContext waits for configured proxy-group capacity instead of
+// overflowing concurrent requests onto one default proxy. It falls back only
+// when the requested group has no usable runtime nodes at all.
+func (m *Manager) AcquireImageContext(ctx context.Context, fields map[string]any) (*Lease, error) {
+	if m == nil {
+		return &Lease{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	groupID := ""
+	if fields != nil {
+		for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+			value := strings.TrimSpace(stringValue(fields[key]))
+			if value == "" {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(value), "group:") {
+				groupID = strings.TrimSpace(value[len("group:"):])
+				break
+			}
+			if normalized := normalizeURL(value); normalized != "" && imageProxyCompatible(normalized) {
+				return &Lease{URL: normalized, Source: "account"}, nil
+			}
+			break
+		}
+	}
+	if groupID == "" {
+		m.mu.Lock()
+		groupID = m.imageGroupID
+		m.mu.Unlock()
+	}
+	if groupID != "" {
+		lease, _, err := m.acquireGroupContext(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		if lease != nil {
+			return lease, nil
+		}
+	}
+	proxyURL, configured := m.resolveImageFallback()
+	if proxyURL == "" && configured {
+		return &Lease{Source: "unavailable"}, nil
+	}
+	return &Lease{URL: proxyURL, Source: "default"}, nil
+}
+
+func (m *Manager) acquireGroupContext(ctx context.Context, groupID string) (*Lease, bool, error) {
+	for {
+		m.mu.Lock()
+		lease, available, retryAt := m.acquireGroupLocked(groupID)
+		wake := m.imageWake
+		m.mu.Unlock()
+		if lease != nil || !available {
+			return lease, available, nil
+		}
+
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !retryAt.IsZero() {
+			delay := time.Until(retryAt)
+			if delay < 0 {
+				delay = 0
+			}
+			timer = time.NewTimer(delay)
+			timerC = timer.C
+		}
+		select {
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return nil, true, ctx.Err()
+		case <-wake:
+			if timer != nil {
+				timer.Stop()
+			}
+		case <-timerC:
+		}
+	}
+}
+
+func (m *Manager) acquireGroupLocked(groupID string) (*Lease, bool, time.Time) {
+	group := m.imageGroups[groupID]
+	if group == nil || len(group.nodes) == 0 {
+		return nil, false, time.Time{}
+	}
+	now := time.Now()
+	var retryAt time.Time
+	stableExists := false
+	stableCooling := false
+	for _, node := range group.nodes {
+		if node.evicted {
+			continue
+		}
+		if node.successes >= imageNodeStableSuccess && node.failures == 0 {
+			stableExists = true
+			if node.inFlight < node.limit && now.Before(node.cooldownUntil) {
+				stableCooling = true
+			}
+		}
+		if now.Before(node.cooldownUntil) && (retryAt.IsZero() || node.cooldownUntil.Before(retryAt)) {
+			retryAt = node.cooldownUntil
+		}
+	}
+	canary := stableExists && (m.imageSelections+1)%imageNodeCanaryEvery == 0
+	index := -1
+	if canary {
+		index = m.pickProbeNodeLocked(group, now, "")
+	}
+	if index < 0 && stableExists {
+		index = m.pickStableNodeLocked(group, now, "")
+		if index < 0 && stableCooling {
+			index = m.pickProbeNodeLocked(group, now, "")
+		}
+	} else if index < 0 {
+		index = m.pickProbeNodeLocked(group, now, "")
+	}
+	if index >= 0 {
+		node := group.nodes[index]
+		node.inFlight++
+		m.imageSelections++
+		m.imageCursor = (index + 1) % len(group.nodes)
+		return newImageLease(m, group, node), true, time.Time{}
+	}
+	return nil, true, retryAt
+}
+
+func (m *Manager) pickStableNodeLocked(group *imageGroup, now time.Time, excludedURL string) int {
+	best := -1
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.evicted || node.url == excludedURL || node.successes < imageNodeStableSuccess || node.failures > 0 ||
+			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
+			continue
+		}
+		if best < 0 || imageNodeBetter(node, group.nodes[best]) {
+			best = index
+		}
+	}
+	return best
+}
+
+func (m *Manager) pickProbeNodeLocked(group *imageGroup, now time.Time, excludedURL string) int {
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.evicted || node.url == excludedURL || node.successes >= imageNodeStableSuccess ||
+			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
+			continue
+		}
+		return index
+	}
+	return -1
+}
+
+func imageNodeBetter(candidate, current *imageNode) bool {
+	left := candidate.inFlight * current.limit
+	right := current.inFlight * candidate.limit
+	if left != right {
+		return left < right
+	}
+	return effectiveImageNodeLatency(candidate) < effectiveImageNodeLatency(current)
+}
+
+func effectiveImageNodeLatency(node *imageNode) int64 {
+	if node == nil || node.latencyMS <= 0 {
+		return int64((60 * time.Second) / time.Millisecond)
+	}
+	return node.latencyMS
+}
+
+func newImageLease(manager *Manager, group *imageGroup, node *imageNode) *Lease {
+	return &Lease{manager: manager, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+}
+
+func (m *Manager) resolveImageFallback() (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	configured := m.url != "" || len(m.pool) > 0
+	for offset := 0; offset < len(m.pool); offset++ {
+		index := (m.cursor + offset) % len(m.pool)
+		if imageProxyCompatible(m.pool[index]) {
+			m.cursor = (index + 1) % len(m.pool)
+			return m.pool[index], true
+		}
+	}
+	if imageProxyCompatible(m.url) {
+		return m.url, true
+	}
+	if m.upstreamRouter != nil {
+		if upstream := m.upstreamRouter.Resolve(); upstream != "" {
+			configured = true
+			if imageProxyCompatible(upstream) {
+				return upstream, true
+			}
+		}
+	}
+	return "", configured
+}
+
+// The authenticated ChatGPT image flow uses tls-client for browser TLS
+// fingerprinting. That client supports HTTP(S) and SOCKS5, but not SOCKS4.
+func imageProxyCompatible(proxyURL string) bool {
+	parsed, err := url.Parse(normalizeURL(proxyURL))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *Manager) acquireGroup(groupID string) *Lease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lease, _, _ := m.acquireGroupLocked(groupID)
+	return lease
+}
+
+// AcquireStableImage selects a different group node that has already
+// completed several real image requests. It never falls back to direct mode
+// or the default proxy.
+func (m *Manager) AcquireStableImage(fields map[string]any, excludedURL string) *Lease {
+	if m == nil {
+		return nil
+	}
+	groupID := ""
+	for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+		value := strings.TrimSpace(stringValue(fields[key]))
+		if strings.HasPrefix(strings.ToLower(value), "group:") {
+			groupID = strings.TrimSpace(value[len("group:"):])
+			break
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if groupID == "" {
+		groupID = m.imageGroupID
+	}
+	group := m.imageGroups[groupID]
+	if group == nil || len(group.nodes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	excludedURL = normalizeURL(excludedURL)
+	index := m.pickStableNodeLocked(group, now, excludedURL)
+	if index < 0 {
+		return nil
+	}
+	node := group.nodes[index]
+	node.inFlight++
+	m.imageCursor = (index + 1) % len(group.nodes)
+	return newImageLease(m, group, node)
+}
+
+func (l *Lease) ObserveLatency(elapsed time.Duration, slowAfter time.Duration) {
+	if l == nil || elapsed <= 0 {
+		return
+	}
+	l.latencyMS.Add(max(elapsed.Milliseconds(), 1))
+	if slowAfter > 0 && elapsed > slowAfter {
+		l.slow.Store(true)
+	}
+}
+
+func (l *Lease) Release(runtimeFailure bool) {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		if l.manager == nil || l.node == nil {
+			return
+		}
+		var event *ImageNodeRuntimeResult
+		l.manager.mu.Lock()
+		if l.node.inFlight > 0 {
+			l.node.inFlight--
+		}
+		runtimeFailure = runtimeFailure || l.failed.Load()
+		observedLatencyMS := l.latencyMS.Load()
+		if runtimeFailure && !l.node.evicted {
+			l.node.failures++
+			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
+			l.node.cooldownUntil = time.Now().Add(cooldown)
+			removed := l.node.failures >= imageNodeFailureLimit
+			if removed {
+				l.node.evicted = true
+				if group := l.manager.imageGroups[l.GroupID]; group != nil {
+					nodes := make([]*imageNode, 0, len(group.nodes)-1)
+					for _, node := range group.nodes {
+						if node != l.node {
+							nodes = append(nodes, node)
+						}
+					}
+					group.nodes = nodes
+					if len(nodes) == 0 {
+						l.manager.imageCursor = 0
+					} else {
+						l.manager.imageCursor %= len(nodes)
+					}
+				}
+			}
+			event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Failures: l.node.failures, Successes: l.node.successes, LatencyMS: l.node.latencyMS, Removed: removed}
+		} else if !runtimeFailure && !l.node.evicted {
+			hadFailures := l.node.failures > 0
+			l.node.failures = 0
+			l.node.successes++
+			if observedLatencyMS > 0 {
+				if l.node.latencyMS <= 0 {
+					l.node.latencyMS = observedLatencyMS
+				} else {
+					l.node.latencyMS = (l.node.latencyMS*7 + observedLatencyMS*3) / 10
+				}
+			}
+			if l.slow.Load() {
+				l.node.cooldownUntil = time.Now().Add(imageNodeSlowCooldown)
+			} else {
+				l.node.cooldownUntil = time.Time{}
+			}
+			if hadFailures || l.slow.Load() || l.node.successes == imageNodeStableSuccess || l.node.successes%25 == 0 {
+				event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Successes: l.node.successes, LatencyMS: l.node.latencyMS}
+			}
+		}
+		callback := l.manager.onImageResult
+		l.manager.signalImageLocked()
+		l.manager.mu.Unlock()
+		if event != nil && callback != nil {
+			callback(*event)
+		}
+	})
+}
+
+func (m *Manager) signalImageLocked() {
+	if m.imageWake != nil {
+		close(m.imageWake)
+	}
+	m.imageWake = make(chan struct{})
+}
+
+func (m *Manager) DescribeImageEgress(proxyURL string) EgressInfo {
+	if m == nil {
+		return EgressInfo{Source: "direct"}
+	}
+	normalized := normalizeURL(proxyURL)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, group := range m.imageGroups {
+		for _, node := range group.nodes {
+			if node.url == normalized {
+				return EgressInfo{Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+			}
+		}
+	}
+	if normalized == "" {
+		return EgressInfo{Source: "direct"}
+	}
+	return EgressInfo{Source: "default"}
 }
 
 func (m *Manager) SetResource(single string, pool []string) {
@@ -187,6 +792,12 @@ func (m *Manager) Snapshot() map[string]any {
 		mode = "single_proxy"
 	}
 	snapshot := map[string]any{"mode": mode, "count": len(m.pool), "resource_count": len(m.resourcePool), "proxy_configured": m.url != "" || len(m.pool) > 0 || m.resourceURL != "" || len(m.resourcePool) > 0}
+	if group := m.imageGroups[m.imageGroupID]; group != nil {
+		snapshot["mode"] = "proxy_group"
+		snapshot["image_group_id"] = group.id
+		snapshot["image_group_count"] = len(group.nodes)
+		snapshot["proxy_configured"] = len(group.nodes) > 0 || snapshot["proxy_configured"] == true
+	}
 	if m.upstreamRouter != nil {
 		snapshot["upstreams"] = m.upstreamRouter.Snapshot()
 	}
@@ -236,6 +847,11 @@ func (t *Transport) forProxy(proxyURL string) (http.RoundTripper, error) {
 		transport := cloneHTTPTransport(t.base)
 		transport.Proxy = http.ProxyURL(parsed)
 		roundTripper = transport
+	case "socks4", "socks4a":
+		transport := cloneHTTPTransport(t.base)
+		transport.Proxy = nil
+		transport.DialContext = (&socks4Dialer{proxy: parsed}).DialContext
+		roundTripper = transport
 	case "socks5", "socks5h", "socks":
 		transport := cloneHTTPTransport(t.base)
 		transport.Proxy = nil
@@ -262,6 +878,64 @@ func cloneHTTPTransport(base http.RoundTripper) *http.Transport {
 }
 
 type socks5Dialer struct{ proxy *url.URL }
+
+type socks4Dialer struct{ proxy *url.URL }
+
+func (d *socks4Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("SOCKS4 only supports TCP, got %s", network)
+	}
+	proxyAddress := d.proxy.Host
+	if _, _, err := net.SplitHostPort(proxyAddress); err != nil {
+		proxyAddress = net.JoinHostPort(proxyAddress, "1080")
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	if err := socks4Connect(conn, address, d.proxy.User); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func socks4Connect(conn io.ReadWriter, address string, user *url.Userinfo) error {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid target port %q", portText)
+	}
+	packet := []byte{0x04, 0x01, byte(port >> 8), byte(port)}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		packet = append(packet, 0x00, 0x00, 0x00, 0x01)
+	} else {
+		packet = append(packet, ip...)
+	}
+	if user != nil {
+		packet = append(packet, []byte(user.Username())...)
+	}
+	packet = append(packet, 0x00)
+	if ip == nil {
+		packet = append(packet, []byte(host)...)
+		packet = append(packet, 0x00)
+	}
+	if _, err := conn.Write(packet); err != nil {
+		return err
+	}
+	var reply [8]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		return err
+	}
+	if reply[1] != 0x5a {
+		return fmt.Errorf("SOCKS4 connect failed with code 0x%02x", reply[1])
+	}
+	return nil
+}
 
 func (d *socks5Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -223,6 +222,12 @@ func (s *Server) proxyProfileByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proxyGroupByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy/groups/"), "/")
+	if strings.HasSuffix(path, "/subscription/refresh") {
+		id := strings.TrimSuffix(path, "/subscription/refresh")
+		s.refreshProxyGroupSubscription(w, r, id)
+		return
+	}
 	s.proxyResourceByID(w, r, "proxy_groups", "/api/proxy/groups/", "groups")
 }
 
@@ -231,31 +236,6 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 		return
 	}
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
-	refresh := strings.HasSuffix(id, "/subscription/refresh")
-	if refresh {
-		id = strings.TrimSuffix(id, "/subscription/refresh")
-	}
-	if refresh {
-		if configKey != "proxy_groups" {
-			writeError(w, http.StatusNotFound, "proxy group not found", "not_found")
-			return
-		}
-		if r.Method == http.MethodPost {
-			result, err := s.refreshProxyGroupSubscription(id)
-			if err != nil {
-				status, code := http.StatusBadGateway, "upstream_error"
-				if errors.Is(err, errProxyGroupNotFound) {
-					status, code = http.StatusNotFound, "not_found"
-				} else if errors.Is(err, errProxySubscriptionInvalid) {
-					status, code = http.StatusBadRequest, "invalid_request_error"
-				}
-				writeError(w, status, "proxy subscription refresh failed", code)
-				return
-			}
-			writeJSON(w, http.StatusOK, result)
-			return
-		}
-	}
 	if r.Method != http.MethodDelete {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
@@ -283,6 +263,12 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
+	}
+	if configKey == "proxy_groups" {
+		if err := s.refreshProxyRuntime(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+			return
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id, responseKey: mapList(updated[configKey])})
 }

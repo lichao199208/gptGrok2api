@@ -3,6 +3,9 @@ import type { ClearanceTestResult, ProxyRuntimeSettings, ProxyRuntimeStatus } fr
 
 export interface ProxyTestResult {
   ok: boolean
+  reachable?: boolean
+  verification?: 'probe_ok' | 'api_required' | 'failed'
+  status_label?: string
   status: number
   latency_ms: number
   error?: string | null
@@ -40,11 +43,14 @@ export interface ProxyNode {
   url: string
   enabled: boolean
   image_concurrency_limit?: number
+  last_status?: number
   last_latency_ms?: number
   fail_count?: number
   last_error?: string
   last_checked_at?: string
   last_error_at?: string
+  last_verification?: string
+  last_status_label?: string
   cooldown_until?: string
   notes?: string
   source?: string
@@ -155,9 +161,9 @@ export const proxyApi = {
       `/api/proxy/groups/${encodeURIComponent(id)}`,
     ),
 
-  testGroup: (payload: { id?: string; node_id?: string; url?: string }) =>
+  testGroup: (payload: { id?: string; node_id?: string; url?: string; prune_failed?: boolean }) =>
     apiClient.post<
-      { id?: string; node_id?: string; url?: string },
+      { id?: string; node_id?: string; url?: string; prune_failed?: boolean },
       { result?: ProxyTestResult | null; results?: Array<{ node_id: string; result: ProxyTestResult }>; groups?: ProxyGroup[] }
     >('/api/proxy/groups/test', payload),
 

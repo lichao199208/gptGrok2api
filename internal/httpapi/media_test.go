@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -30,6 +31,14 @@ func TestValidOpenAIImageSizeAcceptsArbitraryDimensions(t *testing.T) {
 	for _, value := range []string{"0x100", "abc", "100"} {
 		if validOpenAIImageSize(value) {
 			t.Fatalf("accepted %s", value)
+		}
+	}
+}
+
+func TestImageEditsAlwaysReturnServerURL(t *testing.T) {
+	for _, requested := range []string{"", "url", "b64_json"} {
+		if actual := imageEditResponseFormat(requested); actual != "url" {
+			t.Fatalf("imageEditResponseFormat(%q) = %q, want url", requested, actual)
 		}
 	}
 }
@@ -61,6 +70,30 @@ func TestParseImageEditRequestAcceptsJSONDataURL(t *testing.T) {
 	}
 	if parsed.Inputs[0].MIME != "image/png" || len(parsed.Inputs[0].Data) != len(tinyPNG) {
 		t.Fatalf("unexpected parsed image: %#v", parsed.Inputs[0])
+	}
+}
+
+func TestParseImageEditRequestReportsTruncatedJSON(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{"model":"gpt-image-2","prompt":`))
+	request.Header.Set("Content-Type", "application/json")
+
+	_, err := server.parseImageEditRequest(request)
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("expected a truncated JSON diagnostic, got %v", err)
+	}
+}
+
+func TestParseImageEditRequestRejectsOversizedJSON(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.ContentLength = maxJSONBodyBytes + 1
+
+	_, err := server.parseImageEditRequest(request)
+	var parseError imageEditParseError
+	if !errors.As(err, &parseError) || parseError.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected a 413 parse error, got %#v", err)
 	}
 }
 
@@ -141,6 +174,13 @@ func TestUpstreamStatusUnwrapsWrappedErrors(t *testing.T) {
 	err := fmt.Errorf("do request failed /v1/chat/completions: %w", &protocol.UpstreamError{Status: http.StatusTooManyRequests, Message: "throttled"})
 	if status := upstreamStatus(err); status != http.StatusTooManyRequests {
 		t.Fatalf("expected wrapped upstream status 429, got %d", status)
+	}
+}
+
+func TestUpstreamStatusMapsDeadlineToGatewayTimeout(t *testing.T) {
+	err := fmt.Errorf("image polling failed: %w", context.DeadlineExceeded)
+	if status := upstreamStatus(err); status != http.StatusGatewayTimeout {
+		t.Fatalf("expected deadline status 504, got %d", status)
 	}
 }
 
@@ -295,5 +335,112 @@ func TestImageGenerationsRunsOpenAIBatchesConcurrently(t *testing.T) {
 	}
 	if peak.Load() < 2 {
 		t.Fatalf("expected concurrent OpenAI image requests, peak=%d", peak.Load())
+	}
+}
+
+func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig()
+	cfg.RootDir = root
+	cfg.DataDir = root
+	cfg.ConfigPath = filepath.Join(root, "config.json")
+	cfg.AccountsPath = filepath.Join(root, "accounts.json")
+	cfg.AuthKeysPath = filepath.Join(root, "auth_keys.json")
+	cfg.ImageDataDir = filepath.Join(root, "images")
+
+	server := New(cfg)
+	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
+		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fileIDs := []string{
+		"file_000000001234567890abcdef12345678",
+		"file_000000001234567890abcdef87654321",
+	}
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://%s\",\"file-service://%s\"]}}}\n\n", fileIDs[0], fileIDs[1])
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/files/" + fileIDs[0] + "/download", "/backend-api/files/" + fileIDs[1] + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(tinyPNG)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	server.openAIImage = provider.NewOpenAIImage(upstream.URL, upstream.Client(), nil, 30*time.Second)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"一只猫","n":1,"response_format":"url"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer api-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected response: %d %s", response.Code, response.Body.String())
+	}
+	var decoded struct {
+		Data []map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Data) != 1 {
+		t.Fatalf("expected 1 returned image, got %d", len(decoded.Data))
+	}
+	entries, err := os.ReadDir(cfg.ImageDataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored := 0
+	for _, entry := range entries {
+		if !entry.IsDir() && !strings.HasSuffix(entry.Name(), ".meta.json") {
+			stored++
+		}
+	}
+	if stored != 1 {
+		t.Fatalf("expected 1 persisted image, got %d", stored)
+	}
+
+	chatRequest := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-image-2","messages":[{"role":"user","content":"一只猫"}]}`))
+	chatRequest.Header.Set("Content-Type", "application/json")
+	chatRequest.Header.Set("Authorization", "Bearer api-secret")
+	chatResponse := httptest.NewRecorder()
+	server.Handler().ServeHTTP(chatResponse, chatRequest)
+	if chatResponse.Code != http.StatusOK {
+		t.Fatalf("unexpected chat response: %d %s", chatResponse.Code, chatResponse.Body.String())
+	}
+	if count := strings.Count(chatResponse.Body.String(), "![image]("); count != 1 {
+		t.Fatalf("expected 1 returned chat image, got %d: %s", count, chatResponse.Body.String())
+	}
+	entries, err = os.ReadDir(cfg.ImageDataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stored = 0
+	for _, entry := range entries {
+		if !entry.IsDir() && !strings.HasSuffix(entry.Name(), ".meta.json") {
+			stored++
+		}
+	}
+	if stored != 2 {
+		t.Fatalf("expected one persisted image per request, got %d total", stored)
 	}
 }

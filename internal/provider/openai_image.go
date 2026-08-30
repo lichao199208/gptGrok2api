@@ -91,6 +91,17 @@ func notifyOpenAIImageEgress(ctx context.Context, proxyURL string) {
 }
 
 const openAIImageDefaultPollTimeout = 3 * time.Minute
+const openAIImageUploadAttemptTimeout = 60 * time.Second
+const openAIImagePollAttemptTimeout = 20 * time.Second
+const openAIImageReferenceUploadConcurrency = 3
+
+const (
+	openAIImageSlowUpload       = 30 * time.Second
+	openAIImageSlowBootstrap    = 15 * time.Second
+	openAIImageSlowRequirements = 15 * time.Second
+	openAIImageSlowPrepare      = 15 * time.Second
+	openAIImageSlowDownload     = 20 * time.Second
+)
 
 func NewOpenAIImage(baseURL string, client *http.Client, proxy *proxyruntime.Manager, timeout time.Duration) *OpenAIImage {
 	if client == nil {
@@ -112,7 +123,7 @@ func (o *OpenAIImage) SetProxyManager(manager *proxyruntime.Manager) {
 	o.Proxy = manager
 }
 
-func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, prompt, model, size, quality string, inputs []OpenAIImageInput) ([]ImageResult, error) {
+func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, prompt, model, size, quality string, inputs []OpenAIImageInput) (results []ImageResult, err error) {
 	if strings.TrimSpace(account.Token) == "" {
 		return nil, fmt.Errorf("OpenAI image generation requires an access token")
 	}
@@ -126,18 +137,30 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	if quality == "" {
 		quality = "auto"
 	}
-	prompt = strings.TrimSpace(prompt) + "\n\n输出图片尺寸为 " + size + "。\n输出图片质量为 " + quality + "。"
-	references := make([]openAIImageReference, 0, len(inputs))
-	inputStarted := time.Now()
-	for index, input := range inputs {
-		ref, err := o.uploadInput(ctx, account, input, index+1)
-		if err != nil {
-			return nil, err
+	if o.Proxy != nil {
+		egressStarted := time.Now()
+		lease, acquireErr := o.Proxy.AcquireImageContext(ctx, account.Fields)
+		notifyOpenAIImageStage(ctx, "egress_acquire_ms", egressStarted)
+		if acquireErr != nil {
+			return nil, fmt.Errorf("wait for image proxy capacity: %w", acquireErr)
 		}
-		references = append(references, ref)
+		if lease.Source == "unavailable" {
+			return nil, fmt.Errorf("no browser-compatible image proxy is available; use http, https, socks5, or socks5h")
+		}
+		ctx = proxyruntime.WithURL(ctx, lease.URL)
+		ctx = proxyruntime.WithImageLease(ctx, lease)
+		notifyOpenAIImageEgress(ctx, lease.URL)
+		defer func() { lease.Release(openAIImageProxyFailure(err)) }()
+	}
+	prompt = strings.TrimSpace(prompt) + "\n\n输出图片尺寸为 " + size + "。\n输出图片质量为 " + quality + "。"
+	inputStarted := time.Now()
+	references, err := o.uploadInputs(ctx, account, inputs)
+	if err != nil {
+		return nil, err
 	}
 	if len(inputs) > 0 {
 		notifyOpenAIImageStage(ctx, "upload_ms", inputStarted)
+		proxyruntime.ObserveImageLeaseStage(ctx, time.Since(inputStarted), openAIImageSlowUpload)
 	}
 
 	stageStarted := time.Now()
@@ -146,6 +169,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "bootstrap_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowBootstrap)
 
 	stageStarted = time.Now()
 	requirements, err := o.chatRequirements(ctx, account, scripts, build)
@@ -153,6 +177,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "requirements_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowRequirements)
 
 	stageStarted = time.Now()
 	conduit, err := o.prepare(ctx, account, requirements, prompt, model)
@@ -160,32 +185,33 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "prepare_conversation_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowPrepare)
 
 	stageStarted = time.Now()
-	conversationID, fileIDs, err := o.start(ctx, account, requirements, conduit, prompt, model, size, quality, references)
+	conversationID, imageRefs, err := o.start(ctx, account, requirements, conduit, prompt, model, size, quality, references)
 	if err != nil {
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "generation_start_ms", stageStarted)
 	notifyOpenAIImageStage(ctx, "conversation_stream_ms", stageStarted)
-	if conversationID == "" && len(fileIDs) == 0 {
+	if conversationID == "" && len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image stream returned no conversation id")
 	}
-	if len(fileIDs) == 0 {
+	if len(imageRefs) == 0 {
 		if conversationID == "" {
 			return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 		}
 		stageStarted = time.Now()
-		fileIDs, err = o.pollConversation(ctx, account, conversationID)
+		imageRefs, err = o.pollConversation(ctx, account, conversationID)
 		if err != nil {
 			return nil, err
 		}
 		notifyOpenAIImageStage(ctx, "resolve_ms", stageStarted)
 	}
-	if len(fileIDs) == 0 {
+	if len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image generation completed without image files")
 	}
-	results := make([]ImageResult, 0, len(fileIDs))
+	results = make([]ImageResult, 0, len(imageRefs))
 	seen := map[string]bool{}
 	inputFileIDs := map[string]bool{}
 	var lastDownloadErr error
@@ -194,21 +220,23 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 			inputFileIDs[ref.FileID] = true
 		}
 	}
-	for _, fileID := range fileIDs {
+	for _, imageRef := range imageRefs {
+		fileID := strings.TrimPrefix(imageRef, "file-service://")
 		// The upstream SSE/poll response can echo uploaded reference assets.
 		// Those are inputs, not generated outputs, and must never be returned or
 		// persisted in the generated-image gallery.
-		if fileID == "" || seen[fileID] || inputFileIDs[fileID] {
+		if imageRef == "" || seen[imageRef] || inputFileIDs[fileID] {
 			continue
 		}
-		seen[fileID] = true
+		seen[imageRef] = true
 		downloadStarted := time.Now()
-		raw, mime, err := o.downloadFile(ctx, account, fileID)
+		raw, mime, err := o.downloadImageRefWithRetry(ctx, account, conversationID, imageRef)
 		if err != nil {
 			lastDownloadErr = err
 			continue
 		}
 		notifyOpenAIImageStage(ctx, "download_ms", downloadStarted)
+		proxyruntime.ObserveImageLeaseStage(ctx, time.Since(downloadStarted), openAIImageSlowDownload)
 		results = append(results, ImageResult{
 			Base64: base64.StdEncoding.EncodeToString(raw),
 			MIME:   mime,
@@ -224,6 +252,50 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 	}
 	return results, nil
+}
+
+func (o *OpenAIImage) uploadInputs(ctx context.Context, account accounts.Account, inputs []OpenAIImageInput) ([]openAIImageReference, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	references := make([]openAIImageReference, len(inputs))
+	jobs := make(chan int, len(inputs))
+	for index := range inputs {
+		jobs <- index
+	}
+	close(jobs)
+
+	workerCount := min(len(inputs), openAIImageReferenceUploadConcurrency)
+	var workers sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	workers.Add(workerCount)
+	for worker := 0; worker < workerCount; worker++ {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				if uploadCtx.Err() != nil {
+					return
+				}
+				ref, uploadErr := o.uploadInput(uploadCtx, account, inputs[index], index+1)
+				if uploadErr != nil {
+					errOnce.Do(func() {
+						firstErr = uploadErr
+						cancel()
+					})
+					return
+				}
+				references[index] = ref
+			}
+		}()
+	}
+	workers.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return references, nil
 }
 
 // NormalizeOpenAIImageSize keeps legacy UI presets compatible with the
@@ -243,26 +315,23 @@ func NormalizeOpenAIImageSize(size string) string {
 	}
 }
 
-func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, image ImageResult, responseFormat, imageDir, publicBase string) (map[string]string, error) {
+func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, image ImageResult, responseFormat, imageDir, publicBase string) (map[string]string, string, error) {
 	format := strings.ToLower(strings.TrimSpace(responseFormat))
 	if format == "" {
 		format = "url"
 	}
 	if format != "url" && format != "b64_json" {
-		return nil, fmt.Errorf("response_format must be url or b64_json")
+		return nil, "", fmt.Errorf("response_format must be url or b64_json")
 	}
 	if image.Base64 == "" {
-		return nil, fmt.Errorf("OpenAI image result has no image bytes")
-	}
-	if format == "b64_json" {
-		return map[string]string{"b64_json": image.Base64}, nil
+		return nil, "", fmt.Errorf("OpenAI image result has no image bytes")
 	}
 	raw, err := base64.StdEncoding.DecodeString(image.Base64)
 	if err != nil {
-		return nil, fmt.Errorf("decode OpenAI image: %w", err)
+		return nil, "", fmt.Errorf("decode OpenAI image: %w", err)
 	}
 	if err := ensureDir(imageDir); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	id := randomMediaID()
 	ext := ".png"
@@ -270,13 +339,16 @@ func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, ima
 		ext = ".jpg"
 	}
 	if err := writeMediaFile(imageDir, id, ext, raw); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	value := "/v1/files/image?id=" + id
 	if strings.TrimSpace(publicBase) != "" {
 		value = strings.TrimRight(publicBase, "/") + value
 	}
-	return map[string]string{"url": value}, nil
+	if format == "b64_json" {
+		return map[string]string{"b64_json": image.Base64}, value, nil
+	}
+	return map[string]string{"url": value}, value, nil
 }
 
 type openAIRequirements struct {
@@ -496,20 +568,24 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 		}
 	}
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		response, err := o.do(ctx, http.MethodGet, "/backend-api/conversation/"+url.PathEscape(conversationID), account, nil, nil, false)
+		value, err := o.pollConversationOnce(ctx, account, conversationID)
 		if err == nil {
-			var value any
-			if decodeErr := decodeOpenAIJSON(response, &value, "image conversation"); decodeErr == nil {
-				id := ""
-				ids := []string{}
-				collectOpenAIImageRefs(value, &id, &ids)
-				if len(ids) > 0 {
-					return uniqueStrings(ids), nil
-				}
+			id := ""
+			ids := []string{}
+			collectOpenAIImageRefs(value, &id, &ids)
+			if len(ids) > 0 {
+				return uniqueStrings(ids), nil
 			}
+			if terminal := openAIImageTerminalError(value); terminal != nil {
+				return nil, terminal
+			}
+			lastErr = errors.New("upstream response contained no image reference")
 		} else if !isRetryableOpenAIError(err) {
 			return nil, err
+		} else {
+			lastErr = err
 		}
 		wait := 5 * time.Second
 		if remaining := time.Until(deadline); remaining < wait {
@@ -518,12 +594,132 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 		if wait > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, fmt.Errorf("OpenAI image result polling deadline exceeded (last poll error: %s): %w", openAIImagePollErrorSummary(lastErr), ctx.Err())
 			case <-time.After(wait):
 			}
 		}
 	}
-	return nil, &protocol.UpstreamError{Status: http.StatusGatewayTimeout, Message: "OpenAI image result polling timed out", Body: "OpenAI image result polling timed out"}
+	message := "OpenAI image result polling timed out"
+	if lastErr != nil {
+		message += " (last poll error: " + openAIImagePollErrorSummary(lastErr) + ")"
+	}
+	return nil, &protocol.UpstreamError{Status: http.StatusGatewayTimeout, Message: message, Body: message}
+}
+
+func (o *OpenAIImage) pollConversationOnce(ctx context.Context, account accounts.Account, conversationID string) (any, error) {
+	request := func(requestCtx context.Context) (any, error) {
+		attemptCtx, cancel := context.WithTimeout(requestCtx, minDuration(o.RequestTimeout, openAIImagePollAttemptTimeout))
+		defer cancel()
+		response, err := o.do(attemptCtx, http.MethodGet, "/backend-api/conversation/"+url.PathEscape(conversationID), account, nil, nil, false)
+		if err != nil {
+			return nil, err
+		}
+		var value any
+		if err := decodeOpenAIJSON(response, &value, "image conversation"); err != nil {
+			return nil, err
+		}
+		return value, nil
+	}
+	value, err := request(ctx)
+	if err == nil || !isRetryableOpenAITransferError(err) {
+		return value, err
+	}
+	o.markPrimaryProxyFailure(ctx, err)
+	stable := o.acquireStableRetry(ctx, account)
+	if stable == nil {
+		return nil, err
+	}
+	retryCtx := proxyruntime.WithURL(ctx, stable.URL)
+	value, err = request(retryCtx)
+	stable.Release(openAIImageProxyFailure(err))
+	return value, err
+}
+
+func openAIImagePollErrorSummary(err error) string {
+	if err == nil {
+		return "none"
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "request deadline exceeded"
+	}
+	var upstream *protocol.UpstreamError
+	if errors.As(err, &upstream) {
+		return fmt.Sprintf("upstream HTTP %d", upstream.Status)
+	}
+	message := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(message, "unexpected eof"):
+		return "unexpected EOF"
+	case strings.Contains(message, "connection reset"):
+		return "connection reset by peer"
+	case strings.Contains(message, "timeout"):
+		return "network timeout"
+	case strings.Contains(message, "decode"):
+		return "invalid upstream JSON"
+	case strings.Contains(message, "no image reference"):
+		return "upstream response contained no image reference"
+	default:
+		return "poll request failed"
+	}
+}
+
+func openAIImageTerminalError(value any) error {
+	reason := openAIImageTerminalReason(value)
+	if reason == "" {
+		return nil
+	}
+	message := "OpenAI image generation stopped by upstream: " + reason
+	return &protocol.UpstreamError{Status: http.StatusUnprocessableEntity, Message: message, Body: message}
+}
+
+func openAIImageTerminalReason(value any) string {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			normalizedKey := strings.ToLower(strings.TrimSpace(key))
+			text := strings.ToLower(strings.TrimSpace(stringValue(item)))
+			switch normalizedKey {
+			case "status", "state", "task_status", "generation_status":
+				switch text {
+				case "failed", "error", "cancelled", "canceled", "blocked", "moderated", "refused", "rejected", "finished_error":
+					return text
+				}
+			case "content_type", "finish_type", "finish_reason":
+				switch text {
+				case "refusal", "content_filter", "safety", "moderation":
+					return text
+				}
+			case "error":
+				if details, ok := item.(map[string]any); ok {
+					if message := firstStringValue(details, "message", "code", "type"); message != "" {
+						return truncateOpenAIImageReason(message)
+					}
+				} else if message := strings.TrimSpace(stringValue(item)); message != "" {
+					return truncateOpenAIImageReason(message)
+				}
+			}
+		}
+		for _, item := range typed {
+			if reason := openAIImageTerminalReason(item); reason != "" {
+				return reason
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if reason := openAIImageTerminalReason(item); reason != "" {
+				return reason
+			}
+		}
+	}
+	return ""
+}
+
+func truncateOpenAIImageReason(value string) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if len(value) > 160 {
+		return value[:160]
+	}
+	return value
 }
 
 func (o *OpenAIImage) uploadInput(ctx context.Context, account accounts.Account, input OpenAIImageInput, index int) (openAIImageReference, error) {
@@ -543,12 +739,8 @@ func (o *OpenAIImage) uploadInput(ctx context.Context, account accounts.Account,
 		"file_name": name, "file_size": len(input.Data), "use_case": "multimodal",
 		"width": width, "height": height,
 	}
-	response, err := o.do(ctx, http.MethodPost, "/backend-api/files", account, payload, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}, false)
+	meta, err := o.prepareInputUpload(ctx, account, payload)
 	if err != nil {
-		return openAIImageReference{}, err
-	}
-	var meta map[string]any
-	if err := decodeOpenAIJSON(response, &meta, "image upload prepare"); err != nil {
 		return openAIImageReference{}, err
 	}
 	fileID := stringValue(meta["file_id"])
@@ -556,15 +748,14 @@ func (o *OpenAIImage) uploadInput(ctx context.Context, account accounts.Account,
 	if fileID == "" || uploadURL == "" {
 		return openAIImageReference{}, fmt.Errorf("OpenAI image upload returned incomplete metadata")
 	}
-	response, err = o.doAbsolute(ctx, http.MethodPut, uploadURL, account, bytes.NewReader(input.Data), map[string]string{
+	err = o.uploadInputBlob(ctx, account, uploadURL, input.Data, map[string]string{
 		"Content-Type": mimeType, "x-ms-blob-type": "BlockBlob", "x-ms-version": "2020-04-08",
 		"Accept": "application/json, text/plain, */*",
-	}, false)
+	})
 	if err != nil {
 		return openAIImageReference{}, err
 	}
-	_ = response.Body.Close()
-	response, err = o.do(ctx, http.MethodPost, "/backend-api/files/"+url.PathEscape(fileID)+"/uploaded", account, map[string]any{}, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}, false)
+	response, err := o.do(ctx, http.MethodPost, "/backend-api/files/"+url.PathEscape(fileID)+"/uploaded", account, map[string]any{}, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}, false)
 	if err != nil {
 		return openAIImageReference{}, err
 	}
@@ -572,18 +763,188 @@ func (o *OpenAIImage) uploadInput(ctx context.Context, account accounts.Account,
 	return openAIImageReference{FileID: fileID, FileName: name, FileSize: len(input.Data), MIME: mimeType, Width: width, Height: height}, nil
 }
 
+// prepareInputUpload retries only before the binary upload and generation have
+// started. The retry remains proxy-only and is limited to one stable group node.
+func (o *OpenAIImage) prepareInputUpload(ctx context.Context, account accounts.Account, payload map[string]any) (map[string]any, error) {
+	request := func(requestCtx context.Context) (map[string]any, error) {
+		requestCtx, cancel := context.WithTimeout(requestCtx, minDuration(o.RequestTimeout, openAIImageUploadAttemptTimeout))
+		defer cancel()
+		response, err := o.do(requestCtx, http.MethodPost, "/backend-api/files", account, payload, map[string]string{"Content-Type": "application/json", "Accept": "application/json"}, false)
+		var meta map[string]any
+		if err == nil {
+			err = decodeOpenAIJSON(response, &meta, "image upload prepare")
+		}
+		return meta, err
+	}
+	proxyURL := o.selectedProxyURL(ctx, account)
+	meta, err := request(proxyruntime.WithURL(ctx, proxyURL))
+	if err == nil {
+		return meta, nil
+	}
+	if !isRetryableOpenAIUploadError(err) {
+		return nil, err
+	}
+	o.markPrimaryProxyFailure(ctx, err)
+	stable := o.acquireStableRetry(ctx, account)
+	if stable == nil {
+		return nil, fmt.Errorf("OpenAI image upload prepare failed after retry: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		stable.Release(false)
+		return nil, ctx.Err()
+	case <-time.After(200 * time.Millisecond):
+	}
+	retryStarted := time.Now()
+	meta, err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowUpload)
+	stable.Release(openAIImageProxyFailure(err))
+	if err != nil {
+		return nil, fmt.Errorf("OpenAI image upload prepare failed after retry: %w", err)
+	}
+	return meta, nil
+}
+
+// uploadInputBlob retries only the replayable signed-storage PUT. The normal
+// ChatGPT flow stays pinned to one proxy; retry egress is restricted to a
+// different group node with multiple successful real image requests.
+func (o *OpenAIImage) uploadInputBlob(ctx context.Context, account accounts.Account, endpoint string, data []byte, headers map[string]string) error {
+	request := func(requestCtx context.Context) error {
+		attemptTimeout := minDuration(o.RequestTimeout, openAIImageUploadAttemptTimeout)
+		requestCtx, cancel := context.WithTimeout(requestCtx, attemptTimeout)
+		defer cancel()
+		response, err := o.doAbsolute(requestCtx, http.MethodPut, endpoint, account, bytes.NewReader(data), headers, false)
+		if err == nil {
+			_ = response.Body.Close()
+		}
+		return err
+	}
+	proxyURL := o.selectedProxyURL(ctx, account)
+	err := request(proxyruntime.WithURL(ctx, proxyURL))
+	if err == nil || !isRetryableOpenAIUploadError(err) {
+		return err
+	}
+	o.markPrimaryProxyFailure(ctx, err)
+	stable := o.acquireStableRetry(ctx, account)
+	if stable == nil {
+		return fmt.Errorf("OpenAI image upload failed after retry: %w", err)
+	}
+	select {
+	case <-ctx.Done():
+		stable.Release(false)
+		return ctx.Err()
+	case <-time.After(200 * time.Millisecond):
+	}
+	retryStarted := time.Now()
+	err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowUpload)
+	stable.Release(openAIImageProxyFailure(err))
+	if err != nil {
+		return fmt.Errorf("OpenAI image upload failed after retry: %w", err)
+	}
+	return nil
+}
+
+func isRetryableOpenAIUploadError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var upstream *protocol.UpstreamError
+	if errors.As(err, &upstream) {
+		return upstream.Status == http.StatusForbidden || upstream.Status == http.StatusRequestTimeout ||
+			upstream.Status == http.StatusTooManyRequests || upstream.Status >= http.StatusInternalServerError
+	}
+	return openAIImageProxyFailure(err)
+}
+
+func isRetryableOpenAITransferError(err error) bool {
+	return isRetryableOpenAIUploadError(err)
+}
+
+func (o *OpenAIImage) selectedProxyURL(ctx context.Context, account accounts.Account) string {
+	proxyURL, selected := proxyruntime.URLSelectionFromContext(ctx)
+	if !selected && o.Proxy != nil {
+		proxyURL = o.Proxy.Resolve(account.Fields, false)
+	}
+	return proxyURL
+}
+
+func (o *OpenAIImage) acquireStableRetry(ctx context.Context, account accounts.Account) *proxyruntime.Lease {
+	proxyURL := o.selectedProxyURL(ctx, account)
+	if proxyURL == "" || o.Proxy == nil {
+		return nil
+	}
+	return o.Proxy.AcquireStableImage(account.Fields, proxyURL)
+}
+
+func (o *OpenAIImage) markPrimaryProxyFailure(ctx context.Context, err error) {
+	if openAIImageProxyFailure(err) {
+		proxyruntime.MarkImageLeaseFailure(ctx)
+	}
+}
+
+func (o *OpenAIImage) downloadImageRefWithRetry(ctx context.Context, account accounts.Account, conversationID, imageRef string) ([]byte, string, error) {
+	request := func(requestCtx context.Context) ([]byte, string, error) {
+		attemptCtx, cancel := context.WithTimeout(requestCtx, minDuration(o.RequestTimeout, openAIImageUploadAttemptTimeout))
+		defer cancel()
+		return o.downloadImageRef(attemptCtx, account, conversationID, imageRef)
+	}
+	proxyURL := o.selectedProxyURL(ctx, account)
+	raw, mime, err := request(proxyruntime.WithURL(ctx, proxyURL))
+	if err == nil || !isRetryableOpenAITransferError(err) {
+		return raw, mime, err
+	}
+	o.markPrimaryProxyFailure(ctx, err)
+	stable := o.acquireStableRetry(ctx, account)
+	if stable == nil {
+		return nil, "", err
+	}
+	retryStarted := time.Now()
+	raw, mime, err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowDownload)
+	stable.Release(openAIImageProxyFailure(err))
+	if err != nil {
+		return nil, "", fmt.Errorf("OpenAI image download failed after retry: %w", err)
+	}
+	return raw, mime, nil
+}
+
 func (o *OpenAIImage) downloadFile(ctx context.Context, account accounts.Account, fileID string) ([]byte, string, error) {
 	response, err := o.do(ctx, http.MethodGet, "/backend-api/files/"+url.PathEscape(fileID)+"/download", account, nil, nil, false)
 	if err != nil {
 		return nil, "", err
 	}
+	return o.readImageDownloadResponse(ctx, account, response)
+}
+
+func (o *OpenAIImage) downloadImageRef(ctx context.Context, account accounts.Account, conversationID, imageRef string) ([]byte, string, error) {
+	if strings.HasPrefix(imageRef, "sediment://") {
+		attachmentID := strings.TrimPrefix(imageRef, "sediment://")
+		if conversationID == "" || attachmentID == "" {
+			return nil, "", fmt.Errorf("OpenAI sediment image reference is incomplete")
+		}
+		path := "/backend-api/conversation/" + url.PathEscape(conversationID) + "/attachment/" + url.PathEscape(attachmentID) + "/download"
+		response, err := o.do(ctx, http.MethodGet, path, account, nil, map[string]string{
+			"Accept":                "application/json, image/*, */*",
+			"Referer":               o.BaseURL + "/c/" + conversationID,
+			"X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download",
+		}, false)
+		if err != nil {
+			return nil, "", err
+		}
+		return o.readImageDownloadResponse(ctx, account, response)
+	}
+	return o.downloadFile(ctx, account, strings.TrimPrefix(imageRef, "file-service://"))
+}
+
+func (o *OpenAIImage) readImageDownloadResponse(ctx context.Context, account accounts.Account, response *http.Response) ([]byte, string, error) {
 	var value map[string]any
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	_ = response.Body.Close()
 	if err != nil {
 		return nil, "", err
 	}
-	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
+	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "application/json") || json.Valid(raw) {
 		if json.Unmarshal(raw, &value) != nil {
 			return nil, "", fmt.Errorf("decode OpenAI image download metadata")
 		}
@@ -655,8 +1016,8 @@ func (o *OpenAIImage) doAbsolute(ctx context.Context, method, endpoint string, a
 }
 
 func (o *OpenAIImage) doRequest(ctx context.Context, method, endpoint, targetPath string, account accounts.Account, body io.Reader, extra map[string]string, stream, authenticated bool) (*http.Response, error) {
-	proxyURL := ""
-	if o.Proxy != nil {
+	proxyURL, selected := proxyruntime.URLSelectionFromContext(ctx)
+	if !selected && o.Proxy != nil {
 		proxyURL = o.Proxy.Resolve(account.Fields, false)
 		ctx = proxyruntime.WithURL(ctx, proxyURL)
 	}
@@ -694,6 +1055,30 @@ func (o *OpenAIImage) doRequest(ctx context.Context, method, endpoint, targetPat
 		return nil, upstreamErr
 	}
 	return response, nil
+}
+
+func openAIImageProxyFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var upstream *protocol.UpstreamError
+	if errors.As(err, &upstream) {
+		return upstream.Status == http.StatusForbidden
+	}
+	message := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"timeout", "deadline exceeded", "unexpected eof", "connection reset", "broken pipe",
+		"proxyconnect", "dial tcp", "tls handshake", "network is unreachable", "no route to host",
+		"connection refused", "connection closed", "server misbehaving",
+	} {
+		if strings.Contains(message, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (o *OpenAIImage) browserFor(proxyURL string) (*browserHTTP, error) {
@@ -783,6 +1168,8 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 				pointer := stringValue(item)
 				if strings.HasPrefix(pointer, "file-service://") {
 					*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
+				} else if strings.HasPrefix(pointer, "sediment://") {
+					*fileIDs = append(*fileIDs, pointer)
 				}
 			case "file_id", "fileid":
 				id := stringValue(item)
@@ -805,6 +1192,11 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 		for _, match := range regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
 				*fileIDs = append(*fileIDs, match[1])
+			}
+		}
+		for _, match := range regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
+			if len(match) == 2 {
+				*fileIDs = append(*fileIDs, "sediment://"+match[1])
 			}
 		}
 		for _, match := range regexp.MustCompile(`(?i)\b(file_[a-z0-9][a-z0-9_-]{5,})\b`).FindAllStringSubmatch(typed, -1) {

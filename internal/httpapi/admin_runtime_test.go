@@ -3,6 +3,7 @@ package httpapi
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/auucoder/gptgrok2api-go/internal/accounts"
 	"github.com/auucoder/gptgrok2api-go/internal/config"
 )
 
@@ -48,6 +50,56 @@ func TestRuntimeMonitorLifecycle(t *testing.T) {
 	item, ok = monitor.detail("call-1")
 	if !ok || item.Status != "success" || item.Progress != 100 || item.Duration < 0 {
 		t.Fatalf("unexpected completed item: %#v %v", item, ok)
+	}
+}
+
+func TestRequestMonitorEnrichmentUpdatesLiveEgressAndAccount(t *testing.T) {
+	server := &Server{monitor: newRuntimeMonitor()}
+	server.monitor.start("call-egress", "/v1/images/generations", "gpt-image-2", "test")
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	request = request.WithContext(context.WithValue(request.Context(), monitorCallIDKey{}, "call-egress"))
+
+	server.enrichMonitorAccount(request, accounts.Account{Pool: "basic", Fields: map[string]any{
+		"email":     "image@example.test",
+		"proxy_url": "http://proxy-user:proxy-pass@203.0.113.8:8080",
+	}})
+	server.enrichRequestMonitor(request, map[string]any{
+		"egress_label": "http://203.0.113.8:8080",
+		"has_proxy":    true,
+	})
+
+	record, ok := server.monitor.detail("call-egress")
+	if !ok {
+		t.Fatal("active monitor record missing")
+	}
+	if record.AccountEmail != "image@example.test" {
+		t.Fatalf("unexpected account email: %q", record.AccountEmail)
+	}
+	if record.ProxySource != "account" || record.EgressLabel != "http://203.0.113.8:8080" || !record.HasProxy {
+		t.Fatalf("unexpected egress metadata: %#v", record)
+	}
+	if strings.Contains(record.EgressLabel, "proxy-user") || strings.Contains(record.EgressLabel, "proxy-pass") {
+		t.Fatalf("proxy credentials leaked into monitor label: %q", record.EgressLabel)
+	}
+}
+
+func TestRequestMonitorDoesNotCountHandlerExecutionAsQueueTime(t *testing.T) {
+	server := &Server{monitor: newRuntimeMonitor()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"test"}`))
+	response := httptest.NewRecorder()
+	server.withRequestMonitor(response, request, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	records := server.monitor.completed
+	if len(records) != 1 {
+		t.Fatalf("expected one completed monitor record, got %d", len(records))
+	}
+	if queue := monitorNumber(records[0].Metrics["handler_queue_ms"]); queue != 0 {
+		t.Fatalf("handler execution was mislabeled as queue time: %vms", queue)
+	}
+	if records[0].Duration < 20 {
+		t.Fatalf("test handler duration was not captured: %dms", records[0].Duration)
 	}
 }
 
@@ -130,6 +182,77 @@ func TestMonitorSnapshotWithHistorySummary(t *testing.T) {
 	activeByStage, ok := summary["active_by_stage"].(map[string]any)
 	if !ok || monitorNumber(activeByStage["running"]) != 1 {
 		t.Fatalf("active_by_stage missing: %#v", summary["active_by_stage"])
+	}
+}
+
+func TestDashboardAccountAndLogSummary(t *testing.T) {
+	accountStats := dashboardAccountStats([]map[string]any{
+		{"access_token": "header.payload.signature", "status": "正常", "enabled": true, "quota": 25, "type": "plus", "success": 3},
+		{"access_token": "second.jwt.token", "status": "限流", "enabled": true, "quota": 10, "type": "free", "fail": 1},
+		{"access_token": "grok-disabled", "status": "禁用", "enabled": false, "source_type": "grok"},
+		{"access_token": "grok-abnormal", "status": "异常", "enabled": true, "source_type": "grok", "invalid_count": 1},
+	})
+	if intValue(accountStats["total"]) != 4 || intValue(accountStats["active"]) != 1 || intValue(accountStats["limited"]) != 1 {
+		t.Fatalf("unexpected account totals: %#v", accountStats)
+	}
+	if intValue(accountStats["abnormal"]) != 1 || intValue(accountStats["disabled"]) != 1 || intValue(accountStats["total_quota"]) != 25 {
+		t.Fatalf("unexpected account categories: %#v", accountStats)
+	}
+	providers := mapValue(accountStats["providers"])
+	if intValue(mapValue(providers["gpt"])["total"]) != 2 || intValue(mapValue(providers["grok"])["total"]) != 2 {
+		t.Fatalf("unexpected provider totals: %#v", providers)
+	}
+
+	now := time.Date(2026, 8, 30, 13, 45, 0, 0, time.FixedZone("CST", 8*60*60))
+	callLog := func(id, status string, statusCode int, startedAt time.Time, duration int) map[string]any {
+		return map[string]any{
+			"id": id, "type": "call", "time": startedAt.Format(time.RFC3339), "summary": id,
+			"detail": map[string]any{
+				"status": status, "status_code": statusCode, "started_at": startedAt.Format(time.RFC3339),
+				"endpoint": "/v1/images/generations", "model": "gpt-image-2", "duration_ms": duration,
+				"monitor": map[string]any{"metrics": map[string]any{"http_ttfb_ms": 500, "total_ms": duration}},
+			},
+		}
+	}
+	logs := []map[string]any{
+		callLog("success", "success", 200, now.Add(-30*time.Minute), 2000),
+		callLog("limited", "failed", 429, now.Add(-10*time.Minute), 3000),
+		callLog("old", "success", 200, now.Add(-48*time.Hour), 1000),
+	}
+	summary := dashboardLogSummary(logs, "24h", now)
+	if intValue(summary["total"]) != 2 || intValue(summary["success"]) != 1 || intValue(summary["failed"]) != 1 {
+		t.Fatalf("unexpected log totals: %#v", summary)
+	}
+	trend := mapValue(summary["trend"])
+	labels, ok := trend["labels"].([]string)
+	if !ok || len(labels) != 24 {
+		t.Fatalf("unexpected trend labels: %#v", trend["labels"])
+	}
+	modelSeries, ok := trend["model_requests"].(map[string][]int)
+	if !ok || len(modelSeries["gpt-image-2"]) != 24 || modelSeries["gpt-image-2"][23] != 2 {
+		t.Fatalf("unexpected model series: %#v", trend["model_requests"])
+	}
+	rateLimited := trend["rate_limited_requests"].([]int)
+	if rateLimited[23] != 1 {
+		t.Fatalf("rate limited request missing: %#v", rateLimited)
+	}
+}
+
+func TestDashboardRouteDisablesCaching(t *testing.T) {
+	server := New(adminTestConfig(t.TempDir()))
+	response := adminRequest(server.Handler(), http.MethodGet, "/api/dashboard?time_range=24h", nil)
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected dashboard status: %d %s", response.Code, response.Body.String())
+	}
+	if response.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("dashboard response can be cached: %#v", response.Header())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["generated_at"] == nil || mapValue(payload["accounts"])["providers"] == nil || mapValue(payload["logs"])["trend"] == nil {
+		t.Fatalf("dashboard payload is incomplete: %#v", payload)
 	}
 }
 

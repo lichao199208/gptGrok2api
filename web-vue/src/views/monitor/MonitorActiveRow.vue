@@ -15,7 +15,7 @@
     <td>{{ formatMs(row.elapsed_ms) }}</td>
     <td>{{ metricDigest(row) }}</td>
     <td>
-      <MetaChip size="xs" tone="muted">{{ egressText(row) }}</MetaChip>
+      <MetaChip size="xs" tone="muted" :title="egressText(row)">{{ egressText(row) }}</MetaChip>
     </td>
     <td class="max-w-[12rem] truncate">{{ row.account_email || '-' }}</td>
   </tr>

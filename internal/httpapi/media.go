@@ -52,6 +52,7 @@ type imageEditRequest struct {
 
 type imageEditParseError struct {
 	Message string
+	Status  int
 }
 
 func (e imageEditParseError) Error() string { return e.Message }
@@ -64,7 +65,7 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
-	s.stageRequestMonitor(r, "handler_queue_done", 10, map[string]any{"handler_queue_ms": s.requestMonitorElapsed(r)})
+	s.stageRequestMonitor(r, "handler_queue_done", 10, nil)
 	var request struct {
 		Model          string `json:"model"`
 		Prompt         string `json:"prompt"`
@@ -134,7 +135,6 @@ func (s *Server) imageGenerations(w http.ResponseWriter, r *http.Request) {
 	defer s.accountPool.Release(lease)
 	s.enrichMonitorAccount(r, lease.Account)
 	s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
-	s.stageRequestMonitor(r, "image_egress_ready", 40, map[string]any{"egress_acquire_ms": time.Since(accountStarted).Milliseconds()})
 	generationStarted := time.Now()
 	var images []provider.ImageResult
 	if request.Model == "grok-imagine-image-lite" {
@@ -176,6 +176,8 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		count = 1
 	}
 	results := make([][]map[string]string, count)
+	ctx, timeoutCancel := context.WithTimeout(ctx, imageRequestTotalTimeout(s.cfg.RequestTimeout))
+	defer timeoutCancel()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ctx = s.monitorOpenAIImageContext(r, ctx)
@@ -197,11 +199,18 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			releaseSlot, slotErr := s.acquireImageSlot(ctx, r)
+			if slotErr != nil {
+				sendErr(slotErr)
+				cancel()
+				return
+			}
+			defer releaseSlot()
 			excluded := map[string]bool{}
 			for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 				accountStarted := time.Now()
 				s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
-				lease, reserveErr := s.accountPool.ReserveMatching(ctx, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount)
+				lease, reserveErr := s.accountPool.ReserveMatchingLimit(ctx, []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
 				if reserveErr != nil {
 					sendErr(reserveErr)
 					cancel()
@@ -209,7 +218,6 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				}
 				s.enrichMonitorAccount(r, lease.Account)
 				s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
-				s.stageRequestMonitor(r, "image_egress_ready", 40, map[string]any{"egress_acquire_ms": time.Since(accountStarted).Milliseconds()})
 
 				generated, generateErr := s.openAIImage.Generate(ctx, lease.Account, prompt, model, size, quality, inputs)
 				if generateErr != nil {
@@ -227,13 +235,17 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				items := make([]map[string]string, 0, len(generated))
 				var resolveErr error
 				for _, image := range generated {
-					value, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
+					value, localURL, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
 					if err != nil {
 						resolveErr = err
 						break
 					}
-					s.recordGeneratedMedia(ctx, value)
+					s.recordGeneratedMedia(ctx, map[string]string{"url": localURL})
 					items = append(items, value)
+					// Each worker represents exactly one requested output. Upstream can
+					// expose that output through multiple references, so resolving the
+					// remaining entries would only persist files that are later discarded.
+					break
 				}
 				if resolveErr != nil {
 					s.accountPool.Release(lease)
@@ -271,6 +283,20 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		data = data[:count]
 	}
 	return data, nil
+}
+
+func imageRequestTotalTimeout(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = 3 * time.Minute
+	}
+	total := requestTimeout * 2
+	if total < 2*time.Minute {
+		return 2 * time.Minute
+	}
+	if total > 6*time.Minute {
+		return 6 * time.Minute
+	}
+	return total
 }
 
 func (s *Server) parseImageEditRequest(r *http.Request) (imageEditRequest, error) {
@@ -318,10 +344,23 @@ func (s *Server) parseImageEditRequest(r *http.Request) (imageEditRequest, error
 }
 
 func (s *Server) parseJSONImageEditRequest(r *http.Request) (imageEditRequest, error) {
+	if r.ContentLength > maxJSONBodyBytes {
+		return imageEditRequest{}, imageEditParseError{Message: "JSON body exceeds 64MB limit", Status: http.StatusRequestEntityTooLarge}
+	}
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
+	if err != nil {
+		return imageEditRequest{}, imageEditParseError{Message: "invalid JSON body: request body could not be read"}
+	}
+	if len(raw) > maxJSONBodyBytes {
+		return imageEditRequest{}, imageEditParseError{Message: "JSON body exceeds 64MB limit", Status: http.StatusRequestEntityTooLarge}
+	}
+	decoded, ok := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
+	if !ok {
+		return imageEditRequest{}, imageEditParseError{Message: "invalid JSON body: body is empty, truncated, or has invalid content encoding"}
+	}
 	var body map[string]any
-	decoder := json.NewDecoder(io.LimitReader(r.Body, maxImageEditReferenceBytes+1<<20))
-	if err := decoder.Decode(&body); err != nil {
-		return imageEditRequest{}, imageEditParseError{Message: "invalid JSON body"}
+	if err := json.Unmarshal(decoded, &body); err != nil {
+		return imageEditRequest{}, imageEditParseError{Message: describeJSONBodyError(err)}
 	}
 	request := imageEditRequest{
 		Model:          stringValue(body["model"]),
@@ -674,10 +713,15 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
-	s.stageRequestMonitor(r, "handler_queue_done", 10, map[string]any{"handler_queue_ms": s.requestMonitorElapsed(r)})
+	s.stageRequestMonitor(r, "handler_queue_done", 10, nil)
 	request, err := s.parseImageEditRequest(r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		status := http.StatusBadRequest
+		var parseError imageEditParseError
+		if errors.As(err, &parseError) && parseError.Status >= 400 {
+			status = parseError.Status
+		}
+		writeError(w, status, err.Error(), "invalid_request_error")
 		return
 	}
 	modelName := strings.TrimSpace(request.Model)
@@ -723,10 +767,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		if size == "" {
 			size = "1024x1024"
 		}
-		format := request.ResponseFormat
-		if format == "" {
-			format = "url"
-		}
+		format := imageEditResponseFormat(request.ResponseFormat)
 		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
 		if err != nil {
 			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
@@ -781,10 +822,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := make([]map[string]string, 0, minInt(n, len(images)))
-	format := request.ResponseFormat
-	if format == "" {
-		format = "url"
-	}
+	format := imageEditResponseFormat(request.ResponseFormat)
 	for _, image := range images[:minInt(n, len(images))] {
 		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, format, s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
@@ -796,6 +834,10 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 	s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+}
+
+func imageEditResponseFormat(string) string {
+	return "url"
 }
 
 func (s *Server) imageFile(w http.ResponseWriter, r *http.Request) {
@@ -812,6 +854,7 @@ func (s *Server) monitorOpenAIImageContext(r *http.Request, ctx context.Context)
 			progress int
 		}{
 			"upload_ms":               {"image_uploading", 25},
+			"egress_acquire_ms":       {"image_egress_ready", 40},
 			"bootstrap_ms":            {"image_bootstrapping", 43},
 			"requirements_ms":         {"image_getting_token", 45},
 			"prepare_conversation_ms": {"image_preparing_conversation", 50},
@@ -828,9 +871,24 @@ func (s *Server) monitorOpenAIImageContext(r *http.Request, ctx context.Context)
 		s.stageRequestMonitor(r, stage.name, stage.progress, map[string]any{metric: elapsed.Milliseconds()})
 	})
 	return provider.WithOpenAIImageEgress(ctx, func(proxyURL string) {
-		if label := sanitizedEgressLabel(proxyURL); label != "" {
-			s.enrichRequestMonitor(r, map[string]any{"egress_label": label})
+		label := sanitizedEgressLabel(proxyURL)
+		meta := map[string]any{"has_proxy": label != ""}
+		if label == "" {
+			meta["proxy_source"] = "direct"
+			meta["egress_label"] = "direct"
+		} else {
+			meta["egress_label"] = label
+			info := s.proxyManager.DescribeImageEgress(proxyURL)
+			meta["proxy_source"] = info.Source
+			if info.Source == "group" {
+				meta["egress_mode"] = "proxy_group"
+				meta["proxy_group_id"] = info.GroupID
+				meta["proxy_group_name"] = info.GroupName
+				meta["proxy_node_id"] = info.NodeID
+				meta["proxy_node_name"] = info.NodeName
+			}
 		}
+		s.enrichRequestMonitor(r, meta)
 	})
 }
 
@@ -1083,6 +1141,9 @@ func cookieUserID(account accounts.Account) string {
 }
 
 func upstreamStatus(err error) int {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return http.StatusGatewayTimeout
+	}
 	var upstream *protocol.UpstreamError
 	if errors.As(err, &upstream) && upstream.Status >= 400 {
 		return upstream.Status

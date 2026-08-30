@@ -2,80 +2,211 @@ package httpapi
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+
+	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
-func TestParseProxySubscriptionSupportsPlainAndBase64Lists(t *testing.T) {
-	plain := parseProxySubscription("# comment\nhttp://127.0.0.1:8080\nsocks5h://user:pass@example.test:1080\ninvalid")
-	if len(plain) != 2 || plain[1] != "socks5://user:pass@example.test:1080" {
-		t.Fatalf("unexpected plain subscription: %#v", plain)
+func TestParseProxySubscriptionPlainTextAndBase64(t *testing.T) {
+	plain := strings.Join([]string{
+		"# proxies",
+		"http://Example.COM:8080",
+		"http://example.com:8080",
+		"socks4://127.0.0.1:1080",
+		"socks5://user:pass@proxy.example:1080",
+		"host.example:3128",
+		"not a proxy",
+	}, "\n")
+	expected := []string{
+		"http://example.com:8080",
+		"socks4://127.0.0.1:1080",
+		"socks5://user:pass@proxy.example:1080",
+		"http://host.example:3128",
 	}
-
-	encoded := base64.StdEncoding.EncodeToString([]byte("http://127.0.0.1:8080\nhttps://example.test:443"))
-	decoded := parseProxySubscription(encoded)
-	if len(decoded) != 2 || decoded[0] != "http://127.0.0.1:8080" {
-		t.Fatalf("unexpected base64 subscription: %#v", decoded)
+	for name, raw := range map[string][]byte{
+		"plain":  []byte(plain),
+		"base64": []byte(base64.StdEncoding.EncodeToString([]byte(plain))),
+	} {
+		t.Run(name, func(t *testing.T) {
+			nodes, err := parseProxySubscription(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Join(nodes, "\n") != strings.Join(expected, "\n") {
+				t.Fatalf("unexpected nodes: %#v", nodes)
+			}
+		})
 	}
 }
 
-func TestRefreshProxyGroupSubscriptionImportsNodesAndPreservesManualNodes(t *testing.T) {
-	subscription := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("User-Agent"); got != "GPTGrok2API-ProxySubscription/1.0" {
-			t.Fatalf("unexpected user agent: %q", got)
-		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("http://127.0.0.1:8080\nsocks5://127.0.0.1:1080\n"))
+func TestParseProxySubscriptionRejectsMoreThanLimit(t *testing.T) {
+	var input strings.Builder
+	for index := 0; index <= maxProxySubscriptionNodes; index++ {
+		input.WriteString("http://proxy-")
+		input.WriteString(strconv.Itoa(index))
+		input.WriteString(":8080\n")
+	}
+	_, err := parseProxySubscription([]byte(input.String()))
+	if err == nil || !strings.Contains(err.Error(), "5000") {
+		t.Fatalf("expected node limit error, got %v", err)
+	}
+}
+
+func TestRefreshProxyGroupSubscriptionPreservesConcurrentAdminChanges(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		close(started)
+		<-release
+		_, _ = w.Write([]byte(strings.Join([]string{
+			"http://manual.example:8080",
+			"socks4://subscription-one.example:1080",
+			"socks5://subscription-two.example:1080",
+			"socks5://subscription-two.example:1080",
+		}, "\n")))
 	}))
-	defer subscription.Close()
+	defer upstream.Close()
 
 	root := t.TempDir()
-	cfg := testConfig()
-	cfg.RootDir = root
-	cfg.DataDir = root
-	cfg.AccountsPath = root + "/accounts.json"
-	cfg.AuthKeysPath = root + "/auth_keys.json"
-	cfg.ConfigPath = root + "/config.json"
+	cfg := adminTestConfig(root)
 	server := New(cfg)
-	config := map[string]any{
-		"proxy_groups": []map[string]any{{
-			"id":               "test-group",
-			"name":             "Test group",
-			"subscription_url": subscription.URL,
-			"subscription_node_image_concurrency_limit": 7,
-			"nodes": []any{
-				map[string]any{"id": "manual", "url": "http://manual.example:8080"},
-				map[string]any{"id": "old-sub", "url": "http://old.example:8080", "source": "subscription", "subscription_managed": true},
-			},
-		}},
+	server.requestClient = upstream.Client()
+	group := map[string]any{
+		"id": "group-one", "name": "Original", "subscription_url": upstream.URL,
+		"subscription_node_image_concurrency_limit": 20,
+		"nodes": []any{
+			map[string]any{"id": "manual-one", "url": "http://manual.example:8080", "enabled": true},
+			map[string]any{"id": "old-subscription", "url": "http://old.example:8080", "subscription_managed": true},
+		},
 	}
-	if err := server.store.ReplaceConfig(config); err != nil {
+	if _, err := server.store.UpdateConfig("proxy_groups", []any{group}); err != nil {
 		t.Fatal(err)
 	}
 
-	request := httptest.NewRequest(http.MethodPost, "/api/proxy/groups/test-group/subscription/refresh", nil)
-	request.Header.Set("Authorization", "Bearer admin-secret")
-	response := httptest.NewRecorder()
-	server.Handler().ServeHTTP(response, request)
-	if response.Code != http.StatusOK {
-		t.Fatalf("refresh returned %d: %s", response.Code, response.Body.String())
+	responseCh := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		responseCh <- adminRequest(server.Handler(), http.MethodPost, "/api/proxy/groups/group-one/subscription/refresh", nil)
+	}()
+	<-started
+	if _, err := server.store.MutateConfig("proxy_groups", func(value any) (any, error) {
+		groups := mapList(value)
+		next := cloneMap(groups[0])
+		next["name"] = "Changed by another admin"
+		nodes := mapList(next["nodes"])
+		nodes = append(nodes, map[string]any{"id": "manual-two", "url": "http://second-manual.example:8080", "enabled": true})
+		next["nodes"] = nodes
+		groups[0] = next
+		return groups, nil
+	}); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(response.Body.String(), `"node_count":2`) {
-		t.Fatalf("missing node count: %s", response.Body.String())
+	close(release)
+	response := <-responseCh
+	if response.Code != http.StatusOK {
+		t.Fatalf("unexpected response: %d %s", response.Code, response.Body.String())
 	}
 
-	updated, err := server.store.Config()
+	var payload map[string]any
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if intValue(payload["node_count"]) != 2 {
+		t.Fatalf("unexpected subscription count: %#v", payload)
+	}
+	updated := mapValue(payload["group"])
+	if stringValue(updated["name"]) != "Changed by another admin" {
+		t.Fatalf("concurrent admin change was overwritten: %#v", updated)
+	}
+	nodes := mapList(updated["nodes"])
+	if len(nodes) != 4 {
+		t.Fatalf("expected two manual and two subscription nodes, got %#v", nodes)
+	}
+	manual, subscription := 0, 0
+	for _, node := range nodes {
+		if isSubscriptionProxyNode(node) {
+			subscription++
+		} else {
+			manual++
+		}
+	}
+	if manual != 2 || subscription != 2 {
+		t.Fatalf("unexpected node ownership: manual=%d subscription=%d", manual, subscription)
+	}
+}
+
+func TestRefreshProxyGroupSubscriptionRecordsFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "unavailable", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	root := t.TempDir()
+	cfg := adminTestConfig(root)
+	server := New(cfg)
+	server.requestClient = upstream.Client()
+	group := map[string]any{
+		"id": "group-failure", "subscription_url": upstream.URL,
+		"nodes": []any{map[string]any{"id": "old", "url": "http://old.example:8080", "subscription_managed": true}},
+	}
+	if _, err := server.store.UpdateConfig("proxy_groups", []any{group}); err != nil {
+		t.Fatal(err)
+	}
+	response := adminRequest(server.Handler(), http.MethodPost, "/api/proxy/groups/group-failure/subscription/refresh", nil)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("unexpected response: %d %s", response.Code, response.Body.String())
+	}
+	updated, err := server.proxyGroupConfig("group-failure")
 	if err != nil {
 		t.Fatal(err)
 	}
-	groups := mapList(updated["proxy_groups"])
-	nodes := mapList(groups[0]["nodes"])
-	if len(nodes) != 3 || stringValue(nodes[0]["id"]) != "manual" || stringValue(nodes[1]["source"]) != "subscription" {
-		t.Fatalf("manual/subscription nodes were not merged correctly: %#v", nodes)
+	if stringValue(updated["subscription_last_attempt_at"]) == "" || !strings.Contains(stringValue(updated["subscription_last_error"]), "503") {
+		t.Fatalf("subscription failure was not recorded: %#v", updated)
 	}
-	if intValue(nodes[1]["image_concurrency_limit"]) != 7 {
-		t.Fatalf("subscription concurrency was not preserved: %#v", nodes[1])
+	if len(mapList(updated["nodes"])) != 1 {
+		t.Fatalf("failed refresh replaced existing nodes: %#v", updated)
+	}
+}
+
+func TestRuntimeFailuresRemoveAndBlacklistSubscriptionNode(t *testing.T) {
+	root := t.TempDir()
+	server := New(adminTestConfig(root))
+	removedURL := "http://removed.example:8080"
+	group := map[string]any{
+		"id": "images", "subscription_url": "https://subscription.example/list",
+		"subscription_node_count": 2,
+		"nodes": []any{
+			map[string]any{"id": "removed", "url": removedURL, "enabled": true, "subscription_managed": true},
+			map[string]any{"id": "keep", "url": "http://keep.example:8080", "enabled": true, "subscription_managed": true},
+		},
+	}
+	if _, err := server.store.UpdateConfig("proxy_groups", []any{group}); err != nil {
+		t.Fatal(err)
+	}
+	server.persistProxyGroupRuntimeResult(proxyruntime.ImageNodeRuntimeResult{
+		GroupID: "images", NodeID: "removed", URL: removedURL, Failures: 3, Removed: true,
+	})
+	updated, err := server.proxyGroupConfig("images")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes := mapList(updated["nodes"]); len(nodes) != 1 || stringValue(nodes[0]["id"]) != "keep" {
+		t.Fatalf("runtime-failed node was not removed: %#v", updated)
+	}
+	if !containsString(stringList(updated["runtime_removed_proxy_urls"]), removedURL) {
+		t.Fatalf("removed subscription URL was not blacklisted: %#v", updated)
+	}
+	refreshed, _, err := server.applyProxySubscription("images", "https://subscription.example/list", []string{removedURL, "http://new.example:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range mapList(refreshed["nodes"]) {
+		if stringValue(node["url"]) == removedURL {
+			t.Fatalf("blacklisted node was restored by subscription refresh: %#v", refreshed)
+		}
 	}
 }

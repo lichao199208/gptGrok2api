@@ -130,7 +130,15 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 
 func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request, request protocol.ChatRequest) {
 	started := time.Now()
-	imageContext := s.monitorOpenAIImageContext(r, r.Context())
+	imageContext, cancelImageRequest := context.WithTimeout(r.Context(), imageRequestTotalTimeout(s.cfg.RequestTimeout))
+	defer cancelImageRequest()
+	releaseSlot, err := s.acquireImageSlot(imageContext, r)
+	if err != nil {
+		writeOpenAIChatError(w, err)
+		return
+	}
+	defer releaseSlot()
+	imageContext = s.monitorOpenAIImageContext(r, imageContext)
 	s.enrichRequestMonitor(r, map[string]any{"model": request.Model})
 	prompt := protocol.ExtractMessage(request.Messages)
 	if strings.TrimSpace(prompt) == "" {
@@ -141,6 +149,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	var images []provider.ImageResult
 	var selected accounts.Account
 	var lastErr error
+	inputStarted := time.Now()
 	inputs := make([]provider.OpenAIImageInput, 0)
 	for _, message := range request.Messages {
 		parsed, err := s.imageInputsFromChatContent(r.Context(), message.Content)
@@ -150,8 +159,10 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		}
 		inputs = append(inputs, parsed...)
 	}
-	s.stageRequestMonitor(r, "handler_queue_done", 10, map[string]any{"handler_queue_ms": time.Since(started).Milliseconds()})
-	s.stageRequestMonitor(r, "image_uploading", 25, map[string]any{"upload_ms": time.Since(started).Milliseconds()})
+	s.stageRequestMonitor(r, "handler_queue_done", 10, nil)
+	if len(inputs) > 0 {
+		s.stageRequestMonitor(r, "image_uploading", 25, map[string]any{"upload_ms": time.Since(inputStarted).Milliseconds()})
+	}
 	size := strings.TrimSpace(request.Size)
 	if size == "" {
 		size = "1024x1024"
@@ -160,17 +171,14 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	s.stageRequestMonitor(r, "image_egress_waiting", 30, map[string]any{"egress_wait_ms": 0})
 	s.stageRequestMonitor(r, "image_getting_account", 35, nil)
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.ReserveMatching(r.Context(), []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount)
+		accountStarted := time.Now()
+		lease, err := s.accountPool.ReserveMatchingLimit(r.Context(), []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
 		if err != nil {
 			lastErr = err
 			break
 		}
 		s.enrichMonitorAccount(r, lease.Account)
-		s.stageRequestMonitor(r, "image_egress_ready", 40, map[string]any{"egress_acquire_ms": time.Since(started).Milliseconds()})
-		s.stageRequestMonitor(r, "image_bootstrapping", 43, map[string]any{"bootstrap_ms": time.Since(started).Milliseconds()})
-		s.stageRequestMonitor(r, "image_preparing_conversation", 46, map[string]any{"prepare_conversation_ms": time.Since(started).Milliseconds()})
-		s.stageRequestMonitor(r, "image_starting_generation", 50, map[string]any{"account_wait_ms": time.Since(started).Milliseconds()})
-		s.stageRequestMonitor(r, "image_generating", 60, map[string]any{"generation_start_ms": time.Since(started).Milliseconds()})
+		s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
 		images, err = s.openAIImage.Generate(imageContext, lease.Account, prompt, request.Model, size, "auto", inputs)
 		selected = lease.Account
 		s.accountPool.Release(lease)
@@ -187,22 +195,24 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		lastErr = nil
 		break
 	}
-	s.stageRequestMonitor(r, "image_stream_resolve_start", 80, map[string]any{"stream_resolve_ms": time.Since(started).Milliseconds()})
-	s.stageRequestMonitor(r, "image_resolving", 85, map[string]any{"generation_ms": time.Since(started).Milliseconds(), "resolve_ms": time.Since(started).Milliseconds()})
+	s.stageRequestMonitor(r, "image_stream_resolve_start", 80, nil)
 	if lastErr != nil {
 		writeOpenAIChatError(w, lastErr)
 		return
 	}
 	parts := make([]string, 0, len(images))
 	for _, image := range images {
-		item, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
+		item, localURL, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
 			s.accountPool.Feedback(selected, upstreamStatus(resolveErr), resolveErr)
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
 			return
 		}
-		s.recordGeneratedMedia(r.Context(), item)
+		s.recordGeneratedMedia(r.Context(), map[string]string{"url": localURL})
 		parts = append(parts, fmt.Sprintf("![image](%s)", item["url"]))
+		// Chat image requests have no image-count parameter and return one
+		// assistant image. Do not persist extra upstream references.
+		break
 	}
 	s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"total_ms": time.Since(started).Milliseconds()})
 	s.accountPool.Feedback(selected, http.StatusOK, nil)

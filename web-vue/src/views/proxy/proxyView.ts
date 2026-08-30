@@ -52,11 +52,14 @@ function proxyNodeSignature(node: ProxyNode) {
     boundedSignatureText(node.url, 96),
     node.enabled !== false ? 1 : 0,
     node.image_concurrency_limit,
+    node.last_status,
     node.last_latency_ms,
     node.fail_count,
     boundedSignatureText(node.last_error),
     node.last_checked_at,
     node.last_error_at,
+    node.last_verification,
+    node.last_status_label,
     node.cooldown_until,
     boundedSignatureText(node.notes),
   ].map(signatureValue).join(',')
@@ -93,7 +96,7 @@ export function proxyGroupActionItems(
     [
       {
         key: 'test-all',
-        label: testingKey === allKey ? '检测中...' : '检测全部节点',
+        label: testingKey === allKey ? '检测中...' : '检测并剔除',
         disabled: testingKey === allKey || group.nodes.length === 0,
       },
     ],
@@ -173,10 +176,20 @@ export function proxyNodeTestSummary(
 ) {
   if (isProxyNodeTesting(group, node, testingKey)) return '检测中...'
   const result = testResults[proxyNodeTestKey(group, node)]
+  if (result?.verification === 'api_required') return `HTTP 403 · ${result.latency_ms || 0}ms · 需真实图片验证`
   if (result?.ok) return `HTTP ${result.status || '-'} · ${result.latency_ms || 0}ms`
-  if (result && !result.ok) return result.error || '检测失败'
-  if (node.last_error) return node.last_error
-  if (node.last_checked_at) return `${node.last_latency_ms || 0}ms`
+  if (result && !result.ok) {
+    if (result.status) return `HTTP ${result.status} · ${result.latency_ms || 0}ms`
+    return result.error || '检测失败'
+  }
+  if (node.last_verification === 'api_required' || node.last_status === 403) {
+    return `HTTP 403 · ${node.last_latency_ms || 0}ms · 需真实图片验证`
+  }
+  if (node.last_error) {
+    if (node.last_status) return `HTTP ${node.last_status} · ${node.last_latency_ms || 0}ms`
+    return node.last_error
+  }
+  if (node.last_checked_at) return `HTTP ${node.last_status || '-'} · ${node.last_latency_ms || 0}ms`
   return '尚未测试'
 }
 
@@ -188,7 +201,9 @@ export function proxyNodeTestClass(
 ) {
   if (isProxyNodeTesting(group, node, testingKey)) return 'text-sky-600'
   const result = testResults[proxyNodeTestKey(group, node)]
+  if (result?.verification === 'api_required') return 'text-amber-600'
   if (result) return result.ok ? 'text-emerald-600' : 'text-rose-600'
+  if (node.last_verification === 'api_required' || node.last_status === 403) return 'text-amber-600'
   if (node.last_error) return 'text-rose-600'
   if (node.last_checked_at) return 'text-emerald-600'
   return 'text-muted-foreground'

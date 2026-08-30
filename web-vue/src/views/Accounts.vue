@@ -508,7 +508,25 @@
                     <label class="text-xs">
                       <span class="ui-field-label">账户密码</span>
                       <div class="flex gap-2">
-                        <Input v-model="form.login_password" type="password" block autocomplete="new-password" placeholder="没有则留空" />
+                        <Input
+                          v-model="form.login_password"
+                          :type="showLoginPassword ? 'text' : 'password'"
+                          block
+                          autocomplete="off"
+                          placeholder="没有则留空"
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          root-class="w-9 shrink-0 px-0"
+                          :disabled="!form.login_password"
+                          :title="showLoginPassword ? '隐藏账户密码' : '显示账户密码'"
+                          :aria-label="showLoginPassword ? '隐藏账户密码' : '显示账户密码'"
+                          @click="showLoginPassword = !showLoginPassword"
+                        >
+                          <Icon :icon="showLoginPassword ? 'lucide:eye-off' : 'lucide:eye'" class="h-3.5 w-3.5" />
+                        </Button>
                         <Button
                           type="button"
                           size="sm"
@@ -526,7 +544,25 @@
                     <label class="text-xs">
                       <span class="ui-field-label">2FA Secret</span>
                       <div class="flex gap-2">
-                        <Input v-model="form.two_factor_secret" type="password" block autocomplete="off" placeholder="没有则留空" />
+                        <Input
+                          v-model="form.two_factor_secret"
+                          :type="showTwoFactorSecret ? 'text' : 'password'"
+                          block
+                          autocomplete="off"
+                          placeholder="没有则留空"
+                        />
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          root-class="w-9 shrink-0 px-0"
+                          :disabled="!form.two_factor_secret"
+                          :title="showTwoFactorSecret ? '隐藏 2FA Secret' : '显示 2FA Secret'"
+                          :aria-label="showTwoFactorSecret ? '隐藏 2FA Secret' : '显示 2FA Secret'"
+                          @click="showTwoFactorSecret = !showTwoFactorSecret"
+                        >
+                          <Icon :icon="showTwoFactorSecret ? 'lucide:eye-off' : 'lucide:eye'" class="h-3.5 w-3.5" />
+                        </Button>
                         <Button
                           type="button"
                           size="sm"
@@ -993,6 +1029,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { Icon } from '@iconify/vue'
 import { Button, Checkbox, EmptyState, Input } from 'nanocat-ui'
 import AccountBulkBar from '@/components/ai/AccountBulkBar.vue'
 import AccountSelectionSummary from '@/components/ai/AccountSelectionSummary.vue'
@@ -1050,45 +1087,46 @@ defineOptions({ name: 'Accounts' })
 const RemoteAccountImportPanel = defineAsyncComponent(() => import('@/components/ai/RemoteAccountImportPanel.vue'))
 const confirmDialog = useConfirmDialog()
 const toast = useToast()
+const showLoginPassword = ref(false)
+const showTwoFactorSecret = ref(false)
+
+async function writeClipboardText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch {
+      // Fall through for HTTP origins and browsers that deny Clipboard API access.
+    }
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  textarea.style.top = '0'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  try {
+    textarea.focus()
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
+    if (!document.execCommand('copy')) {
+      throw new Error('copy failed')
+    }
+  } finally {
+    textarea.remove()
+  }
+}
 
 async function copyCredential(value: string, label: string) {
   const text = String(value || '').trim()
   if (!text) return
   try {
-    if (navigator.clipboard?.writeText) {
-      try {
-        await navigator.clipboard.writeText(text)
-      } catch {
-        copyTextWithExecCommand(text)
-      }
-    } else {
-      copyTextWithExecCommand(text)
-    }
+    await writeClipboardText(text)
     toast.success(`${label}已复制`)
   } catch {
     toast.error(`${label}复制失败`)
-  }
-}
-
-function copyTextWithExecCommand(text: string) {
-  const input = document.createElement('textarea')
-  input.value = text
-  input.setAttribute('readonly', 'readonly')
-  input.style.position = 'fixed'
-  input.style.left = '-9999px'
-  input.style.top = '0'
-  input.style.opacity = '0'
-  document.body.appendChild(input)
-
-  try {
-    input.focus()
-    input.select()
-    input.setSelectionRange(0, input.value.length)
-    if (!document.execCommand('copy')) {
-      throw new Error('Unable to copy text')
-    }
-  } finally {
-    document.body.removeChild(input)
   }
 }
 
@@ -1212,6 +1250,12 @@ const {
   bindSelectedAccountsToGroup,
   exportAccounts,
 } = useAccountsPage()
+
+watch(showModal, (visible) => {
+  if (visible) return
+  showLoginPassword.value = false
+  showTwoFactorSecret.value = false
+})
 
 const {
   loading: grokLoading,

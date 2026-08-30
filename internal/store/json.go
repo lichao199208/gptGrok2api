@@ -25,12 +25,21 @@ type Identity struct {
 }
 
 type Store struct {
-	accountsPath string
-	deletedPath  string
-	authKeysPath string
-	configPath   string
-	mu           sync.RWMutex
+	accountsPath     string
+	deletedPath      string
+	authKeysPath     string
+	configPath       string
+	mu               sync.RWMutex
+	accountsWriteMu  sync.Mutex
+	accountsCache    []map[string]any
+	accountsIndex    map[string]int
+	accountsLoaded   bool
+	accountsRevision uint64
+	accountsDirty    bool
+	accountsTimer    *time.Timer
 }
+
+const accountRuntimeFlushDelay = time.Second
 
 func New(accountsPath, authKeysPath, configPath string) *Store {
 	return &Store{
@@ -50,15 +59,44 @@ func (s *Store) AuthKeysPath() string {
 }
 
 func (s *Store) LoadAccounts() ([]map[string]any, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return loadList(s.accountsPath)
+	items, _, err := s.AccountSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	return cloneAccountList(items), nil
 }
 
 func (s *Store) SaveAccounts(items []map[string]any) error {
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return writeJSON(s.accountsPath, items)
+	next := normalizeAccountListJSON(items)
+	if err := writeJSON(s.accountsPath, next); err != nil {
+		return err
+	}
+	s.replaceAccountsLocked(next)
+	s.accountsDirty = false
+	return nil
+}
+
+// AccountSnapshot returns an immutable in-memory account view. Callers must
+// not mutate the returned slice or maps. Store mutations always use copy-on-write.
+func (s *Store) AccountSnapshot() ([]map[string]any, uint64, error) {
+	s.mu.RLock()
+	if s.accountsLoaded {
+		items, revision := s.accountsCache, s.accountsRevision
+		s.mu.RUnlock()
+		return items, revision, nil
+	}
+	s.mu.RUnlock()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return nil, 0, err
+	}
+	return s.accountsCache, s.accountsRevision, nil
 }
 
 func (s *Store) LoadAuthKeys() ([]map[string]any, error) {
@@ -87,6 +125,24 @@ func (s *Store) UpdateConfig(key string, value any) (map[string]any, error) {
 		return nil, err
 	}
 	current[key] = value
+	if err := writeJSON(s.configPath, current); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
+func (s *Store) MutateConfig(key string, mutate func(any) (any, error)) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := loadMap(s.configPath)
+	if err != nil {
+		return nil, err
+	}
+	next, err := mutate(current[key])
+	if err != nil {
+		return nil, err
+	}
+	current[key] = next
 	if err := writeJSON(s.configPath, current); err != nil {
 		return nil, err
 	}
@@ -260,16 +316,18 @@ func (s *Store) AccountList() ([]map[string]any, error) {
 }
 
 func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, int, []map[string]any, error) {
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accounts, err := loadList(s.accountsPath)
-	if err != nil {
+	if err := s.loadAccountsLocked(); err != nil {
 		return 0, 0, nil, err
 	}
 	deleted, err := loadDeletedTokens(s.deletedPath)
 	if err != nil {
 		return 0, 0, nil, err
 	}
+	accounts := cloneAccountList(s.accountsCache)
 	byToken := make(map[string]int, len(accounts))
 	for index, item := range accounts {
 		if token := accountToken(item); token != "" {
@@ -297,7 +355,7 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 		added++
 	}
 	for _, rawToken := range tokens {
-		token := normalizeToken(rawToken)
+		token := strings.TrimSpace(rawToken)
 		if token == "" {
 			continue
 		}
@@ -324,21 +382,26 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 		if err := writeJSON(s.accountsPath, accounts); err != nil {
 			return 0, 0, nil, err
 		}
+		accounts = normalizeAccountListJSON(accounts)
+		s.replaceAccountsLocked(accounts)
+		s.accountsDirty = false
 	}
-	return added, skipped, accounts, nil
+	return added, skipped, cloneAccountList(accounts), nil
 }
 
 func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accounts, err := loadList(s.accountsPath)
-	if err != nil {
+	if err := s.loadAccountsLocked(); err != nil {
 		return 0, nil, err
 	}
 	deleted, err := loadDeletedTokens(s.deletedPath)
 	if err != nil {
 		return 0, nil, err
 	}
+	accounts := s.accountsCache
 	targets := make(map[string]struct{}, len(tokens))
 	for _, token := range tokens {
 		if clean := normalizeToken(token); clean != "" {
@@ -361,13 +424,23 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 		if err := writeJSON(s.accountsPath, filtered); err != nil {
 			return 0, nil, err
 		}
+		s.replaceAccountsLocked(filtered)
+		s.accountsDirty = false
 	}
 	if len(targets) > 0 {
 		if err := writeDeletedTokens(s.deletedPath, deleted); err != nil {
 			return 0, nil, err
 		}
 	}
-	return removed, filtered, nil
+	return removed, cloneAccountList(filtered), nil
+}
+
+func normalizeToken(token string) string {
+	token = strings.TrimSpace(token)
+	if len(token) >= 4 && strings.EqualFold(token[:4], "sso=") {
+		return strings.TrimSpace(token[4:])
+	}
+	return token
 }
 
 func tokenHash(token string) string {
@@ -407,27 +480,56 @@ func writeDeletedTokens(path string, deleted map[string]bool) error {
 }
 
 func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]any, []map[string]any, error) {
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	accounts, err := loadList(s.accountsPath)
-	if err != nil {
+	if err := s.loadAccountsLocked(); err != nil {
 		return nil, nil, err
 	}
-	for index, item := range accounts {
-		if accountToken(item) != normalizeToken(token) {
-			continue
-		}
-		next := cloneMap(item)
-		for key, value := range updates {
-			next[key] = value
-		}
-		accounts[index] = next
-		if err := writeJSON(s.accountsPath, accounts); err != nil {
-			return nil, nil, err
-		}
-		return next, accounts, nil
+	accounts, next, ok := s.updatedAccountsLocked(token, updates)
+	if !ok {
+		return nil, cloneAccountList(s.accountsCache), os.ErrNotExist
 	}
-	return nil, accounts, os.ErrNotExist
+	if err := writeJSON(s.accountsPath, accounts); err != nil {
+		return nil, nil, err
+	}
+	s.replaceAccountsLocked(accounts)
+	s.accountsDirty = false
+	result := cloneMap(next)
+	for key, value := range updates {
+		result[key] = value
+	}
+	return result, cloneAccountList(accounts), nil
+}
+
+// UpdateAccountRuntime updates request-derived status immediately in memory
+// and coalesces disk writes. This avoids rewriting a large account file for
+// every concurrent success, timeout, or proxy failure.
+func (s *Store) UpdateAccountRuntime(token string, updates map[string]any) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return nil, err
+	}
+	accounts, next, ok := s.updatedAccountsLocked(token, updates)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	s.replaceAccountsLocked(accounts)
+	s.accountsDirty = true
+	s.scheduleAccountFlushLocked(accountRuntimeFlushDelay)
+	result := cloneMap(next)
+	for key, value := range updates {
+		result[key] = value
+	}
+	return result, nil
+}
+
+// FlushAccounts persists pending runtime feedback. It is primarily useful for
+// orderly shutdowns and deterministic tests; normal requests use the timer.
+func (s *Store) FlushAccounts() error {
+	return s.persistRuntimeAccounts()
 }
 
 // RotateAccountTokens updates an account using its previous access token as
@@ -447,6 +549,9 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 	updates["last_token_refresh_at"] = time.Now().UTC().Format(time.RFC3339)
 	updates["last_token_refresh_error"] = nil
 	updates["last_token_refresh_error_at"] = nil
+	updates["invalid_count"] = 0
+	updates["cooldown_until"] = nil
+	updates["next_retry_at"] = nil
 	// A successful remote refresh supersedes every error marker left by an
 	// earlier refresh or request attempt. Keeping any of these fields makes the
 	// admin status endpoint classify an otherwise healthy account as abnormal.
@@ -464,6 +569,120 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 		updates[key] = nil
 	}
 	return s.UpdateAccount(oldToken, updates)
+}
+
+func (s *Store) loadAccountsLocked() error {
+	if s.accountsLoaded {
+		return nil
+	}
+	items, err := loadList(s.accountsPath)
+	if err != nil {
+		return err
+	}
+	s.accountsCache = cloneAccountList(items)
+	s.accountsIndex = accountIndex(s.accountsCache)
+	s.accountsLoaded = true
+	s.accountsRevision++
+	return nil
+}
+
+func (s *Store) replaceAccountsLocked(items []map[string]any) {
+	s.accountsCache = items
+	s.accountsIndex = accountIndex(items)
+	s.accountsLoaded = true
+	s.accountsRevision++
+}
+
+func (s *Store) updatedAccountsLocked(token string, updates map[string]any) ([]map[string]any, map[string]any, bool) {
+	index, ok := s.accountsIndex[strings.TrimSpace(token)]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return nil, nil, false
+	}
+	accounts := append([]map[string]any(nil), s.accountsCache...)
+	next := cloneMap(accounts[index])
+	for key, value := range updates {
+		next[key] = value
+	}
+	next = normalizeAccountMapJSON(next)
+	accounts[index] = next
+	return accounts, next, true
+}
+
+func (s *Store) scheduleAccountFlushLocked(delay time.Duration) {
+	if delay <= 0 {
+		delay = accountRuntimeFlushDelay
+	}
+	if s.accountsTimer != nil {
+		return
+	}
+	s.accountsTimer = time.AfterFunc(delay, func() {
+		s.mu.Lock()
+		s.accountsTimer = nil
+		s.mu.Unlock()
+		_ = s.persistRuntimeAccounts()
+	})
+}
+
+func (s *Store) persistRuntimeAccounts() error {
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
+
+	s.mu.RLock()
+	if !s.accountsLoaded || !s.accountsDirty {
+		s.mu.RUnlock()
+		return nil
+	}
+	items := s.accountsCache
+	revision := s.accountsRevision
+	s.mu.RUnlock()
+
+	if err := writeJSON(s.accountsPath, items); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.accountsRevision == revision {
+		s.accountsDirty = false
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func accountIndex(items []map[string]any) map[string]int {
+	index := make(map[string]int, len(items))
+	for i, item := range items {
+		if token := accountToken(item); token != "" {
+			index[token] = i
+		}
+	}
+	return index
+}
+
+func cloneAccountList(items []map[string]any) []map[string]any {
+	cloned := make([]map[string]any, len(items))
+	for i, item := range items {
+		cloned[i] = cloneMap(item)
+	}
+	return cloned
+}
+
+func normalizeAccountMapJSON(item map[string]any) map[string]any {
+	raw, err := json.Marshal(item)
+	if err != nil {
+		return cloneMap(item)
+	}
+	var normalized map[string]any
+	if json.Unmarshal(raw, &normalized) != nil {
+		return cloneMap(item)
+	}
+	return normalized
+}
+
+func normalizeAccountListJSON(items []map[string]any) []map[string]any {
+	normalized := make([]map[string]any, len(items))
+	for i, item := range items {
+		normalized[i] = normalizeAccountMapJSON(item)
+	}
+	return normalized
 }
 
 func loadList(path string) ([]map[string]any, error) {
@@ -664,14 +883,6 @@ func randomID() string {
 func hashKey(value string) string {
 	sum := sha256.Sum256([]byte(value))
 	return hex.EncodeToString(sum[:])
-}
-
-func normalizeToken(token string) string {
-	token = strings.TrimSpace(token)
-	if len(token) >= 4 && strings.EqualFold(token[:4], "sso=") {
-		token = strings.TrimSpace(token[4:])
-	}
-	return token
 }
 
 func accountToken(item map[string]any) string {

@@ -6,269 +6,284 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
 const (
-	maxProxySubscriptionBytes = 5 * 1024 * 1024
+	maxProxySubscriptionBytes = 8 << 20
 	maxProxySubscriptionNodes = 5000
-	proxySubscriptionTimeout  = 20 * time.Second
 )
 
 var (
-	errProxySubscriptionInvalid = errors.New("invalid proxy subscription")
-	errProxyGroupNotFound       = errors.New("proxy group not found")
-	supportedProxySchemes       = map[string]bool{
-		"http": true, "https": true, "socks4": true, "socks5": true,
-	}
-	proxySubscriptionTokenPattern = regexp.MustCompile(`[\r\n,;\t ]+`)
+	errProxyGroupNotFound          = errors.New("proxy group not found")
+	errProxySubscriptionURLChanged = errors.New("proxy subscription URL changed while refresh was running")
 )
 
-func normalizeProxySubscriptionURL(value string) string {
-	raw := strings.Trim(strings.TrimSpace(value), "\ufeff\"'")
-	if raw == "" || strings.HasPrefix(raw, "#") || strings.HasPrefix(raw, ";") || strings.HasPrefix(raw, "//") {
-		return ""
+func (s *Server) refreshProxyGroupSubscription(w http.ResponseWriter, r *http.Request, id string) {
+	if !s.requireAdmin(w, r) {
+		return
 	}
-	if comment := strings.IndexByte(raw, '#'); comment >= 0 {
-		raw = strings.TrimSpace(raw[:comment])
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
 	}
-	if strings.HasPrefix(strings.ToLower(raw), "socks5h://") {
-		raw = "socks5://" + raw[len("socks5h://"):]
-	}
-	if !strings.Contains(raw, "://") {
-		parts := strings.Split(raw, ":")
-		if len(parts) == 4 {
-			if _, err := strconv.Atoi(parts[1]); err == nil {
-				raw = fmt.Sprintf("http://%s:%s@%s:%s", parts[2], parts[3], parts[0], parts[1])
-			}
-		} else {
-			raw = "http://" + raw
-		}
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Hostname() == "" || parsed.Port() == "" {
-		return ""
-	}
-	if !supportedProxySchemes[strings.ToLower(parsed.Scheme)] {
-		return ""
-	}
-	port, err := strconv.Atoi(parsed.Port())
-	if err != nil || port < 1 || port > 65535 {
-		return ""
-	}
-	return raw
-}
-
-func parseProxySubscriptionWithLimit(text string, limit int) ([]string, bool) {
-	parse := func(input string) ([]string, bool) {
-		seen := make(map[string]struct{})
-		proxies := make([]string, 0)
-		for _, item := range proxySubscriptionTokenPattern.Split(strings.TrimSpace(input), -1) {
-			proxy := normalizeProxySubscriptionURL(item)
-			if proxy == "" {
-				continue
-			}
-			if _, ok := seen[proxy]; ok {
-				continue
-			}
-			if limit > 0 && len(proxies) >= limit {
-				return nil, true
-			}
-			seen[proxy] = struct{}{}
-			proxies = append(proxies, proxy)
-		}
-		return proxies, false
-	}
-	if proxies, overflow := parse(text); overflow || len(proxies) > 0 {
-		return proxies, overflow
-	}
-
-	compact := strings.Join(strings.Fields(text), "")
-	if compact == "" {
-		return nil, false
-	}
-	for _, encoding := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
-		decoded, err := encoding.DecodeString(compact)
-		if err != nil || string(decoded) == text {
-			continue
-		}
-		if proxies, overflow := parse(string(decoded)); overflow || len(proxies) > 0 {
-			return proxies, overflow
-		}
-	}
-	return nil, false
-}
-
-func parseProxySubscription(text string) []string {
-	proxies, _ := parseProxySubscriptionWithLimit(text, 0)
-	return proxies
-}
-
-func fetchProxySubscription(subscriptionURL string) (string, error) {
-	parsed, err := url.Parse(subscriptionURL)
-	if err != nil || parsed.Hostname() == "" || !map[string]bool{"http": true, "https": true}[strings.ToLower(parsed.Scheme)] {
-		return "", fmt.Errorf("%w: subscription URL must use http or https", errProxySubscriptionInvalid)
-	}
-	request, err := http.NewRequest(http.MethodGet, subscriptionURL, nil)
+	id = strings.TrimSpace(id)
+	group, err := s.proxyGroupConfig(id)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", errProxySubscriptionInvalid, err)
+		writeError(w, http.StatusNotFound, err.Error(), "not_found")
+		return
 	}
-	request.Header.Set("User-Agent", "GPTGrok2API-ProxySubscription/1.0")
-	client := &http.Client{Timeout: proxySubscriptionTimeout}
-	response, err := client.Do(request)
+	subscriptionURL := strings.TrimSpace(stringValue(group["subscription_url"]))
+	parsedURL, err := url.Parse(subscriptionURL)
+	if err != nil || parsedURL.Host == "" || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") {
+		err = errors.New("proxy subscription URL must use http or https")
+		s.recordProxySubscriptionError(id, subscriptionURL, err)
+		writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
+		return
+	}
+
+	nodes, err := s.fetchProxySubscription(r, parsedURL.String())
 	if err != nil {
-		return "", err
+		s.recordProxySubscriptionError(id, subscriptionURL, err)
+		writeError(w, http.StatusBadGateway, err.Error(), "upstream_error")
+		return
+	}
+	updatedGroup, groups, err := s.applyProxySubscription(id, subscriptionURL, nodes)
+	if err != nil {
+		status := http.StatusInternalServerError
+		errorType := "server_error"
+		if errors.Is(err, errProxyGroupNotFound) {
+			status, errorType = http.StatusNotFound, "not_found"
+		} else if errors.Is(err, errProxySubscriptionURLChanged) {
+			status, errorType = http.StatusConflict, "conflict_error"
+		}
+		writeError(w, status, err.Error(), errorType)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "group": updatedGroup, "groups": groups,
+		"node_count": intValue(updatedGroup["subscription_node_count"]), "refreshed_at": updatedGroup["subscription_last_updated_at"],
+	})
+}
+
+func (s *Server) proxyGroupConfig(id string) (map[string]any, error) {
+	cfg, err := s.store.Config()
+	if err != nil {
+		return nil, err
+	}
+	for _, group := range mapList(cfg["proxy_groups"]) {
+		if stringValue(group["id"]) == id {
+			return group, nil
+		}
+	}
+	return nil, errProxyGroupNotFound
+}
+
+func (s *Server) fetchProxySubscription(r *http.Request, subscriptionURL string) ([]string, error) {
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, subscriptionURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "text/plain, application/octet-stream;q=0.9, */*;q=0.8")
+	req.Header.Set("User-Agent", "gptgrok2api-go/1.2 proxy-subscription")
+	response, err := s.requestClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request proxy subscription: %w", err)
 	}
 	defer response.Body.Close()
-	if response.StatusCode < http.StatusOK || response.StatusCode >= http.StatusMultipleChoices {
-		return "", fmt.Errorf("subscription request returned HTTP %d", response.StatusCode)
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("proxy subscription returned HTTP %d", response.StatusCode)
 	}
-	data, err := io.ReadAll(io.LimitReader(response.Body, maxProxySubscriptionBytes+1))
+	raw, err := io.ReadAll(io.LimitReader(response.Body, maxProxySubscriptionBytes+1))
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("read proxy subscription: %w", err)
 	}
-	if len(data) > maxProxySubscriptionBytes {
-		return "", fmt.Errorf("%w: subscription response exceeds 5 MiB", errProxySubscriptionInvalid)
+	if len(raw) > maxProxySubscriptionBytes {
+		return nil, fmt.Errorf("proxy subscription exceeds %d MiB", maxProxySubscriptionBytes>>20)
 	}
-	return string(data), nil
+	return parseProxySubscription(raw)
+}
+
+func parseProxySubscription(raw []byte) ([]string, error) {
+	if nodes, tooMany := proxyURLsFromText(string(raw)); len(nodes) > 0 || tooMany {
+		if tooMany {
+			return nil, fmt.Errorf("proxy subscription exceeds %d nodes", maxProxySubscriptionNodes)
+		}
+		return nodes, nil
+	}
+	compact := strings.Map(func(r rune) rune {
+		if r == ' ' || r == '\t' || r == '\r' || r == '\n' {
+			return -1
+		}
+		return r
+	}, string(raw))
+	for _, decoder := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		decoded, err := decoder.DecodeString(compact)
+		if err != nil {
+			continue
+		}
+		nodes, tooMany := proxyURLsFromText(string(decoded))
+		if tooMany {
+			return nil, fmt.Errorf("proxy subscription exceeds %d nodes", maxProxySubscriptionNodes)
+		}
+		if len(nodes) > 0 {
+			return nodes, nil
+		}
+	}
+	return nil, errors.New("proxy subscription contains no supported proxy nodes")
+}
+
+func proxyURLsFromText(value string) ([]string, bool) {
+	seen := map[string]bool{}
+	result := make([]string, 0)
+	for _, line := range strings.Split(strings.TrimPrefix(value, "\ufeff"), "\n") {
+		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		line = strings.Replace(line, `\://`, "://", 1)
+		normalized := normalizeSubscriptionProxyURL(line)
+		if normalized == "" || seen[normalized] {
+			continue
+		}
+		seen[normalized] = true
+		result = append(result, normalized)
+		if len(result) > maxProxySubscriptionNodes {
+			return nil, true
+		}
+	}
+	return result, false
+}
+
+func normalizeSubscriptionProxyURL(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	if !strings.Contains(value, "://") {
+		value = "http://" + value
+	}
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	switch parsed.Scheme {
+	case "http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h":
+	default:
+		return ""
+	}
+	host := parsed.Hostname()
+	port := parsed.Port()
+	if host == "" || port == "" {
+		return ""
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return ""
+	}
+	parsed.Host = net.JoinHostPort(strings.ToLower(host), port)
+	parsed.Path, parsed.RawPath, parsed.RawQuery, parsed.Fragment = "", "", "", ""
+	return parsed.String()
 }
 
 func proxySubscriptionNode(proxyURL string, index, concurrency int) map[string]any {
-	parsed, _ := url.Parse(proxyURL)
 	digest := sha256.Sum256([]byte(proxyURL))
 	return map[string]any{
-		"id":                      fmt.Sprintf("sub-%x", digest[:8]),
-		"name":                    fmt.Sprintf("订阅 %d · %s", index, strings.ToLower(parsed.Scheme)),
-		"url":                     proxyURL,
-		"enabled":                 true,
-		"image_concurrency_limit": concurrency,
-		"notes":                   "订阅自动管理",
-		"source":                  "subscription",
-		"subscription_managed":    true,
+		"id": fmt.Sprintf("sub-%x", digest[:8]), "name": fmt.Sprintf("订阅 %d", index+1),
+		"url": proxyURL, "enabled": true, "image_concurrency_limit": concurrency,
+		"source": "subscription", "subscription_managed": true,
 	}
 }
 
-func proxySubscriptionGroupIndex(groups []map[string]any, id string) int {
-	for index, group := range groups {
-		if stringValue(group["id"]) == id {
-			return index
+func isSubscriptionProxyNode(node map[string]any) bool {
+	return boolValue(node["subscription_managed"], false) || strings.EqualFold(stringValue(node["source"]), "subscription")
+}
+
+func (s *Server) applyProxySubscription(id, subscriptionURL string, proxyURLs []string) (map[string]any, []map[string]any, error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	var updatedGroup map[string]any
+	updated, err := s.store.MutateConfig("proxy_groups", func(value any) (any, error) {
+		groups := mapList(value)
+		found := false
+		for index, current := range groups {
+			if stringValue(current["id"]) != id {
+				continue
+			}
+			found = true
+			if strings.TrimSpace(stringValue(current["subscription_url"])) != subscriptionURL {
+				return nil, errProxySubscriptionURLChanged
+			}
+			next := cloneMap(current)
+			manualNodes := make([]map[string]any, 0)
+			seen := map[string]bool{}
+			blocked := map[string]bool{}
+			for _, blockedURL := range stringList(current["runtime_removed_proxy_urls"]) {
+				if normalized := normalizeSubscriptionProxyURL(blockedURL); normalized != "" {
+					blocked[normalized] = true
+				}
+			}
+			for _, node := range mapList(current["nodes"]) {
+				if isSubscriptionProxyNode(node) {
+					continue
+				}
+				manualNodes = append(manualNodes, node)
+				if normalized := normalizeSubscriptionProxyURL(stringValue(node["url"])); normalized != "" {
+					seen[normalized] = true
+				}
+			}
+			concurrency := intValue(current["subscription_node_image_concurrency_limit"])
+			subscriptionCount := 0
+			for _, proxyURL := range proxyURLs {
+				if seen[proxyURL] || blocked[proxyURL] {
+					continue
+				}
+				seen[proxyURL] = true
+				manualNodes = append(manualNodes, proxySubscriptionNode(proxyURL, subscriptionCount, concurrency))
+				subscriptionCount++
+			}
+			next["nodes"] = manualNodes
+			next["subscription_last_attempt_at"] = now
+			next["subscription_last_updated_at"] = now
+			next["subscription_last_error"] = ""
+			next["subscription_node_count"] = subscriptionCount
+			groups[index] = next
+			updatedGroup = next
+			break
 		}
-	}
-	return -1
-}
-
-func proxySubscriptionErrorMessage(err error, subscriptionURL string) string {
-	message := strings.TrimSpace(err.Error())
-	if subscriptionURL != "" {
-		message = strings.ReplaceAll(message, subscriptionURL, "[subscription-url]")
-	}
-	if len(message) > 300 {
-		message = message[:300]
-	}
-	return message
-}
-
-func (s *Server) recordProxySubscriptionFailure(groupID, subscriptionURL string, cause error) {
-	cfg, err := s.store.Config()
-	if err != nil {
-		return
-	}
-	groups := mapList(cfg["proxy_groups"])
-	index := proxySubscriptionGroupIndex(groups, groupID)
-	if index < 0 {
-		return
-	}
-	group := cloneMap(groups[index])
-	group["subscription_last_attempt_at"] = time.Now().UTC()
-	group["subscription_last_error"] = proxySubscriptionErrorMessage(cause, subscriptionURL)
-	groups[index] = group
-	_, _ = s.store.UpdateConfig("proxy_groups", groups)
-}
-
-func (s *Server) refreshProxyGroupSubscription(groupID string) (map[string]any, error) {
-	normalized := slugID(strings.TrimPrefix(strings.ToLower(strings.TrimSpace(groupID)), "group:"))
-	cfg, err := s.store.Config()
-	if err != nil {
-		return nil, err
-	}
-	groups := mapList(cfg["proxy_groups"])
-	groupIndex := proxySubscriptionGroupIndex(groups, normalized)
-	if groupIndex < 0 {
-		return nil, errProxyGroupNotFound
-	}
-	subscriptionURL := strings.TrimSpace(stringValue(groups[groupIndex]["subscription_url"]))
-	if subscriptionURL == "" {
-		return nil, fmt.Errorf("%w: proxy subscription URL is required", errProxySubscriptionInvalid)
-	}
-
-	text, err := fetchProxySubscription(subscriptionURL)
-	if err != nil {
-		s.recordProxySubscriptionFailure(normalized, subscriptionURL, err)
-		return nil, err
-	}
-	proxies, overflow := parseProxySubscriptionWithLimit(text, maxProxySubscriptionNodes)
-	if overflow {
-		err := fmt.Errorf("%w: subscription contains more than %d proxies", errProxySubscriptionInvalid, maxProxySubscriptionNodes)
-		s.recordProxySubscriptionFailure(normalized, subscriptionURL, err)
-		return nil, err
-	}
-	if len(proxies) == 0 {
-		err := fmt.Errorf("%w: subscription returned no supported proxies", errProxySubscriptionInvalid)
-		s.recordProxySubscriptionFailure(normalized, subscriptionURL, err)
-		return nil, err
-	}
-
-	// Reload after the network request so a concurrent admin edit is retained.
-	latestConfig, err := s.store.Config()
-	if err != nil {
-		return nil, err
-	}
-	latestGroups := mapList(latestConfig["proxy_groups"])
-	groupIndex = proxySubscriptionGroupIndex(latestGroups, normalized)
-	if groupIndex < 0 {
-		return nil, errProxyGroupNotFound
-	}
-	group := cloneMap(latestGroups[groupIndex])
-	if latestURL := strings.TrimSpace(stringValue(group["subscription_url"])); latestURL != subscriptionURL {
-		return nil, fmt.Errorf("%w: subscription URL changed during refresh", errProxySubscriptionInvalid)
-	}
-	concurrency := 30
-	if raw, exists := group["subscription_node_image_concurrency_limit"]; exists {
-		concurrency = intValue(raw)
-	}
-	if concurrency < 0 || concurrency > 10000 {
-		concurrency = 30
-	}
-	manualNodes := make([]any, 0)
-	for _, node := range mapList(group["nodes"]) {
-		if boolValue(node["subscription_managed"], false) || strings.EqualFold(stringValue(node["source"]), "subscription") {
-			continue
+		if !found {
+			return nil, errProxyGroupNotFound
 		}
-		manualNodes = append(manualNodes, node)
-	}
-	subscriptionNodes := make([]any, 0, len(proxies))
-	for index, proxy := range proxies {
-		subscriptionNodes = append(subscriptionNodes, proxySubscriptionNode(proxy, index+1, concurrency))
-	}
-	group["nodes"] = append(manualNodes, subscriptionNodes...)
-	now := time.Now().UTC()
-	group["subscription_last_updated_at"] = now
-	group["subscription_last_attempt_at"] = now
-	group["subscription_last_error"] = ""
-	group["subscription_node_count"] = len(subscriptionNodes)
-	latestGroups[groupIndex] = group
-	updated, err := s.store.UpdateConfig("proxy_groups", latestGroups)
+		return groups, nil
+	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return map[string]any{
-		"group":      group,
-		"groups":     mapList(updated["proxy_groups"]),
-		"node_count": len(subscriptionNodes),
-	}, nil
+	if err := s.refreshProxyRuntime(); err != nil {
+		return nil, nil, err
+	}
+	return updatedGroup, mapList(updated["proxy_groups"]), nil
+}
+
+func (s *Server) recordProxySubscriptionError(id, subscriptionURL string, refreshErr error) {
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, _ = s.store.MutateConfig("proxy_groups", func(value any) (any, error) {
+		groups := mapList(value)
+		for index, current := range groups {
+			if stringValue(current["id"]) != id || strings.TrimSpace(stringValue(current["subscription_url"])) != subscriptionURL {
+				continue
+			}
+			next := cloneMap(current)
+			next["subscription_last_attempt_at"] = now
+			next["subscription_last_error"] = refreshErr.Error()
+			groups[index] = next
+			break
+		}
+		return groups, nil
+	})
 }

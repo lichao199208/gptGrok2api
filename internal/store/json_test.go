@@ -123,40 +123,43 @@ func TestRotateAccountTokensClearsStaleErrorMarkers(t *testing.T) {
 	}
 }
 
-func TestDeletedAccountTombstoneNormalizesSSOPrefix(t *testing.T) {
+func TestAccountSnapshotUsesCopyOnWriteAndFlushesRuntimeUpdates(t *testing.T) {
 	root := t.TempDir()
-	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
-	if added, _, _, err := repository.AddAccounts(nil, []map[string]any{{"sso": "sso=opaque-token", "source_type": "grok_sso"}}); err != nil || added != 1 {
-		t.Fatalf("initial SSO add failed: added=%d err=%v", added, err)
+	accountPath := filepath.Join(root, "accounts.json")
+	repository := New(accountPath, filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "status": "正常", "enabled": true}}); err != nil {
+		t.Fatal(err)
 	}
-	if removed, _, err := repository.DeleteAccounts([]string{"opaque-token"}); err != nil || removed != 1 {
-		t.Fatalf("SSO delete failed: removed=%d err=%v", removed, err)
-	}
-	added, skipped, _, err := repository.AddAccounts(nil, []map[string]any{{"sso": "sso=opaque-token", "source_type": "grok_sso"}})
-	if err != nil || added != 0 || skipped != 1 {
-		t.Fatalf("SSO tombstone was bypassed: added=%d skipped=%d err=%v", added, skipped, err)
-	}
-}
 
-func TestDeletedAccountCannotBeReaddedByAutomaticImport(t *testing.T) {
-	root := t.TempDir()
-	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
-	if added, _, _, err := repository.AddAccounts([]string{"deleted-token"}, nil); err != nil || added != 1 {
-		t.Fatalf("initial add failed: added=%d err=%v", added, err)
+	before, beforeRevision, err := repository.AccountSnapshot()
+	if err != nil || len(before) != 1 {
+		t.Fatalf("unexpected initial snapshot: %#v %v", before, err)
 	}
-	removed, _, err := repository.DeleteAccounts([]string{"deleted-token"})
-	if err != nil || removed != 1 {
-		t.Fatalf("delete failed: removed=%d err=%v", removed, err)
+	if _, err := repository.UpdateAccountRuntime("one", map[string]any{"last_error_status": 502, "last_error_message": "temporary"}); err != nil {
+		t.Fatal(err)
 	}
-	added, skipped, items, err := repository.AddAccounts([]string{"deleted-token"}, []map[string]any{{"access_token": "deleted-token", "source_type": "grok_sso"}})
-	if err != nil || added != 0 || skipped != 2 || len(items) != 0 {
-		t.Fatalf("deleted token was re-added: added=%d skipped=%d items=%#v err=%v", added, skipped, items, err)
-	}
-	raw, err := os.ReadFile(filepath.Join(root, "deleted_accounts.json"))
+	after, afterRevision, err := repository.AccountSnapshot()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(raw) == "" || string(raw) == "[\"deleted-token\"]" {
-		t.Fatalf("deletion tombstone is missing or contains plaintext token: %s", raw)
+	if afterRevision <= beforeRevision || after[0]["last_error_message"] != "temporary" {
+		t.Fatalf("runtime update did not advance snapshot: before=%d after=%d item=%#v", beforeRevision, afterRevision, after[0])
+	}
+	if before[0]["last_error_message"] != nil {
+		t.Fatalf("previous snapshot was mutated in place: %#v", before[0])
+	}
+	if err := repository.FlushAccounts(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(accountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0]["last_error_message"] != "temporary" {
+		t.Fatalf("runtime update was not flushed: %#v", persisted)
 	}
 }

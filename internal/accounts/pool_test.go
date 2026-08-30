@@ -3,6 +3,7 @@ package accounts
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -77,8 +78,106 @@ func TestPoolFeedbackInvokesInvalidCallbackOnlyForAuthFailures(t *testing.T) {
 	if called != 0 {
 		t.Fatalf("temporary upstream error invoked invalid callback %d times", called)
 	}
+	p.Feedback(account, 403, errors.New("cloudflare forbidden"))
+	if called != 0 {
+		t.Fatalf("temporary forbidden response invoked invalid callback %d times", called)
+	}
+	items, err := repository.AccountList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := items[0]["status"]; got != "正常" {
+		t.Fatalf("403 marked account abnormal: %#v", items[0])
+	}
 	p.Feedback(account, 401, errors.New("unauthorized"))
 	if called != 1 {
 		t.Fatalf("expected one invalid callback, got %d", called)
+	}
+}
+
+func TestPoolSuccessfulFeedbackClearsStaleRequestAbnormalState(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	stored := map[string]any{
+		"access_token": "one", "pool": "basic", "enabled": true, "status": "异常",
+		"status_reason_code": "auth_invalid", "last_error_kind": "auth_invalid",
+		"last_error_status": 403, "last_error_message": "temporary forbidden", "invalid_count": 1,
+	}
+	if err := repository.SaveAccounts([]map[string]any{stored}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(repository)
+	p.Feedback(Account{Token: "one", Pool: "basic", Fields: stored}, 200, nil)
+	items, err := repository.AccountList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0]["status"] != "正常" || intValue(items[0]["invalid_count"]) != 0 || stringValue(items[0]["last_error_kind"]) != "" {
+		t.Fatalf("successful request did not recover account: %#v", items[0])
+	}
+}
+
+func TestPoolConcurrencyLimitWaitsForAccountRelease(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "pool": "basic", "enabled": true, "status": "正常"}}); err != nil {
+		t.Fatal(err)
+	}
+	pool := New(repository)
+	first, err := pool.ReserveMatchingLimit(context.Background(), []string{"basic"}, nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acquired := make(chan *Lease, 1)
+	errorsOut := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		lease, reserveErr := pool.ReserveMatchingLimit(ctx, []string{"basic"}, nil, nil, 1)
+		if reserveErr != nil {
+			errorsOut <- reserveErr
+			return
+		}
+		acquired <- lease
+	}()
+	select {
+	case lease := <-acquired:
+		pool.Release(lease)
+		t.Fatal("second request bypassed the per-account concurrency limit")
+	case err := <-errorsOut:
+		t.Fatalf("second request failed instead of waiting: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	pool.Release(first)
+	select {
+	case lease := <-acquired:
+		pool.Release(lease)
+	case err := <-errorsOut:
+		t.Fatalf("waiting request failed after release: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("waiting request was not woken after account release")
+	}
+}
+
+func BenchmarkPoolReserveWithTwoThousandCachedAccounts(b *testing.B) {
+	root := b.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	items := make([]map[string]any, 2000)
+	for index := range items {
+		items[index] = map[string]any{"access_token": fmt.Sprintf("token-%04d", index), "pool": "basic", "enabled": true, "status": "正常"}
+	}
+	if err := repository.SaveAccounts(items); err != nil {
+		b.Fatal(err)
+	}
+	pool := New(repository)
+	b.ResetTimer()
+	for index := 0; index < b.N; index++ {
+		lease, err := pool.ReserveMatchingLimit(context.Background(), []string{"basic"}, nil, nil, 1)
+		if err != nil {
+			b.Fatal(err)
+		}
+		pool.Release(lease)
 	}
 }

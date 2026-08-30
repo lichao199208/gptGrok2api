@@ -1,6 +1,6 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { statsApi } from '@/api/stats'
-import { usePageQuery } from '@/composables/usePageQuery'
+import { usePageQuery, useVisibilityPolling } from '@/composables/usePageQuery'
 import { usePageRuntime } from '@/composables/usePageRuntime'
 import {
   getLineChartTheme,
@@ -33,11 +33,18 @@ export function useDashboardPage() {
   const pageRuntime = usePageRuntime('dashboard')
   const DASHBOARD_DATA_REQUEST_KEY = 'dashboard:data'
   const CHART_BOOTSTRAP_TIMER_KEY = 'dashboard:chart-bootstrap'
+  const DASHBOARD_POLL_TIMER_KEY = 'dashboard:poll'
   const chartRequestKey = (chartType: ChartType) => `dashboard:chart:${chartType}`
   const dashboardDataQuery = usePageQuery({
     runtime: pageRuntime,
     key: DASHBOARD_DATA_REQUEST_KEY,
     errorMessage: '概览加载失败',
+  })
+  const dashboardPolling = useVisibilityPolling({
+    runtime: pageRuntime,
+    key: DASHBOARD_POLL_TIMER_KEY,
+    intervalMs: 30_000,
+    action: refreshDashboardSilently,
   })
 
   // 每个图表独立的时间范围
@@ -318,6 +325,7 @@ export function useDashboardPage() {
 
   pageRuntime.onActivate(({ initial }) => {
     bindResizeListener()
+    dashboardPolling.start()
     if (initial) {
       void reloadDashboardOnEnter()
       return
@@ -326,12 +334,14 @@ export function useDashboardPage() {
   })
 
   pageRuntime.onDeactivate(() => {
+    dashboardPolling.stop()
     unbindResizeListener()
     dashboardEntrySeq += 1
     resetDashboardViewState()
   })
 
   pageRuntime.onHide(() => {
+    dashboardPolling.stop()
     unbindResizeListener()
     dashboardEntrySeq += 1
     resetDashboardViewState()
@@ -339,10 +349,12 @@ export function useDashboardPage() {
 
   pageRuntime.onShow(() => {
     bindResizeListener()
+    dashboardPolling.start()
     void reloadDashboardOnEnter()
   })
 
   onBeforeUnmount(() => {
+    dashboardPolling.stop()
     unbindResizeListener()
     dashboardEntrySeq += 1
     clearChartBootstrapTimer()
@@ -627,7 +639,7 @@ export function useDashboardPage() {
     })
   }
 
-  async function refreshDashboardData(force = false) {
+  async function refreshDashboardData(force = false, options: { silent?: boolean } = {}) {
     const chartRanges = getDashboardChartRanges()
 
     const refreshed = await dashboardDataQuery.run(
@@ -637,12 +649,34 @@ export function useDashboardPage() {
       },
       {
         apply: () => applyDashboardOverview(chartRanges),
+        silentError: options.silent,
+        silentLoading: options.silent,
         onError: (_message, error) => {
           console.error('Failed to refresh dashboard data:', error)
         },
       },
     )
     return Boolean(refreshed)
+  }
+
+  function updateDashboardCharts() {
+    updateHourlyRequestsChart('refresh')
+    updateTrendChart('refresh')
+    updateSuccessRateChart('refresh')
+    updateModelChart('refresh')
+    updateModelRankChart('refresh')
+    updateResponseTimeChart('refresh')
+  }
+
+  async function refreshDashboardSilently() {
+    if (!dashboardDataReady.value) return
+    const refreshed = await refreshDashboardData(true, { silent: true })
+    if (refreshed) updateDashboardCharts()
+  }
+
+  async function refreshDashboard() {
+    const refreshed = await refreshDashboardData(true)
+    if (refreshed) updateDashboardCharts()
   }
 
   async function reloadDashboardOnEnter() {
@@ -1055,6 +1089,7 @@ export function useDashboardPage() {
     dashboardLoading: computed(() => dashboardDataQuery.loading.value || !dashboardLoadSettled.value),
     dashboardLoadError: dashboardDataQuery.error,
     retryDashboard,
+    refreshDashboard,
     timeRangeHourlyRequests,
     timeRangeTrend,
     timeRangeSuccessRate,

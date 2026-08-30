@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -13,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/auucoder/gptgrok2api-go/internal/accounts"
 	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
@@ -258,11 +260,22 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		URL string `json:"url"`
+		ID          string `json:"id"`
+		NodeID      string `json:"node_id"`
+		URL         string `json:"url"`
+		PruneFailed bool   `json:"prune_failed"`
 	}
 	if r.Body != nil && r.ContentLength != 0 && !decodeJSON(w, r, &request) {
 		return
 	}
+
+	// The group endpoint supports checking every configured node. Keep the
+	// explicit URL path below unchanged for the other proxy test endpoints.
+	if r.URL.Path == "/api/proxy/groups/test" && strings.TrimSpace(request.URL) == "" {
+		s.testProxyGroup(w, r, request.ID, request.NodeID, request.PruneFailed)
+		return
+	}
+
 	candidate := strings.TrimSpace(request.URL)
 	if candidate == "" {
 		candidate = s.proxyManager.Resolve(nil, false)
@@ -271,23 +284,116 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "proxy url is required", "invalid_request_error")
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"result": s.testProxyCandidate(r.Context(), candidate)})
+}
+
+func (s *Server) testProxyGroup(w http.ResponseWriter, r *http.Request, groupID, nodeID string, pruneFailed bool) {
+	groupID = slugID(groupID)
+	if groupID == "" {
+		writeError(w, http.StatusBadRequest, "proxy group id or url is required", "invalid_request_error")
+		return
+	}
+	cfg, err := s.store.Config()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
+	groups := mapList(cfg["proxy_groups"])
+	var group map[string]any
+	for _, item := range groups {
+		if slugID(stringValue(item["id"])) == groupID {
+			group = item
+			break
+		}
+	}
+	if group == nil {
+		writeError(w, http.StatusNotFound, "proxy group not found", "not_found")
+		return
+	}
+
+	nodeID = slugID(nodeID)
+	type testedNode struct {
+		index  int
+		id     string
+		result map[string]any
+	}
+	tested := make([]testedNode, 0)
+	for index, node := range mapList(group["nodes"]) {
+		if !boolValue(node["enabled"], true) {
+			continue
+		}
+		id := strings.TrimSpace(stringValue(node["id"]))
+		candidate := strings.TrimSpace(stringValue(node["url"]))
+		if candidate == "" || (nodeID != "" && id != nodeID && slugID(id) != slugID(nodeID)) {
+			continue
+		}
+		tested = append(tested, testedNode{index: index, id: id, result: s.testProxyCandidate(r.Context(), candidate)})
+	}
+	if len(tested) == 0 {
+		writeError(w, http.StatusBadRequest, "proxy group node url is required", "invalid_request_error")
+		return
+	}
+
+	results := make([]map[string]any, 0, len(tested))
+	failedIndexes := make(map[int]bool)
+	for _, item := range tested {
+		results = append(results, map[string]any{"node_id": item.id, "result": item.result})
+		if !boolValue(item.result["ok"], false) {
+			failedIndexes[item.index] = true
+		}
+	}
+
+	updatedGroups := groups
+	// Only the all-node action prunes. A single-node check must never delete a
+	// node, even if a caller sends prune_failed=true accidentally.
+	if pruneFailed && nodeID == "" && len(failedIndexes) > 0 {
+		nextGroups := make([]map[string]any, 0, len(groups))
+		for _, item := range groups {
+			if slugID(stringValue(item["id"])) != groupID {
+				nextGroups = append(nextGroups, item)
+				continue
+			}
+			updated := cloneMap(item)
+			keptNodes := make([]map[string]any, 0)
+			for index, node := range mapList(item["nodes"]) {
+				if !failedIndexes[index] {
+					keptNodes = append(keptNodes, node)
+				}
+			}
+			updated["nodes"] = keptNodes
+			nextGroups = append(nextGroups, updated)
+		}
+		updatedConfig, updateErr := s.store.UpdateConfig("proxy_groups", nextGroups)
+		if updateErr != nil {
+			writeError(w, http.StatusInternalServerError, updateErr.Error(), "server_error")
+			return
+		}
+		updatedGroups = mapList(updatedConfig["proxy_groups"])
+	}
+	var singleResult map[string]any
+	if len(results) == 1 {
+		singleResult = results[0]["result"].(map[string]any)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results, "result": singleResult, "groups": updatedGroups})
+}
+
+func (s *Server) testProxyCandidate(ctx context.Context, candidate string) map[string]any {
 	parsed, err := url.Parse(candidate)
 	if err != nil || parsed.Host == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "invalid proxy url", "has_proxy": true}})
-		return
+		return map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "invalid proxy url", "proxy_source": "input", "has_proxy": true}
 	}
 	client := &http.Client{Transport: proxyruntime.NewTransport(http.DefaultTransport), Timeout: 15 * time.Second}
 	started := time.Now()
-	req, err := http.NewRequestWithContext(proxyruntime.WithURL(r.Context(), candidate), http.MethodGet, "https://chatgpt.com/api/auth/csrf", nil)
+	req, err := http.NewRequestWithContext(proxyruntime.WithURL(ctx, candidate), http.MethodGet, "https://chatgpt.com/api/auth/csrf", nil)
 	result := map[string]any{"proxy_source": "input", "has_proxy": true}
 	if err == nil {
 		var response *http.Response
 		response, err = client.Do(req)
 		if response != nil {
-			defer response.Body.Close()
+			response.Body.Close()
 			result["status"] = response.StatusCode
-			result["ok"] = response.StatusCode < 500
-			if response.StatusCode >= 500 {
+			result["ok"] = proxyTestStatusOK(response.StatusCode)
+			if !proxyTestStatusOK(response.StatusCode) {
 				result["error"] = fmt.Sprintf("HTTP %d", response.StatusCode)
 			}
 		}
@@ -298,11 +404,11 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		result["status"] = 0
 		result["error"] = redactProxyError(err.Error())
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"result": result})
+	return result
 }
 
 func redactProxyError(value string) string {
-	for _, scheme := range []string{"http://", "https://", "socks5://", "socks5h://", "socks://"} {
+	for _, scheme := range []string{"http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://", "socks://"} {
 		for {
 			start := strings.Index(strings.ToLower(value), scheme)
 			if start < 0 {
@@ -1019,23 +1125,264 @@ func (s *Server) dashboard(w http.ResponseWriter, r *http.Request) {
 	if !s.requireAdmin(w, r) {
 		return
 	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
+		return
+	}
 	accounts, _ := s.store.AccountList()
-	active := 0
-	for _, item := range accounts {
-		if boolValue(item["enabled"], true) && !strings.EqualFold(stringValue(item["status"]), "disabled") {
-			active++
+	accountStats := dashboardAccountStats(accounts)
+	healthy := boolValue(accountStats["healthy"], false)
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":       map[bool]string{true: "ok", false: "degraded"}[healthy],
+		"healthy":      healthy,
+		"runtime":      "go",
+		"version":      s.cfg.Version,
+		"generated_at": time.Now().UTC().Format(time.RFC3339),
+		"accounts":     accountStats,
+		"storage":      map[string]any{"backend": "json", "health": "ok", "images": mediaStats(s.cfg.ImageDataDir), "videos": mediaStats(s.cfg.VideoDataDir)},
+		"logs":         dashboardLogSummary(s.loadCallLogs(), r.URL.Query().Get("time_range"), time.Now()),
+	})
+}
+
+func newDashboardProviderStats(provider string) map[string]any {
+	return map[string]any{
+		"provider": provider, "total": 0, "cumulative_total": 0,
+		"active": 0, "limited": 0, "abnormal": 0, "disabled": 0,
+		"total_quota": 0, "unlimited_quota_count": 0, "unknown_quota_count": 0,
+		"total_success": 0, "total_fail": 0, "by_type": map[string]any{},
+		"source_available": true, "healthy": false,
+	}
+}
+
+func dashboardAccountStats(items []map[string]any) map[string]any {
+	total := newDashboardProviderStats("all")
+	providers := map[string]map[string]any{
+		"gpt":  newDashboardProviderStats("gpt"),
+		"grok": newDashboardProviderStats("grok"),
+	}
+	for _, item := range items {
+		provider := "grok"
+		if isOpenAIAccount(accounts.Account{Token: accountToken(item), Fields: item}) {
+			provider = "gpt"
+		}
+		for _, stats := range []map[string]any{total, providers[provider]} {
+			stats["total"] = intValue(stats["total"]) + 1
+			stats["cumulative_total"] = intValue(stats["cumulative_total"]) + 1
+			category := accountStatusCategory(item)
+			switch category {
+			case "limited", "abnormal", "disabled":
+				stats[category] = intValue(stats[category]) + 1
+			default:
+				stats["active"] = intValue(stats["active"]) + 1
+				quota := maxInt(0, intValue(item["quota"]))
+				stats["total_quota"] = intValue(stats["total_quota"]) + quota
+				accountType := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringValue(item["type"]), stringValue(item["plan_type"]))))
+				unlimited := boolValue(item["image_quota_unknown"], false) && (accountType == "pro" || accountType == "prolite")
+				if unlimited {
+					stats["unlimited_quota_count"] = intValue(stats["unlimited_quota_count"]) + 1
+				} else if boolValue(item["image_quota_unknown"], false) || quota <= 0 {
+					stats["unknown_quota_count"] = intValue(stats["unknown_quota_count"]) + 1
+				}
+			}
+			stats["total_success"] = intValue(stats["total_success"]) + maxInt(0, intValue(item["success"]))
+			stats["total_fail"] = intValue(stats["total_fail"]) + maxInt(0, intValue(item["fail"]))
+			accountType := firstNonEmpty(stringValue(item["type"]), stringValue(item["source_type"]), "unknown")
+			byType := mapValue(stats["by_type"])
+			byType[accountType] = intValue(byType[accountType]) + 1
 		}
 	}
-	healthy := active > 0
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":   map[bool]string{true: "ok", false: "degraded"}[healthy],
-		"healthy":  healthy,
-		"runtime":  "go",
-		"version":  s.cfg.Version,
-		"accounts": map[string]any{"total": len(accounts), "active": active, "healthy": healthy},
-		"storage":  map[string]any{"backend": "json", "health": "ok", "images": mediaStats(s.cfg.ImageDataDir), "videos": mediaStats(s.cfg.VideoDataDir)},
-		"logs":     map[string]any{"monitor": s.monitorSnapshotWithHistory()},
-	})
+	for _, stats := range []map[string]any{total, providers["gpt"], providers["grok"]} {
+		stats["healthy"] = intValue(stats["active"]) > 0 || intValue(stats["unlimited_quota_count"]) > 0 || intValue(stats["unknown_quota_count"]) > 0
+	}
+	total["providers"] = map[string]any{"gpt": providers["gpt"], "grok": providers["grok"]}
+	return total
+}
+
+func dashboardLogSummary(items []map[string]any, timeRange string, now time.Time) map[string]any {
+	timeRange = strings.ToLower(strings.TrimSpace(timeRange))
+	if timeRange != "7d" && timeRange != "30d" {
+		timeRange = "24h"
+	}
+	location := now.Location()
+	now = now.In(location)
+	bucketCount := 24
+	bucketStep := time.Hour
+	currentStart := now.Truncate(time.Hour)
+	labelFormat := "15:00"
+	if timeRange != "24h" {
+		bucketCount = 7
+		if timeRange == "30d" {
+			bucketCount = 30
+		}
+		bucketStep = 24 * time.Hour
+		currentStart = time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, location)
+		labelFormat = "01-02"
+	}
+	firstStart := currentStart.Add(-time.Duration(bucketCount-1) * bucketStep)
+	labels := make([]string, bucketCount)
+	totalRequests := make([]int, bucketCount)
+	successRequests := make([]int, bucketCount)
+	failedRequests := make([]int, bucketCount)
+	rateLimitedRequests := make([]int, bucketCount)
+	modelRequests := map[string][]int{}
+	modelTotalSums := map[string][]float64{}
+	modelTotalCounts := map[string][]int{}
+	modelTTFBSums := map[string][]float64{}
+	modelTTFBCounts := map[string][]int{}
+	for index := range labels {
+		labels[index] = firstStart.Add(time.Duration(index) * bucketStep).Format(labelFormat)
+	}
+
+	byEndpoint := map[string]any{}
+	byModel := map[string]any{}
+	byStatus := map[string]any{}
+	byErrorCode := map[string]any{}
+	recentFailures := []map[string]any{}
+	total, success, failed := 0, 0, 0
+	if len(items) > 20000 {
+		items = items[len(items)-20000:]
+	}
+	for _, item := range items {
+		if !strings.EqualFold(stringValue(item["type"]), "call") {
+			continue
+		}
+		detail := mapValue(item["detail"])
+		startedAt, ok := dashboardLogTime(firstNonEmpty(stringValue(detail["started_at"]), stringValue(item["time"])), location)
+		if !ok || startedAt.Before(firstStart) || !startedAt.Before(currentStart.Add(bucketStep)) {
+			continue
+		}
+		bucket := int(startedAt.Sub(firstStart) / bucketStep)
+		if bucket < 0 || bucket >= bucketCount {
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(firstNonEmpty(stringValue(detail["status"]), stringValue(item["status"]))))
+		endpoint := strings.TrimSpace(firstNonEmpty(stringValue(detail["endpoint"]), stringValue(item["endpoint"])))
+		modelName := strings.TrimSpace(firstNonEmpty(stringValue(detail["model"]), stringValue(item["model"])))
+		errorText := strings.TrimSpace(firstNonEmpty(stringValue(detail["error"]), stringValue(detail["raw_error"])))
+		errorCode := strings.TrimSpace(firstNonEmpty(stringValue(detail["error_code"]), stringValue(item["error_code"])))
+		statusCode := intValue(detail["status_code"])
+		isFailed := status == "failed" || status == "error" || status == "fail" || errorText != "" || statusCode >= 400
+		isRateLimited := statusCode == http.StatusTooManyRequests || strings.Contains(strings.ToLower(errorCode), "rate_limit") || errorCode == "429"
+		if errorCode == "" && statusCode >= 400 {
+			errorCode = fmt.Sprintf("%d", statusCode)
+		}
+
+		total++
+		totalRequests[bucket]++
+		if isFailed {
+			failed++
+			if isRateLimited {
+				rateLimitedRequests[bucket]++
+			} else {
+				failedRequests[bucket]++
+			}
+			recentFailures = append(recentFailures, map[string]any{
+				"id": item["id"], "time": firstNonEmpty(stringValue(item["time"]), stringValue(detail["started_at"])),
+				"summary": item["summary"], "endpoint": endpoint, "error_code": errorCode,
+				"stage": detail["stage"], "reason": firstNonEmpty(errorText, stringValue(detail["reason"])),
+				"conversation_id": detail["conversation_id"],
+			})
+		} else {
+			success++
+			successRequests[bucket]++
+		}
+		if status != "" {
+			byStatus[status] = intValue(byStatus[status]) + 1
+		}
+		if strings.HasPrefix(endpoint, "/") {
+			byEndpoint[endpoint] = intValue(byEndpoint[endpoint]) + 1
+		}
+		if modelName != "" {
+			byModel[modelName] = intValue(byModel[modelName]) + 1
+			ensureDashboardIntSeries(modelRequests, modelName, bucketCount)[bucket]++
+			duration := dashboardLogMetric(detail, "duration_ms", "total_ms")
+			if duration > 0 {
+				ensureDashboardFloatSeries(modelTotalSums, modelName, bucketCount)[bucket] += duration
+				ensureDashboardIntSeries(modelTotalCounts, modelName, bucketCount)[bucket]++
+			}
+			ttfb := dashboardLogMetric(detail, "http_ttfb_ms", "sse_first_event_ms", "stream_first_queue_ms")
+			if ttfb > 0 {
+				ensureDashboardFloatSeries(modelTTFBSums, modelName, bucketCount)[bucket] += ttfb
+				ensureDashboardIntSeries(modelTTFBCounts, modelName, bucketCount)[bucket]++
+			}
+		}
+		if errorCode != "" {
+			byErrorCode[errorCode] = intValue(byErrorCode[errorCode]) + 1
+		}
+	}
+	if len(recentFailures) > 10 {
+		recentFailures = recentFailures[len(recentFailures)-10:]
+	}
+	return map[string]any{
+		"total": total, "success": success, "failed": failed,
+		"by_endpoint": byEndpoint, "by_model": byModel, "by_status": byStatus,
+		"by_error_code": byErrorCode, "recent_failures": recentFailures,
+		"trend": map[string]any{
+			"labels": labels, "total_requests": totalRequests, "success_requests": successRequests,
+			"failed_requests": failedRequests, "rate_limited_requests": rateLimitedRequests,
+			"model_requests":    modelRequests,
+			"model_total_times": dashboardAverageSeries(modelTotalSums, modelTotalCounts),
+			"model_ttfb_times":  dashboardAverageSeries(modelTTFBSums, modelTTFBCounts),
+		},
+	}
+}
+
+func dashboardLogTime(value string, location *time.Location) (time.Time, bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return time.Time{}, false
+	}
+	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
+		parsed, err := time.ParseInLocation(layout, value, location)
+		if err == nil {
+			return parsed.In(location), true
+		}
+	}
+	return time.Time{}, false
+}
+
+func dashboardLogMetric(detail map[string]any, keys ...string) float64 {
+	monitor := mapValue(detail["monitor"])
+	metrics := mapValue(monitor["metrics"])
+	perf := mapValue(monitor["perf"])
+	for _, key := range keys {
+		for _, source := range []map[string]any{detail, metrics, perf, monitor} {
+			value := float64(monitorNumber(source[key]))
+			if value > 0 {
+				return value
+			}
+		}
+	}
+	return 0
+}
+
+func ensureDashboardIntSeries(values map[string][]int, key string, length int) []int {
+	if values[key] == nil {
+		values[key] = make([]int, length)
+	}
+	return values[key]
+}
+
+func ensureDashboardFloatSeries(values map[string][]float64, key string, length int) []float64 {
+	if values[key] == nil {
+		values[key] = make([]float64, length)
+	}
+	return values[key]
+}
+
+func dashboardAverageSeries(sums map[string][]float64, counts map[string][]int) map[string][]float64 {
+	result := map[string][]float64{}
+	for modelName, totals := range sums {
+		averages := make([]float64, len(totals))
+		for index, total := range totals {
+			if counts[modelName][index] > 0 {
+				averages[index] = math.Round(total/float64(counts[modelName][index])*100) / 100
+			}
+		}
+		result[modelName] = averages
+	}
+	return result
 }
 
 func mediaStats(root string) map[string]any {
