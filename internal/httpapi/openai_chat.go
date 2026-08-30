@@ -203,6 +203,9 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		}
 		s.recordGeneratedMedia(r.Context(), map[string]string{"url": localURL})
 		parts = append(parts, fmt.Sprintf("![image](%s)", item["url"]))
+		// Chat image requests have no image-count parameter and return one
+		// assistant image. Do not persist extra upstream references.
+		break
 	}
 	s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"total_ms": time.Since(started).Milliseconds()})
 	s.accountPool.Feedback(selected, http.StatusOK, nil)

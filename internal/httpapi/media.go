@@ -234,6 +234,10 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 					}
 					s.recordGeneratedMedia(ctx, map[string]string{"url": localURL})
 					items = append(items, value)
+					// Each worker represents exactly one requested output. Upstream can
+					// expose that output through multiple references, so resolving the
+					// remaining entries would only persist files that are later discarded.
+					break
 				}
 				if resolveErr != nil {
 					s.accountPool.Release(lease)
