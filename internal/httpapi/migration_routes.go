@@ -235,7 +235,12 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 		id = strings.TrimSuffix(id, "/subscription/refresh")
 	}
 	if refresh && r.Method == http.MethodPost {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "refreshed_at": time.Now().UTC()})
+		result, err := s.refreshProxyGroupSubscription(id)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "proxy subscription refresh failed", "upstream_error")
+			return
+		}
+		writeJSON(w, http.StatusOK, result)
 		return
 	}
 	if r.Method != http.MethodDelete {
