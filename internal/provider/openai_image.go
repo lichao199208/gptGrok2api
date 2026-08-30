@@ -580,42 +580,50 @@ func (o *OpenAIImage) uploadInput(ctx context.Context, account accounts.Account,
 }
 
 // uploadInputBlob retries only the replayable signed-storage PUT. The normal
-// ChatGPT flow stays pinned to one proxy, while a final direct attempt avoids
-// failing the whole edit when a proxy cannot carry large object-store bodies.
+// ChatGPT flow stays pinned to one proxy; retry egress is restricted to a
+// different group node with multiple successful real image requests.
 func (o *OpenAIImage) uploadInputBlob(ctx context.Context, account accounts.Account, endpoint string, data []byte, headers map[string]string) error {
 	proxyURL, selected := proxyruntime.URLSelectionFromContext(ctx)
 	if !selected && o.Proxy != nil {
 		proxyURL = o.Proxy.Resolve(account.Fields, false)
 	}
-	routes := []string{proxyURL}
-	if proxyURL != "" {
-		routes = append(routes, "")
+	routes := []struct {
+		url   string
+		lease *proxyruntime.Lease
+	}{{url: proxyURL}}
+	if proxyURL != "" && o.Proxy != nil {
+		if stable := o.Proxy.AcquireStableImage(account.Fields, proxyURL); stable != nil {
+			routes = append(routes, struct {
+				url   string
+				lease *proxyruntime.Lease
+			}{url: stable.URL, lease: stable})
+		}
+	}
+	if len(routes) == 1 {
+		routes = append(routes, routes[0])
 	}
 	var lastErr error
-	for routeIndex, route := range routes {
-		attempts := 2
-		if routeIndex > 0 {
-			attempts = 1
+	for index, route := range routes {
+		attemptTimeout := minDuration(o.RequestTimeout, openAIImageUploadAttemptTimeout)
+		requestCtx, cancel := context.WithTimeout(proxyruntime.WithURL(ctx, route.url), attemptTimeout)
+		response, err := o.doAbsolute(requestCtx, http.MethodPut, endpoint, account, bytes.NewReader(data), headers, false)
+		cancel()
+		if route.lease != nil {
+			route.lease.Release(openAIImageProxyFailure(err))
 		}
-		for attempt := 0; attempt < attempts; attempt++ {
-			attemptTimeout := minDuration(o.RequestTimeout, openAIImageUploadAttemptTimeout)
-			requestCtx, cancel := context.WithTimeout(proxyruntime.WithURL(ctx, route), attemptTimeout)
-			response, err := o.doAbsolute(requestCtx, http.MethodPut, endpoint, account, bytes.NewReader(data), headers, false)
-			cancel()
-			if err == nil {
-				_ = response.Body.Close()
-				return nil
-			}
-			lastErr = err
-			if !isRetryableOpenAIUploadError(err) {
-				return err
-			}
-			if attempt+1 < attempts {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-time.After(200 * time.Millisecond):
-				}
+		if err == nil {
+			_ = response.Body.Close()
+			return nil
+		}
+		lastErr = err
+		if !isRetryableOpenAIUploadError(err) {
+			return err
+		}
+		if index+1 < len(routes) {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(200 * time.Millisecond):
 			}
 		}
 	}
@@ -788,12 +796,7 @@ func openAIImageProxyFailure(err error) bool {
 	}
 	var upstream *protocol.UpstreamError
 	if errors.As(err, &upstream) {
-		switch upstream.Status {
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict,
-			http.StatusUnprocessableEntity, http.StatusTooManyRequests:
-			return false
-		}
-		return upstream.Status == http.StatusForbidden || upstream.Status >= http.StatusInternalServerError
+		return upstream.Status == http.StatusForbidden
 	}
 	return true
 }

@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+
+	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
 func TestParseProxySubscriptionPlainTextAndBase64(t *testing.T) {
@@ -167,5 +169,44 @@ func TestRefreshProxyGroupSubscriptionRecordsFailure(t *testing.T) {
 	}
 	if len(mapList(updated["nodes"])) != 1 {
 		t.Fatalf("failed refresh replaced existing nodes: %#v", updated)
+	}
+}
+
+func TestRuntimeFailuresRemoveAndBlacklistSubscriptionNode(t *testing.T) {
+	root := t.TempDir()
+	server := New(adminTestConfig(root))
+	removedURL := "http://removed.example:8080"
+	group := map[string]any{
+		"id": "images", "subscription_url": "https://subscription.example/list",
+		"subscription_node_count": 2,
+		"nodes": []any{
+			map[string]any{"id": "removed", "url": removedURL, "enabled": true, "subscription_managed": true},
+			map[string]any{"id": "keep", "url": "http://keep.example:8080", "enabled": true, "subscription_managed": true},
+		},
+	}
+	if _, err := server.store.UpdateConfig("proxy_groups", []any{group}); err != nil {
+		t.Fatal(err)
+	}
+	server.persistProxyGroupRuntimeResult(proxyruntime.ImageNodeRuntimeResult{
+		GroupID: "images", NodeID: "removed", URL: removedURL, Failures: 3, Removed: true,
+	})
+	updated, err := server.proxyGroupConfig("images")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nodes := mapList(updated["nodes"]); len(nodes) != 1 || stringValue(nodes[0]["id"]) != "keep" {
+		t.Fatalf("runtime-failed node was not removed: %#v", updated)
+	}
+	if !containsString(stringList(updated["runtime_removed_proxy_urls"]), removedURL) {
+		t.Fatalf("removed subscription URL was not blacklisted: %#v", updated)
+	}
+	refreshed, _, err := server.applyProxySubscription("images", "https://subscription.example/list", []string{removedURL, "http://new.example:8080"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, node := range mapList(refreshed["nodes"]) {
+		if stringValue(node["url"]) == removedURL {
+			t.Fatalf("blacklisted node was restored by subscription refresh: %#v", refreshed)
+		}
 	}
 }

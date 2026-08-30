@@ -222,6 +222,12 @@ func (s *Server) applyProxySubscription(id, subscriptionURL string, proxyURLs []
 			next := cloneMap(current)
 			manualNodes := make([]map[string]any, 0)
 			seen := map[string]bool{}
+			blocked := map[string]bool{}
+			for _, blockedURL := range stringList(current["runtime_removed_proxy_urls"]) {
+				if normalized := normalizeSubscriptionProxyURL(blockedURL); normalized != "" {
+					blocked[normalized] = true
+				}
+			}
 			for _, node := range mapList(current["nodes"]) {
 				if isSubscriptionProxyNode(node) {
 					continue
@@ -234,7 +240,7 @@ func (s *Server) applyProxySubscription(id, subscriptionURL string, proxyURLs []
 			concurrency := intValue(current["subscription_node_image_concurrency_limit"])
 			subscriptionCount := 0
 			for _, proxyURL := range proxyURLs {
-				if seen[proxyURL] {
+				if seen[proxyURL] || blocked[proxyURL] {
 					continue
 				}
 				seen[proxyURL] = true

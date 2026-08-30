@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
+	"github.com/auucoder/gptgrok2api-go/internal/protocol"
 	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
 
@@ -28,10 +29,9 @@ func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) 
 	return f(request)
 }
 
-func TestOpenAIImageUploadRetriesProxyThenFallsBackToDirect(t *testing.T) {
+func TestOpenAIImageUploadRetriesWithStableProxyAndNeverDirect(t *testing.T) {
 	payload := []byte("replayable-image-payload")
-	proxyAttempts := 0
-	directAttempts := 0
+	attempts := []string{}
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		raw, err := io.ReadAll(request.Body)
 		if err != nil {
@@ -40,21 +40,29 @@ func TestOpenAIImageUploadRetriesProxyThenFallsBackToDirect(t *testing.T) {
 		if !bytes.Equal(raw, payload) {
 			t.Fatalf("upload body changed between retries: %q", raw)
 		}
-		if proxyruntime.URLFromContext(request.Context()) != "" {
-			proxyAttempts++
+		proxyURL := proxyruntime.URLFromContext(request.Context())
+		attempts = append(attempts, proxyURL)
+		if proxyURL == "" {
+			t.Fatal("upload retry used direct egress")
+		}
+		if proxyURL == "http://current.invalid:8080" {
 			return nil, errors.New("read: connection reset by peer")
 		}
-		directAttempts++
 		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
 	})}
-	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, nil, 10*time.Second)
-	ctx := proxyruntime.WithURL(context.Background(), "http://proxy.invalid:8080")
+	manager := proxyruntime.NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []proxyruntime.GroupConfig{{ID: "images", Enabled: true, Nodes: []proxyruntime.NodeConfig{
+		{ID: "current", URL: "http://current.invalid:8080", Enabled: true},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, RuntimeSuccesses: 3},
+	}}})
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, manager, 10*time.Second)
+	ctx := proxyruntime.WithURL(context.Background(), "http://current.invalid:8080")
 	err := imageClient.uploadInputBlob(ctx, accounts.Account{}, "https://storage.invalid/upload", payload, map[string]string{"Content-Type": "image/png"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if proxyAttempts != 2 || directAttempts != 1 {
-		t.Fatalf("unexpected attempts: proxy=%d direct=%d", proxyAttempts, directAttempts)
+	if len(attempts) != 2 || attempts[0] != "http://current.invalid:8080" || attempts[1] != "http://stable.invalid:8080" {
+		t.Fatalf("unexpected proxy attempts: %#v", attempts)
 	}
 }
 
@@ -68,6 +76,15 @@ func TestOpenAIImageUploadDoesNotRetryNonRetryableResponse(t *testing.T) {
 	err := imageClient.uploadInputBlob(proxyruntime.WithURL(context.Background(), "http://proxy.invalid:8080"), accounts.Account{}, "https://storage.invalid/upload", []byte("image"), nil)
 	if err == nil || attempts != 1 {
 		t.Fatalf("expected one non-retryable attempt, attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestOpenAIImageProxyFailureExcludesProviderServerErrors(t *testing.T) {
+	if openAIImageProxyFailure(&protocol.UpstreamError{Status: http.StatusInternalServerError, Message: "provider unavailable"}) {
+		t.Fatal("provider HTTP 500 was attributed to the proxy")
+	}
+	if !openAIImageProxyFailure(errors.New("read: connection reset by peer")) {
+		t.Fatal("transport reset was not attributed to the proxy")
 	}
 }
 

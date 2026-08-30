@@ -73,6 +73,53 @@ func TestImageGroupRuntimeFailureCoolsNodeAndSwitches(t *testing.T) {
 	}
 }
 
+func TestImageGroupRemovesNodeAfterThreeConsecutiveRuntimeFailures(t *testing.T) {
+	manager := NewManager("http://default.invalid:8080", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "bad", URL: "http://bad.invalid:8080", Enabled: true},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, RuntimeSuccesses: 3},
+	}}})
+	events := []ImageNodeRuntimeResult{}
+	manager.SetImageNodeResultCallback(func(event ImageNodeRuntimeResult) { events = append(events, event) })
+	manager.mu.Lock()
+	manager.imageGroups["images"].nodes[1].cooldownUntil = time.Now().Add(time.Hour)
+	manager.mu.Unlock()
+	for failures := 1; failures <= 3; failures++ {
+		lease := manager.acquireGroup("images")
+		if lease == nil || lease.NodeID != "bad" {
+			t.Fatalf("failure %d did not acquire target node: %#v", failures, lease)
+		}
+		lease.Release(true)
+		manager.mu.Lock()
+		if failures < 3 {
+			manager.imageGroups["images"].nodes[0].cooldownUntil = time.Time{}
+		}
+		manager.mu.Unlock()
+	}
+	if len(events) != 3 || !events[2].Removed || events[2].Failures != 3 {
+		t.Fatalf("unexpected runtime events: %#v", events)
+	}
+	manager.mu.Lock()
+	nodes := manager.imageGroups["images"].nodes
+	manager.mu.Unlock()
+	if len(nodes) != 1 || nodes[0].id != "stable" {
+		t.Fatalf("failed node remained in runtime group: %#v", nodes)
+	}
+}
+
+func TestAcquireStableImageRequiresThreeSuccessfulRequests(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "new", URL: "http://new.invalid:8080", Enabled: true, RuntimeSuccesses: 2},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, RuntimeSuccesses: 3},
+	}}})
+	lease := manager.AcquireStableImage(nil, "")
+	if lease == nil || lease.NodeID != "stable" {
+		t.Fatalf("expected stable node, got %#v", lease)
+	}
+	lease.Release(false)
+}
+
 func TestHTTPProxyTransport(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("target-ok")) }))
 	defer target.Close()

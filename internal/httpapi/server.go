@@ -91,6 +91,8 @@ func New(cfg config.Config) *Server {
 			item.Nodes = append(item.Nodes, proxyruntime.NodeConfig{
 				ID: node.ID, Name: node.Name, URL: node.URL, Enabled: node.Enabled,
 				ImageConcurrencyLimit: node.ImageConcurrencyLimit, LastStatus: node.LastStatus, LastError: node.LastError,
+				RuntimeFailures:  node.RuntimeFailures,
+				RuntimeSuccesses: node.RuntimeSuccesses,
 			})
 		}
 		groups = append(groups, item)
@@ -144,6 +146,7 @@ func New(cfg config.Config) *Server {
 		registerRuntime:    registerruntime.NewRuntime(),
 	}
 	server.openAIChat = provider.NewOpenAIChat(server.openAIImage)
+	proxyManager.SetImageNodeResultCallback(server.persistProxyGroupRuntimeResult)
 	server.accountPool.SetInvalidCallback(server.maybeAutoRemoveInvalidAccount)
 	server.loadEditableFileTasks()
 	server.chatProvider.SetProxyManager(proxyManager)

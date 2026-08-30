@@ -106,6 +106,7 @@ type Manager struct {
 	imageGroups    map[string]*imageGroup
 	imageGroupID   string
 	imageCursor    int
+	onImageResult  func(ImageNodeRuntimeResult)
 }
 
 type GroupConfig struct {
@@ -120,6 +121,8 @@ type NodeConfig struct {
 	ImageConcurrencyLimit int
 	LastStatus            int
 	LastError             string
+	RuntimeFailures       int
+	RuntimeSuccesses      int
 }
 
 type imageGroup struct {
@@ -128,9 +131,10 @@ type imageGroup struct {
 }
 
 type imageNode struct {
-	id, name, url             string
-	limit, inFlight, failures int
-	cooldownUntil             time.Time
+	id, name, url                        string
+	limit, inFlight, failures, successes int
+	cooldownUntil                        time.Time
+	evicted                              bool
 }
 
 type Lease struct {
@@ -147,6 +151,26 @@ type Lease struct {
 
 type EgressInfo struct {
 	Source, GroupID, GroupName, NodeID, NodeName string
+}
+
+type ImageNodeRuntimeResult struct {
+	GroupID, GroupName, NodeID, NodeName, URL string
+	Failures, Successes                       int
+	Removed                                   bool
+}
+
+const (
+	imageNodeFailureLimit  = 3
+	imageNodeStableSuccess = 3
+)
+
+func (m *Manager) SetImageNodeResultCallback(callback func(ImageNodeRuntimeResult)) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.onImageResult = callback
+	m.mu.Unlock()
 }
 
 func NewManager(single string, pool []string) *Manager {
@@ -182,7 +206,18 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 			if limit < 1 {
 				limit = 20
 			}
-			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit})
+			failures := node.RuntimeFailures
+			if failures < 0 {
+				failures = 0
+			}
+			if failures >= imageNodeFailureLimit {
+				continue
+			}
+			successes := node.RuntimeSuccesses
+			if successes < 0 {
+				successes = 0
+			}
+			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes})
 		}
 		next[id] = item
 	}
@@ -259,6 +294,46 @@ func (m *Manager) acquireGroup(groupID string) *Lease {
 	return nil
 }
 
+// AcquireStableImage selects a different group node that has already
+// completed several real image requests. It never falls back to direct mode
+// or the default proxy.
+func (m *Manager) AcquireStableImage(fields map[string]any, excludedURL string) *Lease {
+	if m == nil {
+		return nil
+	}
+	groupID := ""
+	for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+		value := strings.TrimSpace(stringValue(fields[key]))
+		if strings.HasPrefix(strings.ToLower(value), "group:") {
+			groupID = strings.TrimSpace(value[len("group:"):])
+			break
+		}
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if groupID == "" {
+		groupID = m.imageGroupID
+	}
+	group := m.imageGroups[groupID]
+	if group == nil || len(group.nodes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	excludedURL = normalizeURL(excludedURL)
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.evicted || node.url == excludedURL || node.successes < imageNodeStableSuccess || node.failures > 0 ||
+			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
+			continue
+		}
+		node.inFlight++
+		m.imageCursor = (index + 1) % len(group.nodes)
+		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+	}
+	return nil
+}
+
 func (l *Lease) Release(runtimeFailure bool) {
 	if l == nil {
 		return
@@ -267,17 +342,46 @@ func (l *Lease) Release(runtimeFailure bool) {
 		if l.manager == nil || l.node == nil {
 			return
 		}
+		var event *ImageNodeRuntimeResult
 		l.manager.mu.Lock()
 		if l.node.inFlight > 0 {
 			l.node.inFlight--
 		}
-		if runtimeFailure {
+		if runtimeFailure && !l.node.evicted {
 			l.node.failures++
 			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
 			l.node.cooldownUntil = time.Now().Add(cooldown)
-		} else {
+			removed := l.node.failures >= imageNodeFailureLimit
+			if removed {
+				l.node.evicted = true
+				if group := l.manager.imageGroups[l.GroupID]; group != nil {
+					nodes := make([]*imageNode, 0, len(group.nodes)-1)
+					for _, node := range group.nodes {
+						if node != l.node {
+							nodes = append(nodes, node)
+						}
+					}
+					group.nodes = nodes
+					if len(nodes) == 0 {
+						l.manager.imageCursor = 0
+					} else {
+						l.manager.imageCursor %= len(nodes)
+					}
+				}
+			}
+			event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Failures: l.node.failures, Successes: l.node.successes, Removed: removed}
+		} else if !runtimeFailure && !l.node.evicted {
+			hadFailures := l.node.failures > 0
 			l.node.failures = 0
 			l.node.cooldownUntil = time.Time{}
+			l.node.successes++
+			if hadFailures || l.node.successes == imageNodeStableSuccess || l.node.successes%25 == 0 {
+				event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Successes: l.node.successes}
+			}
+		}
+		callback := l.manager.onImageResult
+		if event != nil && callback != nil {
+			callback(*event)
 		}
 		l.manager.mu.Unlock()
 	})
