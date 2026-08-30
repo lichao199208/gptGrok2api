@@ -535,7 +535,7 @@
           variant="outline"
           @click="openReleasePage"
         >
-          打开发布页
+          打开 GitHub
         </Button>
         <Button
           size="xs"
@@ -558,7 +558,7 @@ import { versionApi } from '@/api/version'
 import { getAuthToken } from '@/api/client'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/auth'
-import { projectReleasePageUrl } from '@/config/project'
+import { projectRepositoryUrl } from '@/config/project'
 import { useModelCatalog } from '@/composables/useModelCatalog'
 import { Button, ValueSurface } from 'nanocat-ui'
 import ConfirmDialog from '@/components/ui/AppConfirmDialog.vue'
@@ -838,7 +838,7 @@ let stopRoutePendingBeforeEach: (() => void) | null = null
 let stopRoutePendingAfterEach: (() => void) | null = null
 let stopRoutePendingError: (() => void) | null = null
 const prefetchedRoutePaths = new Set<string>()
-const releasePageUrl = projectReleasePageUrl
+const releasePageUrl = ref(projectRepositoryUrl)
 const updateCheckingMessage = '正在从 GitHub 检查版本...'
 
 function currentVersionCandidate(value: string) {
@@ -963,7 +963,7 @@ function openUpdateDialog() {
 }
 
 function openReleasePage() {
-  window.open(releasePageUrl, '_blank', 'noopener,noreferrer')
+  window.open(releasePageUrl.value, '_blank', 'noopener,noreferrer')
 }
 
 async function checkForUpdates(showMessage = true) {
@@ -976,6 +976,7 @@ async function checkForUpdates(showMessage = true) {
     currentVersionTag.value = currentVersionCandidate(result.tag || result.version || '')
     if (!result.latest_tag && !result.latest_version) throw new Error('GitHub 未返回有效版本')
     latestVersionTag.value = normalizeVersionTag(result.latest_tag || result.latest_version)
+    releasePageUrl.value = result.release_url || projectRepositoryUrl
     const remoteReleases = parseChangelog(result.changelog || '')
     if (remoteReleases.length) {
       releaseEntries.value = remoteReleases
