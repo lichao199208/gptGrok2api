@@ -1,5 +1,12 @@
 <template>
   <div class="space-y-5">
+    <div v-if="dashboardDataReady" class="flex justify-end">
+      <Button size="sm" variant="outline" :disabled="dashboardLoading" @click="refreshDashboard">
+        <Icon icon="lucide:refresh-cw" class="h-3.5 w-3.5" :class="dashboardLoading ? 'animate-spin' : ''" />
+        {{ dashboardLoading ? '刷新中...' : '刷新' }}
+      </Button>
+    </div>
+
     <PageLoadingState
       v-if="!dashboardDataReady && dashboardLoading"
       title="正在加载概览"
@@ -85,6 +92,7 @@
 </template>
 
 <script setup lang="ts">
+import { Icon } from '@iconify/vue'
 import { Button, ChartCard, StatCard } from 'nanocat-ui'
 import PageLoadingState from '@/components/ai/PageLoadingState.vue'
 import StateBlock from '@/components/ai/StateBlock.vue'
@@ -99,6 +107,7 @@ const {
   dashboardLoading,
   dashboardLoadError,
   retryDashboard,
+  refreshDashboard,
   timeRangeHourlyRequests,
   timeRangeTrend,
   timeRangeSuccessRate,
