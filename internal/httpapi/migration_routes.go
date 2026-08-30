@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/url"
@@ -234,14 +235,26 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 	if refresh {
 		id = strings.TrimSuffix(id, "/subscription/refresh")
 	}
-	if refresh && r.Method == http.MethodPost {
-		result, err := s.refreshProxyGroupSubscription(id)
-		if err != nil {
-			writeError(w, http.StatusBadGateway, "proxy subscription refresh failed", "upstream_error")
+	if refresh {
+		if configKey != "proxy_groups" {
+			writeError(w, http.StatusNotFound, "proxy group not found", "not_found")
 			return
 		}
-		writeJSON(w, http.StatusOK, result)
-		return
+		if r.Method == http.MethodPost {
+			result, err := s.refreshProxyGroupSubscription(id)
+			if err != nil {
+				status, code := http.StatusBadGateway, "upstream_error"
+				if errors.Is(err, errProxyGroupNotFound) {
+					status, code = http.StatusNotFound, "not_found"
+				} else if errors.Is(err, errProxySubscriptionInvalid) {
+					status, code = http.StatusBadRequest, "invalid_request_error"
+				}
+				writeError(w, status, "proxy subscription refresh failed", code)
+				return
+			}
+			writeJSON(w, http.StatusOK, result)
+			return
+		}
 	}
 	if r.Method != http.MethodDelete {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
