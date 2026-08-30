@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -106,6 +107,7 @@ type Manager struct {
 	imageGroups    map[string]*imageGroup
 	imageGroupID   string
 	imageCursor    int
+	imageWake      chan struct{}
 	onImageResult  func(ImageNodeRuntimeResult)
 }
 
@@ -147,6 +149,7 @@ type Lease struct {
 	NodeID    string
 	NodeName  string
 	once      sync.Once
+	failed    atomic.Bool
 }
 
 type EgressInfo struct {
@@ -162,7 +165,26 @@ type ImageNodeRuntimeResult struct {
 const (
 	imageNodeFailureLimit  = 3
 	imageNodeStableSuccess = 3
+	defaultImageNodeLimit  = 3
 )
+
+type imageLeaseContextKey struct{}
+
+func WithImageLease(ctx context.Context, lease *Lease) context.Context {
+	if lease == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, imageLeaseContextKey{}, lease)
+}
+
+// MarkImageLeaseFailure remembers a transport failure even when a later
+// stage-level retry succeeds through a different proxy.
+func MarkImageLeaseFailure(ctx context.Context) {
+	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
+	if lease != nil {
+		lease.failed.Store(true)
+	}
+}
 
 func (m *Manager) SetImageNodeResultCallback(callback func(ImageNodeRuntimeResult)) {
 	if m == nil {
@@ -180,7 +202,24 @@ func NewManager(single string, pool []string) *Manager {
 			clean = append(clean, value)
 		}
 	}
-	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}}
+	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}, imageWake: make(chan struct{})}
+}
+
+func (m *Manager) SetDefault(single string, pool []string) {
+	if m == nil {
+		return
+	}
+	clean := make([]string, 0, len(pool))
+	for _, item := range pool {
+		if value := normalizeURL(item); value != "" {
+			clean = append(clean, value)
+		}
+	}
+	m.mu.Lock()
+	m.url = normalizeURL(single)
+	m.pool = clean
+	m.cursor = 0
+	m.mu.Unlock()
 }
 
 // ConfigureImageGroups enables request-scoped image egress selection. A
@@ -199,12 +238,12 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 		item := &imageGroup{id: id, name: strings.TrimSpace(group.Name), strategy: strings.TrimSpace(group.Strategy)}
 		for _, node := range group.Nodes {
 			proxyURL := normalizeURL(node.URL)
-			if !node.Enabled || proxyURL == "" || !probeAllowsRuntimeValidation(node.LastStatus, node.LastError) {
+			if !node.Enabled || proxyURL == "" || !imageProxyCompatible(proxyURL) || !probeAllowsRuntimeValidation(node.LastStatus, node.LastError) {
 				continue
 			}
 			limit := node.ImageConcurrencyLimit
 			if limit < 1 {
-				limit = 20
+				limit = defaultImageNodeLimit
 			}
 			failures := node.RuntimeFailures
 			if failures < 0 {
@@ -229,6 +268,7 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 	m.imageGroups = next
 	m.imageGroupID = groupID
 	m.imageCursor = 0
+	m.signalImageLocked()
 	m.mu.Unlock()
 }
 
@@ -257,7 +297,7 @@ func (m *Manager) AcquireImage(fields map[string]any) *Lease {
 				}
 				break
 			}
-			if normalized := normalizeURL(value); normalized != "" {
+			if normalized := normalizeURL(value); normalized != "" && imageProxyCompatible(normalized) {
 				return &Lease{URL: normalized, Source: "account"}
 			}
 		}
@@ -270,28 +310,170 @@ func (m *Manager) AcquireImage(fields map[string]any) *Lease {
 			return lease
 		}
 	}
-	return &Lease{URL: m.Resolve(nil, false), Source: "default"}
+	proxyURL, configured := m.resolveImageFallback()
+	if proxyURL == "" && configured {
+		return &Lease{Source: "unavailable"}
+	}
+	return &Lease{URL: proxyURL, Source: "default"}
+}
+
+// AcquireImageContext waits for configured proxy-group capacity instead of
+// overflowing concurrent requests onto one default proxy. It falls back only
+// when the requested group has no usable runtime nodes at all.
+func (m *Manager) AcquireImageContext(ctx context.Context, fields map[string]any) (*Lease, error) {
+	if m == nil {
+		return &Lease{}, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	groupID := ""
+	if fields != nil {
+		for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+			value := strings.TrimSpace(stringValue(fields[key]))
+			if value == "" {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(value), "group:") {
+				groupID = strings.TrimSpace(value[len("group:"):])
+				break
+			}
+			if normalized := normalizeURL(value); normalized != "" && imageProxyCompatible(normalized) {
+				return &Lease{URL: normalized, Source: "account"}, nil
+			}
+			break
+		}
+	}
+	if groupID == "" {
+		m.mu.Lock()
+		groupID = m.imageGroupID
+		m.mu.Unlock()
+	}
+	if groupID != "" {
+		lease, _, err := m.acquireGroupContext(ctx, groupID)
+		if err != nil {
+			return nil, err
+		}
+		if lease != nil {
+			return lease, nil
+		}
+	}
+	proxyURL, configured := m.resolveImageFallback()
+	if proxyURL == "" && configured {
+		return &Lease{Source: "unavailable"}, nil
+	}
+	return &Lease{URL: proxyURL, Source: "default"}, nil
+}
+
+func (m *Manager) acquireGroupContext(ctx context.Context, groupID string) (*Lease, bool, error) {
+	for {
+		m.mu.Lock()
+		lease, available, retryAt := m.acquireGroupLocked(groupID)
+		wake := m.imageWake
+		m.mu.Unlock()
+		if lease != nil || !available {
+			return lease, available, nil
+		}
+
+		var timer *time.Timer
+		var timerC <-chan time.Time
+		if !retryAt.IsZero() {
+			delay := time.Until(retryAt)
+			if delay < 0 {
+				delay = 0
+			}
+			timer = time.NewTimer(delay)
+			timerC = timer.C
+		}
+		select {
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return nil, true, ctx.Err()
+		case <-wake:
+			if timer != nil {
+				timer.Stop()
+			}
+		case <-timerC:
+		}
+	}
+}
+
+func (m *Manager) acquireGroupLocked(groupID string) (*Lease, bool, time.Time) {
+	group := m.imageGroups[groupID]
+	if group == nil || len(group.nodes) == 0 {
+		return nil, false, time.Time{}
+	}
+	now := time.Now()
+	var retryAt time.Time
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.inFlight >= node.limit {
+			continue
+		}
+		if now.Before(node.cooldownUntil) {
+			if retryAt.IsZero() || node.cooldownUntil.Before(retryAt) {
+				retryAt = node.cooldownUntil
+			}
+			continue
+		}
+		node.inFlight++
+		m.imageCursor = (index + 1) % len(group.nodes)
+		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}, true, time.Time{}
+	}
+	return nil, true, retryAt
+}
+
+func (m *Manager) resolveImageFallback() (string, bool) {
+	if m == nil {
+		return "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	configured := m.url != "" || len(m.pool) > 0
+	for offset := 0; offset < len(m.pool); offset++ {
+		index := (m.cursor + offset) % len(m.pool)
+		if imageProxyCompatible(m.pool[index]) {
+			m.cursor = (index + 1) % len(m.pool)
+			return m.pool[index], true
+		}
+	}
+	if imageProxyCompatible(m.url) {
+		return m.url, true
+	}
+	if m.upstreamRouter != nil {
+		if upstream := m.upstreamRouter.Resolve(); upstream != "" {
+			configured = true
+			if imageProxyCompatible(upstream) {
+				return upstream, true
+			}
+		}
+	}
+	return "", configured
+}
+
+// The authenticated ChatGPT image flow uses tls-client for browser TLS
+// fingerprinting. That client supports HTTP(S) and SOCKS5, but not SOCKS4.
+func imageProxyCompatible(proxyURL string) bool {
+	parsed, err := url.Parse(normalizeURL(proxyURL))
+	if err != nil || parsed.Host == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "socks5", "socks5h":
+		return true
+	default:
+		return false
+	}
 }
 
 func (m *Manager) acquireGroup(groupID string) *Lease {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	group := m.imageGroups[groupID]
-	if group == nil || len(group.nodes) == 0 {
-		return nil
-	}
-	now := time.Now()
-	for offset := 0; offset < len(group.nodes); offset++ {
-		index := (m.imageCursor + offset) % len(group.nodes)
-		node := group.nodes[index]
-		if node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
-			continue
-		}
-		node.inFlight++
-		m.imageCursor = (index + 1) % len(group.nodes)
-		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
-	}
-	return nil
+	lease, _, _ := m.acquireGroupLocked(groupID)
+	return lease
 }
 
 // AcquireStableImage selects a different group node that has already
@@ -347,6 +529,7 @@ func (l *Lease) Release(runtimeFailure bool) {
 		if l.node.inFlight > 0 {
 			l.node.inFlight--
 		}
+		runtimeFailure = runtimeFailure || l.failed.Load()
 		if runtimeFailure && !l.node.evicted {
 			l.node.failures++
 			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
@@ -380,11 +563,19 @@ func (l *Lease) Release(runtimeFailure bool) {
 			}
 		}
 		callback := l.manager.onImageResult
+		l.manager.signalImageLocked()
+		l.manager.mu.Unlock()
 		if event != nil && callback != nil {
 			callback(*event)
 		}
-		l.manager.mu.Unlock()
 	})
+}
+
+func (m *Manager) signalImageLocked() {
+	if m.imageWake != nil {
+		close(m.imageWake)
+	}
+	m.imageWake = make(chan struct{})
 }
 
 func (m *Manager) DescribeImageEgress(proxyURL string) EgressInfo {

@@ -65,6 +65,7 @@ type Server struct {
 	videoJobs          map[string]*videoJob
 	imageTaskMu        sync.RWMutex
 	imageTasks         map[string]*imageTaskState
+	imageSlots         chan struct{}
 	fileTaskMu         sync.RWMutex
 	fileTasks          map[string]*editableFileTaskState
 	schedulerMu        sync.Mutex
@@ -84,19 +85,7 @@ type Server struct {
 func New(cfg config.Config) *Server {
 	repository := store.New(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath)
 	proxyManager := proxyruntime.NewManager(cfg.ProxyURL, cfg.ProxyPool)
-	groups := make([]proxyruntime.GroupConfig, 0, len(cfg.ProxyGroups))
-	for _, group := range cfg.ProxyGroups {
-		item := proxyruntime.GroupConfig{ID: group.ID, Name: group.Name, Enabled: group.Enabled, Strategy: group.Strategy}
-		for _, node := range group.Nodes {
-			item.Nodes = append(item.Nodes, proxyruntime.NodeConfig{
-				ID: node.ID, Name: node.Name, URL: node.URL, Enabled: node.Enabled,
-				ImageConcurrencyLimit: node.ImageConcurrencyLimit, LastStatus: node.LastStatus, LastError: node.LastError,
-				RuntimeFailures:  node.RuntimeFailures,
-				RuntimeSuccesses: node.RuntimeSuccesses,
-			})
-		}
-		groups = append(groups, item)
-	}
+	groups := runtimeProxyGroups(cfg.ProxyGroups)
 	proxyManager.ConfigureImageGroups(cfg.FallbackProxy, groups)
 	proxyManager.SetResource(cfg.ResourceProxyURL, cfg.ResourceProxyPool)
 	proxyManager.SetUpstreamsFile(cfg.ProxyUpstreamsFile)
@@ -129,6 +118,7 @@ func New(cfg config.Config) *Server {
 		proxyManager:       proxyManager,
 		videoJobs:          map[string]*videoJob{},
 		imageTasks:         map[string]*imageTaskState{},
+		imageSlots:         makeImageSlots(cfg.ImageMaxConcurrency),
 		fileTasks:          map[string]*editableFileTaskState{},
 		schedulerLeases:    map[string]map[string]any{},
 		external:           newExternalManager(cfg.DataDir),
@@ -169,6 +159,80 @@ func New(cfg config.Config) *Server {
 		go server.openAISurvivalScheduler()
 	}
 	return server
+}
+
+func runtimeProxyGroups(groups []config.ProxyGroup) []proxyruntime.GroupConfig {
+	result := make([]proxyruntime.GroupConfig, 0, len(groups))
+	for _, group := range groups {
+		item := proxyruntime.GroupConfig{ID: group.ID, Name: group.Name, Enabled: group.Enabled, Strategy: group.Strategy}
+		for _, node := range group.Nodes {
+			item.Nodes = append(item.Nodes, proxyruntime.NodeConfig{
+				ID: node.ID, Name: node.Name, URL: node.URL, Enabled: node.Enabled,
+				ImageConcurrencyLimit: node.ImageConcurrencyLimit, LastStatus: node.LastStatus, LastError: node.LastError,
+				RuntimeFailures: node.RuntimeFailures, RuntimeSuccesses: node.RuntimeSuccesses,
+			})
+		}
+		result = append(result, item)
+	}
+	return result
+}
+
+func (s *Server) refreshProxyRuntime() error {
+	if s == nil || s.store == nil || s.proxyManager == nil {
+		return nil
+	}
+	values, err := s.store.Config()
+	if err != nil {
+		return err
+	}
+	runtimeConfig := config.Config{}
+	config.ApplyProxyConfig(&runtimeConfig, values)
+	// Environment variables retain their normal precedence over persisted UI
+	// settings, matching config.Load at process startup.
+	if strings.TrimSpace(os.Getenv("GO_PROXY_URL")) != "" {
+		runtimeConfig.ProxyURL = s.cfg.ProxyURL
+	}
+	if strings.TrimSpace(os.Getenv("GO_PROXY_POOL")) != "" {
+		runtimeConfig.ProxyPool = s.cfg.ProxyPool
+	}
+	if strings.TrimSpace(os.Getenv("GO_RESOURCE_PROXY_URL")) != "" {
+		runtimeConfig.ResourceProxyURL = s.cfg.ResourceProxyURL
+	}
+	if strings.TrimSpace(os.Getenv("GO_RESOURCE_PROXY_POOL")) != "" {
+		runtimeConfig.ResourceProxyPool = s.cfg.ResourceProxyPool
+	}
+	s.proxyManager.SetDefault(runtimeConfig.ProxyURL, runtimeConfig.ProxyPool)
+	s.proxyManager.SetResource(runtimeConfig.ResourceProxyURL, runtimeConfig.ResourceProxyPool)
+	s.proxyManager.ConfigureImageGroups(runtimeConfig.FallbackProxy, runtimeProxyGroups(runtimeConfig.ProxyGroups))
+	return nil
+}
+
+func makeImageSlots(limit int) chan struct{} {
+	if limit <= 0 {
+		return nil
+	}
+	return make(chan struct{}, limit)
+}
+
+// acquireImageSlot bounds the number of expensive browser-image flows in the
+// process. Waiting here is real handler queue time, unlike provider stages that
+// may overlap later in the request.
+func (s *Server) acquireImageSlot(ctx context.Context, r *http.Request) (func(), error) {
+	if s == nil || s.imageSlots == nil {
+		return func() {}, nil
+	}
+	started := time.Now()
+	select {
+	case s.imageSlots <- struct{}{}:
+		waited := time.Since(started)
+		if r != nil {
+			s.stageRequestMonitor(r, "handler_queue_done", 10, map[string]any{"handler_queue_ms": waited.Milliseconds()})
+		}
+		var once sync.Once
+		return func() { once.Do(func() { <-s.imageSlots }) }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 // maybeAutoRemoveInvalidAccount removes browser/session accounts only after a
@@ -390,6 +454,7 @@ func (s *Server) withRequestMonitor(w http.ResponseWriter, r *http.Request, next
 	}
 	s.monitor.enrich(id, meta)
 	s.monitor.update(id, "handler_started", 10, "")
+	s.monitor.enrich(id, map[string]any{"metrics": map[string]any{"handler_queue_ms": 0}})
 	capture := &statusCaptureWriter{ResponseWriter: w}
 	next.ServeHTTP(capture, r.WithContext(context.WithValue(r.Context(), monitorCallIDKey{}, id)))
 	status := capture.status
@@ -1739,6 +1804,10 @@ func (s *Server) settings(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 			return
 		}
+		if err := s.refreshProxyRuntime(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]any{"runtime": "go", "config": current})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
@@ -1762,15 +1831,45 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 	r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	raw, err := io.ReadAll(r.Body)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
+		var maxBytesError *http.MaxBytesError
+		if errors.As(err, &maxBytesError) {
+			writeError(w, http.StatusRequestEntityTooLarge, "JSON body exceeds 64MB limit", "invalid_request_error")
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid JSON body: request body could not be read", "invalid_request_error")
+		}
 		return false
 	}
 	decoded, ok := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
-	if !ok || json.Unmarshal(decoded, target) != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body", "invalid_request_error")
+	if !ok {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: body is empty, truncated, or has invalid content encoding", "invalid_request_error")
+		return false
+	}
+	if err := json.Unmarshal(decoded, target); err != nil {
+		writeError(w, http.StatusBadRequest, describeJSONBodyError(err), "invalid_request_error")
 		return false
 	}
 	return true
+}
+
+func describeJSONBodyError(err error) string {
+	if err == nil {
+		return "invalid JSON body"
+	}
+	var syntaxError *json.SyntaxError
+	if errors.As(err, &syntaxError) {
+		if strings.Contains(strings.ToLower(err.Error()), "unexpected end") {
+			return fmt.Sprintf("invalid JSON body: request body is truncated near byte %d", syntaxError.Offset)
+		}
+		return fmt.Sprintf("invalid JSON body: malformed JSON near byte %d", syntaxError.Offset)
+	}
+	var typeError *json.UnmarshalTypeError
+	if errors.As(err, &typeError) {
+		return fmt.Sprintf("invalid JSON body: field %q has the wrong value type", typeError.Field)
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) || strings.Contains(strings.ToLower(err.Error()), "unexpected end") {
+		return "invalid JSON body: request body is truncated"
+	}
+	return "invalid JSON body: malformed JSON"
 }
 
 // normalizeJSONBytes accepts the encodings emitted by common API gateways.

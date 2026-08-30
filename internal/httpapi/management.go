@@ -417,6 +417,10 @@ func (s *Server) proxyGroups(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error(), "server_error")
 		return
 	}
+	if err := s.refreshProxyRuntime(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
 	writeJSON(w, 200, map[string]any{"group": request, "groups": mapList(updated["proxy_groups"])})
 }
 

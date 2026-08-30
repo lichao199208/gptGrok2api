@@ -28,7 +28,7 @@ export type ProxyGroupForm = {
 
 export const FORM_TEST_KEY = '__form__'
 
-const DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY = 30
+const DEFAULT_PROXY_NODE_IMAGE_CONCURRENCY = 3
 
 function createGeneratedId(prefix: string) {
   let suffix = ''

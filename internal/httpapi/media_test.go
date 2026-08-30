@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"mime/multipart"
 	"net/http"
@@ -69,6 +70,30 @@ func TestParseImageEditRequestAcceptsJSONDataURL(t *testing.T) {
 	}
 	if parsed.Inputs[0].MIME != "image/png" || len(parsed.Inputs[0].Data) != len(tinyPNG) {
 		t.Fatalf("unexpected parsed image: %#v", parsed.Inputs[0])
+	}
+}
+
+func TestParseImageEditRequestReportsTruncatedJSON(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{"model":"gpt-image-2","prompt":`))
+	request.Header.Set("Content-Type", "application/json")
+
+	_, err := server.parseImageEditRequest(request)
+	if err == nil || !strings.Contains(err.Error(), "truncated") {
+		t.Fatalf("expected a truncated JSON diagnostic, got %v", err)
+	}
+}
+
+func TestParseImageEditRequestRejectsOversizedJSON(t *testing.T) {
+	server := &Server{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/edits", strings.NewReader(`{}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.ContentLength = maxJSONBodyBytes + 1
+
+	_, err := server.parseImageEditRequest(request)
+	var parseError imageEditParseError
+	if !errors.As(err, &parseError) || parseError.Status != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected a 413 parse error, got %#v", err)
 	}
 }
 
@@ -149,6 +174,13 @@ func TestUpstreamStatusUnwrapsWrappedErrors(t *testing.T) {
 	err := fmt.Errorf("do request failed /v1/chat/completions: %w", &protocol.UpstreamError{Status: http.StatusTooManyRequests, Message: "throttled"})
 	if status := upstreamStatus(err); status != http.StatusTooManyRequests {
 		t.Fatalf("expected wrapped upstream status 429, got %d", status)
+	}
+}
+
+func TestUpstreamStatusMapsDeadlineToGatewayTimeout(t *testing.T) {
+	err := fmt.Errorf("image polling failed: %w", context.DeadlineExceeded)
+	if status := upstreamStatus(err); status != http.StatusGatewayTimeout {
+		t.Fatalf("expected deadline status 504, got %d", status)
 	}
 }
 

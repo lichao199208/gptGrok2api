@@ -122,3 +122,44 @@ func TestRotateAccountTokensClearsStaleErrorMarkers(t *testing.T) {
 		}
 	}
 }
+
+func TestAccountSnapshotUsesCopyOnWriteAndFlushesRuntimeUpdates(t *testing.T) {
+	root := t.TempDir()
+	accountPath := filepath.Join(root, "accounts.json")
+	repository := New(accountPath, filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "status": "正常", "enabled": true}}); err != nil {
+		t.Fatal(err)
+	}
+
+	before, beforeRevision, err := repository.AccountSnapshot()
+	if err != nil || len(before) != 1 {
+		t.Fatalf("unexpected initial snapshot: %#v %v", before, err)
+	}
+	if _, err := repository.UpdateAccountRuntime("one", map[string]any{"last_error_status": 502, "last_error_message": "temporary"}); err != nil {
+		t.Fatal(err)
+	}
+	after, afterRevision, err := repository.AccountSnapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRevision <= beforeRevision || after[0]["last_error_message"] != "temporary" {
+		t.Fatalf("runtime update did not advance snapshot: before=%d after=%d item=%#v", beforeRevision, afterRevision, after[0])
+	}
+	if before[0]["last_error_message"] != nil {
+		t.Fatalf("previous snapshot was mutated in place: %#v", before[0])
+	}
+	if err := repository.FlushAccounts(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(accountPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var persisted []map[string]any
+	if err := json.Unmarshal(raw, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if len(persisted) != 1 || persisted[0]["last_error_message"] != "temporary" {
+		t.Fatalf("runtime update was not flushed: %#v", persisted)
+	}
+}

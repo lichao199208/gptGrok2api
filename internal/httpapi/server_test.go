@@ -1,12 +1,17 @@
 package httpapi
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/config"
+	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
+	"github.com/auucoder/gptgrok2api-go/internal/store"
 )
 
 func testConfig() config.Config {
@@ -19,6 +24,78 @@ func testConfig() config.Config {
 		APIKey:       "api-secret",
 		AdminKey:     "admin-secret",
 		Version:      "test",
+	}
+}
+
+func TestImageConcurrencySlotWaitsForRelease(t *testing.T) {
+	server := &Server{imageSlots: makeImageSlots(1)}
+	firstRelease, err := server.acquireImageSlot(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	acquired := make(chan func(), 1)
+	errorsOut := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		release, acquireErr := server.acquireImageSlot(ctx, nil)
+		if acquireErr != nil {
+			errorsOut <- acquireErr
+			return
+		}
+		acquired <- release
+	}()
+	select {
+	case release := <-acquired:
+		release()
+		t.Fatal("second task bypassed the global image limit")
+	case err := <-errorsOut:
+		t.Fatalf("second task failed instead of waiting: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	firstRelease()
+	select {
+	case release := <-acquired:
+		release()
+	case err := <-errorsOut:
+		t.Fatalf("waiting task failed after release: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("waiting task was not woken after slot release")
+	}
+}
+
+func TestRefreshProxyRuntimeAppliesPersistedFallbackGroup(t *testing.T) {
+	for _, key := range []string{"GO_PROXY_URL", "GO_PROXY_POOL", "GO_RESOURCE_PROXY_URL", "GO_RESOURCE_PROXY_POOL"} {
+		t.Setenv(key, "")
+	}
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.ReplaceConfig(map[string]any{
+		"proxy":          "http://old-default.invalid:8080",
+		"fallback_proxy": "group:images",
+		"proxy_groups": []any{map[string]any{
+			"id": "images", "enabled": true,
+			"nodes": []any{map[string]any{
+				"id": "node-one", "url": "socks5://group.invalid:1080", "enabled": true,
+				"last_status": 403, "image_concurrency_limit": 1,
+			}},
+		}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := &Server{store: repository, proxyManager: proxyruntime.NewManager("http://stale.invalid:8080", nil)}
+	if err := server.refreshProxyRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	lease, err := server.proxyManager.AcquireImageContext(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release(false)
+	if lease.Source != "group" || lease.GroupID != "images" || lease.NodeID != "node-one" {
+		t.Fatalf("persisted proxy group was not applied: %#v", lease)
 	}
 }
 

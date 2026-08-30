@@ -467,7 +467,10 @@ export function buildDiagnosticGroups(
   const p95 = summary?.metric_p95 || {}
   const bottleneckValue = Number(summary?.bottleneck?.value_ms || 0)
   const localBusy = summary?.slow_counts?.local_reject_or_busy ?? 0
-  const entryAccountTotal = sumMetricFromMap(p95, ENTRY_ACCOUNT_METRIC_KEYS)
+  // These are independent P95 values and may come from different requests.
+  // Taking the maximum identifies the slowest resource stage without adding
+  // overlapping percentiles into a duration that no request actually saw.
+  const entryAccountTotal = maxMetricFromMap(p95, ENTRY_ACCOUNT_METRIC_KEYS)
   const httpConnectTotal = sumMetricFromMap(p95, ['http_dns_ms', 'http_tcp_ms', 'http_tls_ms'])
   const currentEntryQueueText = entryQueueText(summary)
 
@@ -497,7 +500,7 @@ export function buildDiagnosticGroups(
         { key: 'account_wait_ms', label: '账号等待', value: formatMs(p95.account_wait_ms), meta: '账号池筛选', valueClass: 'text-cyan-600 dark:text-cyan-400' },
         { key: 'egress_wait_ms', label: '出口等待', value: formatMs(p95.egress_wait_ms), meta: activeEgressMeta(summary), valueClass: 'text-teal-600 dark:text-teal-400' },
         { key: 'egress_acquire_ms', label: '出口租约', value: formatMs(p95.egress_acquire_ms), meta: '代理节点并发', valueClass: 'text-teal-600 dark:text-teal-400' },
-        { key: 'entry_account_total_ms', label: '入口账号合计', value: formatMs(entryAccountTotal), meta: '入口 + 首包 + 账号 + 出口', valueClass: 'text-sky-600 dark:text-sky-400' },
+        { key: 'entry_account_total_ms', label: '入口资源 P95', value: formatMs(entryAccountTotal), meta: '入口 / 首包 / 账号 / 出口的最大阶段', valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'entry_p95', label: '入口排队 P95', value: currentEntryQueueText, meta: `线程容量 ${threadTokens} · 慢 ${summary?.slow_counts?.handler_queue ?? 0}`, valueClass: 'text-sky-600 dark:text-sky-400' },
         { key: 'local_busy', label: '本地拒绝/繁忙', value: `${localBusy}`, meta: '无号 / 并发 / 策略', valueClass: 'text-foreground' },
       ],

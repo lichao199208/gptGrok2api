@@ -24,9 +24,9 @@ type Account struct {
 }
 
 type Lease struct {
-	Account  Account
-	pool     *Pool
-	released bool
+	Account Account
+	pool    *Pool
+	once    sync.Once
 }
 
 type Pool struct {
@@ -37,6 +37,9 @@ type Pool struct {
 	inflight   map[string]int
 	cooldowns  map[string]time.Time
 	failures   map[string]int
+	wake       chan struct{}
+	accounts   []Account
+	revision   uint64
 }
 
 // SetInvalidCallback registers a callback for definitive credential failures.
@@ -54,6 +57,7 @@ func New(repository *store.Store) *Pool {
 		inflight:   map[string]int{},
 		cooldowns:  map[string]time.Time{},
 		failures:   map[string]int{},
+		wake:       make(chan struct{}),
 	}
 }
 
@@ -65,66 +69,93 @@ func (p *Pool) Reserve(ctx context.Context, pools []string, excluded map[string]
 // provider predicate. This keeps OpenAI JWT accounts separate from Grok SSO
 // accounts even when both are stored in the same account file.
 func (p *Pool) ReserveMatching(ctx context.Context, pools []string, excluded map[string]bool, match func(Account) bool) (*Lease, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	items, err := p.repository.AccountList()
-	if err != nil {
-		return nil, fmt.Errorf("load accounts: %w", err)
-	}
+	return p.ReserveMatchingLimit(ctx, pools, excluded, match, 0)
+}
 
-	now := time.Now()
-	p.mu.Lock()
-	defer p.mu.Unlock()
+// ReserveMatchingLimit waits when every matching account is at its concurrency
+// limit. A non-positive limit preserves the legacy least-busy behavior.
+func (p *Pool) ReserveMatchingLimit(ctx context.Context, pools []string, excluded map[string]bool, match func(Account) bool, maxInflight int) (*Lease, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		items, revision, err := p.repository.AccountSnapshot()
+		if err != nil {
+			return nil, fmt.Errorf("load accounts: %w", err)
+		}
 
-	candidates := make([]Account, 0, len(items))
-	for _, item := range items {
-		account, ok := normalize(item)
-		if !ok || excluded[account.Token] || (match != nil && !match(account)) || !p.available(account, pools, now) {
-			continue
+		now := time.Now()
+		p.mu.Lock()
+		if p.revision != revision {
+			p.accounts = normalizeAccounts(items)
+			p.revision = revision
 		}
-		candidates = append(candidates, account)
-	}
-	if len(candidates) == 0 {
-		return nil, ErrUnavailable
-	}
+		capacityBlocked := false
+		minInflight := int(^uint(0) >> 1)
+		var selected Account
+		found := false
+		start := 0
+		if len(p.accounts) > 0 {
+			start = int(p.next % uint64(len(p.accounts)))
+		}
+		for offset := 0; offset < len(p.accounts); offset++ {
+			account := p.accounts[(start+offset)%len(p.accounts)]
+			if excluded[account.Token] || (match != nil && !match(account)) || !p.available(account, pools, now) {
+				continue
+			}
+			inflight := p.inflight[account.Token]
+			if maxInflight > 0 && inflight >= maxInflight {
+				capacityBlocked = true
+				continue
+			}
+			if inflight < minInflight {
+				minInflight = inflight
+				selected = account
+				found = true
+			}
+		}
+		if !found {
+			wake := p.wake
+			p.mu.Unlock()
+			if !capacityBlocked {
+				return nil, ErrUnavailable
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-wake:
+				continue
+			}
+		}
 
-	// Prefer the least busy account, then use a rotating tie-breaker.
-	minInflight := int(^uint(0) >> 1)
-	for _, account := range candidates {
-		if count := p.inflight[account.Token]; count < minInflight {
-			minInflight = count
-		}
+		// Starting at a rotating offset preserves tie fairness without building
+		// a temporary candidate list for every request.
+		p.next++
+		p.inflight[selected.Token]++
+		p.mu.Unlock()
+		return &Lease{Account: selected, pool: p}, nil
 	}
-	ready := candidates[:0]
-	for _, account := range candidates {
-		if p.inflight[account.Token] == minInflight {
-			ready = append(ready, account)
-		}
-	}
-	if len(ready) > 1 {
-		start := int(p.next % uint64(len(ready)))
-		rotated := append(ready[start:], ready[:start]...)
-		ready = rotated
-	}
-	selected := ready[0]
-	p.next++
-	p.inflight[selected.Token]++
-	return &Lease{Account: selected, pool: p}, nil
 }
 
 func (p *Pool) Release(lease *Lease) {
-	if lease == nil || lease.pool != p || lease.released {
+	if lease == nil || lease.pool != p {
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	lease.released = true
-	if p.inflight[lease.Account.Token] <= 1 {
-		delete(p.inflight, lease.Account.Token)
-	} else {
-		p.inflight[lease.Account.Token]--
-	}
+	lease.once.Do(func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		if p.inflight[lease.Account.Token] <= 1 {
+			delete(p.inflight, lease.Account.Token)
+		} else {
+			p.inflight[lease.Account.Token]--
+		}
+		p.signalLocked()
+	})
+}
+
+func (p *Pool) signalLocked() {
+	close(p.wake)
+	p.wake = make(chan struct{})
 }
 
 func (p *Pool) Feedback(account Account, status int, err error) {
@@ -151,7 +182,7 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 			if isRequestMarkedAbnormal(account.Fields) {
 				updates["status"] = "正常"
 			}
-			_, _, _ = p.repository.UpdateAccount(account.Token, updates)
+			_, _ = p.repository.UpdateAccountRuntime(account.Token, updates)
 		}
 		return
 	}
@@ -185,7 +216,7 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 	if err != nil {
 		updates["last_error_message"] = truncate(err.Error(), 300)
 	}
-	_, _, _ = p.repository.UpdateAccount(account.Token, updates)
+	_, _ = p.repository.UpdateAccountRuntime(account.Token, updates)
 	if status == 401 {
 		p.mu.Lock()
 		callback := p.onInvalid
@@ -302,6 +333,16 @@ func normalize(item map[string]any) (Account, bool) {
 	return Account{Token: token, Pool: pool, Fields: item}, true
 }
 
+func normalizeAccounts(items []map[string]any) []Account {
+	accounts := make([]Account, 0, len(items))
+	for _, item := range items {
+		if account, ok := normalize(item); ok {
+			accounts = append(accounts, account)
+		}
+	}
+	return accounts
+}
+
 func poolAllowed(accountPool string, pools []string) bool {
 	for _, pool := range pools {
 		if strings.EqualFold(pool, accountPool) {
@@ -323,6 +364,9 @@ func firstString(item map[string]any, keys ...string) string {
 func stringValue(value any) string {
 	if value == nil {
 		return ""
+	}
+	if typed, ok := value.(string); ok {
+		return strings.TrimSpace(typed)
 	}
 	return strings.TrimSpace(fmt.Sprint(value))
 }

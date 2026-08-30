@@ -58,6 +58,53 @@ func TestImageGroupLeasesIncludeHTTP403AndKeepRequestAffinity(t *testing.T) {
 	third.Release(false)
 }
 
+func TestAcquireImageContextWaitsForGroupCapacity(t *testing.T) {
+	manager := NewManager("http://default.invalid:8080", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{
+		ID: "images", Enabled: true, Nodes: []NodeConfig{{
+			ID: "group-node", URL: "http://group.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1,
+		}},
+	}})
+	first, err := manager.AcquireImageContext(context.Background(), nil)
+	if err != nil || first.Source != "group" {
+		t.Fatalf("first group lease failed: lease=%#v err=%v", first, err)
+	}
+
+	acquired := make(chan *Lease, 1)
+	errorsOut := make(chan error, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	go func() {
+		lease, acquireErr := manager.AcquireImageContext(ctx, nil)
+		if acquireErr != nil {
+			errorsOut <- acquireErr
+			return
+		}
+		acquired <- lease
+	}()
+	select {
+	case lease := <-acquired:
+		lease.Release(false)
+		t.Fatal("second request bypassed group capacity")
+	case err := <-errorsOut:
+		t.Fatalf("second request failed instead of waiting: %v", err)
+	case <-time.After(40 * time.Millisecond):
+	}
+
+	first.Release(false)
+	select {
+	case lease := <-acquired:
+		defer lease.Release(false)
+		if lease.Source != "group" || lease.NodeID != "group-node" {
+			t.Fatalf("waiting request fell back to the default proxy: %#v", lease)
+		}
+	case err := <-errorsOut:
+		t.Fatalf("waiting request failed after release: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("waiting request was not woken after proxy release")
+	}
+}
+
 func TestImageGroupRuntimeFailureCoolsNodeAndSwitches(t *testing.T) {
 	manager := NewManager("http://default.invalid:8080", nil)
 	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
@@ -118,6 +165,27 @@ func TestAcquireStableImageRequiresThreeSuccessfulRequests(t *testing.T) {
 		t.Fatalf("expected stable node, got %#v", lease)
 	}
 	lease.Release(false)
+}
+
+func TestImageGroupSkipsSOCKS4ForBrowserImageFlow(t *testing.T) {
+	manager := NewManager("socks4://default.invalid:1080", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "socks4", URL: "socks4://legacy.invalid:1080", Enabled: true},
+		{ID: "socks5", URL: "socks5://supported.invalid:1080", Enabled: true},
+	}}})
+	lease := manager.AcquireImage(nil)
+	defer lease.Release(false)
+	if lease.NodeID != "socks5" || lease.URL != "socks5://supported.invalid:1080" {
+		t.Fatalf("SOCKS4 entered browser image runtime: %#v", lease)
+	}
+}
+
+func TestImageProxyDoesNotFallBackToDirectWhenOnlySOCKS4IsConfigured(t *testing.T) {
+	manager := NewManager("socks4://default.invalid:1080", nil)
+	lease := manager.AcquireImage(nil)
+	if lease.Source != "unavailable" || lease.URL != "" {
+		t.Fatalf("expected an explicit unavailable lease, got %#v", lease)
+	}
 }
 
 func TestHTTPProxyTransport(t *testing.T) {

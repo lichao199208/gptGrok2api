@@ -83,6 +83,26 @@ func TestRequestMonitorEnrichmentUpdatesLiveEgressAndAccount(t *testing.T) {
 	}
 }
 
+func TestRequestMonitorDoesNotCountHandlerExecutionAsQueueTime(t *testing.T) {
+	server := &Server{monitor: newRuntimeMonitor()}
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"test"}`))
+	response := httptest.NewRecorder()
+	server.withRequestMonitor(response, request, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		time.Sleep(20 * time.Millisecond)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}))
+	records := server.monitor.completed
+	if len(records) != 1 {
+		t.Fatalf("expected one completed monitor record, got %d", len(records))
+	}
+	if queue := monitorNumber(records[0].Metrics["handler_queue_ms"]); queue != 0 {
+		t.Fatalf("handler execution was mislabeled as queue time: %vms", queue)
+	}
+	if records[0].Duration < 20 {
+		t.Fatalf("test handler duration was not captured: %dms", records[0].Duration)
+	}
+}
+
 func TestMonitorSnapshotWithHistorySummary(t *testing.T) {
 	root := t.TempDir()
 	cfg := adminTestConfig(root)

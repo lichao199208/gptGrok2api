@@ -181,7 +181,9 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_AUTH_KEYS_PATH` | `data/auth_keys.json` | 用户密钥文件 |
 | `GO_REQUEST_TIMEOUT_SECONDS` | `180` | 上游超时，最大 300 秒 |
 | `GO_CHAT_MAX_RETRIES` | `2` | 聊天/图片最大重试次数 |
-| `GO_CHAT_RETRY_CODES` | `401,403,429,500,502,503` | 触发换号重试的上游 HTTP 状态码 |
+| `GO_IMAGE_ACCOUNT_CONCURRENCY` | `1` | 单个 ChatGPT 账号同时执行的图片任务数（1-4） |
+| `GO_IMAGE_MAX_CONCURRENCY` | `128` | 单进程同时执行的 ChatGPT 图片任务总数（1-1024） |
+| `GO_CHAT_RETRY_CODES` | `401,403,429,500,502,503,504` | 触发换号重试的上游 HTTP 状态码 |
 | `GO_QUEUE_BACKEND` | `redis` | `redis` 或 `json` |
 | `GO_REDIS_ADDR` | `redis:6379` | Redis 地址 |
 | `GO_PROXY_URL` | 空 | 默认代理 |

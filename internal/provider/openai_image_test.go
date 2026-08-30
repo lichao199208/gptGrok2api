@@ -79,6 +79,156 @@ func TestOpenAIImageUploadDoesNotRetryNonRetryableResponse(t *testing.T) {
 	}
 }
 
+func TestOpenAIImageUploadWithoutStableProxyDoesNotRepeatBadRoute(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		return nil, context.DeadlineExceeded
+	})}
+	manager := proxyruntime.NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []proxyruntime.GroupConfig{{ID: "images", Enabled: true, Nodes: []proxyruntime.NodeConfig{
+		{ID: "current", URL: "http://current.invalid:8080", Enabled: true},
+	}}})
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, manager, time.Second)
+	err := imageClient.uploadInputBlob(
+		proxyruntime.WithURL(context.Background(), "http://current.invalid:8080"),
+		accounts.Account{},
+		"https://storage.invalid/upload",
+		[]byte("image"),
+		nil,
+	)
+	if err == nil || attempts != 1 {
+		t.Fatalf("expected one attempt without a distinct stable route, attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestOpenAIImageSuccessfulUploadDoesNotReserveUnusedStableProxy(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})}
+	manager := proxyruntime.NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []proxyruntime.GroupConfig{{ID: "images", Enabled: true, Nodes: []proxyruntime.NodeConfig{
+		{ID: "current", URL: "http://current.invalid:8080", Enabled: true},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 3},
+	}}})
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, manager, time.Second)
+	err := imageClient.uploadInputBlob(
+		proxyruntime.WithURL(context.Background(), "http://current.invalid:8080"),
+		accounts.Account{},
+		"https://storage.invalid/upload",
+		[]byte("image"),
+		nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stable := manager.AcquireStableImage(nil, "http://current.invalid:8080")
+	if stable == nil || stable.NodeID != "stable" {
+		t.Fatalf("successful primary upload leaked the unused stable lease: %#v", stable)
+	}
+	stable.Release(false)
+}
+
+func TestOpenAIImageDownloadRetriesThroughStableProxyAndCoolsPrimary(t *testing.T) {
+	attempts := []string{}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		proxyURL := proxyruntime.URLFromContext(request.Context())
+		attempts = append(attempts, proxyURL)
+		if proxyURL == "http://current.invalid:8080" {
+			return nil, context.DeadlineExceeded
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"image/png"}},
+			Body:       io.NopCloser(bytes.NewReader(onePixelPNG(t))),
+			Request:    request,
+		}, nil
+	})}
+	manager := proxyruntime.NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []proxyruntime.GroupConfig{{ID: "images", Enabled: true, Nodes: []proxyruntime.NodeConfig{
+		{ID: "current", URL: "http://current.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 3},
+	}}})
+	primary := manager.AcquireImage(nil)
+	ctx := proxyruntime.WithImageLease(proxyruntime.WithURL(context.Background(), primary.URL), primary)
+	imageClient := NewOpenAIImage("https://example.invalid", client, manager, time.Second)
+	raw, mime, err := imageClient.downloadImageRefWithRetry(ctx, accounts.Account{}, "conversation", "file_test_download")
+	if err != nil || len(raw) == 0 || mime != "image/png" {
+		t.Fatalf("stable download retry failed: mime=%q bytes=%d err=%v", mime, len(raw), err)
+	}
+	primary.Release(false)
+	if len(attempts) != 2 || attempts[0] != "http://current.invalid:8080" || attempts[1] != "http://stable.invalid:8080" {
+		t.Fatalf("unexpected download proxy attempts: %#v", attempts)
+	}
+	next := manager.AcquireImage(nil)
+	defer next.Release(false)
+	if next.NodeID != "stable" {
+		t.Fatalf("failed primary proxy was not cooled after stable retry: %#v", next)
+	}
+}
+
+func TestOpenAIImagePrepareRetriesUnexpectedEOFWithStableProxy(t *testing.T) {
+	attempts := []string{}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts = append(attempts, proxyruntime.URLFromContext(request.Context()))
+		if len(attempts) == 1 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"file_id":"file_test","upload_url":"https://storage.invalid/upload"}`)),
+			Request:    request,
+		}, nil
+	})}
+	manager := proxyruntime.NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []proxyruntime.GroupConfig{{ID: "images", Enabled: true, Nodes: []proxyruntime.NodeConfig{
+		{ID: "current", URL: "http://current.invalid:8080", Enabled: true},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, RuntimeSuccesses: 3},
+	}}})
+	imageClient := NewOpenAIImage("https://example.invalid", client, manager, time.Second)
+	meta, err := imageClient.prepareInputUpload(
+		proxyruntime.WithURL(context.Background(), "http://current.invalid:8080"),
+		accounts.Account{},
+		map[string]any{"file_name": "image.png", "file_size": 10},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stringValue(meta["file_id"]) != "file_test" {
+		t.Fatalf("unexpected prepare metadata: %#v", meta)
+	}
+	if len(attempts) != 2 || attempts[0] != "http://current.invalid:8080" || attempts[1] != "http://stable.invalid:8080" {
+		t.Fatalf("unexpected prepare proxy attempts: %#v", attempts)
+	}
+}
+
+func TestOpenAIImagePollingTimeoutIncludesLastTransportError(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, io.ErrUnexpectedEOF
+	})}
+	imageClient := NewOpenAIImage("https://example.invalid", client, nil, 20*time.Millisecond)
+	_, err := imageClient.pollConversation(context.Background(), accounts.Account{}, "conversation-timeout")
+	if err == nil || !strings.Contains(err.Error(), "last poll error: unexpected EOF") {
+		t.Fatalf("expected diagnostic polling timeout, got %v", err)
+	}
+}
+
+func TestOpenAIImageTerminalErrorRecognizesUpstreamModeration(t *testing.T) {
+	err := openAIImageTerminalError(map[string]any{
+		"mapping": map[string]any{
+			"tool": map[string]any{"message": map[string]any{"status": "blocked"}},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "blocked") {
+		t.Fatalf("expected an explicit upstream terminal error, got %v", err)
+	}
+	var upstream *protocol.UpstreamError
+	if !errors.As(err, &upstream) || upstream.Status != http.StatusUnprocessableEntity {
+		t.Fatalf("unexpected terminal status: %#v", upstream)
+	}
+}
+
 func TestOpenAIImageProxyFailureExcludesProviderServerErrors(t *testing.T) {
 	if openAIImageProxyFailure(&protocol.UpstreamError{Status: http.StatusInternalServerError, Message: "provider unavailable"}) {
 		t.Fatal("provider HTTP 500 was attributed to the proxy")

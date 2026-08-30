@@ -118,6 +118,10 @@ func (s *Server) proxyRuntime(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 500, err.Error(), "server_error")
 			return
 		}
+		if err := s.refreshProxyRuntime(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+			return
+		}
 	}
 	cfg, _ := s.store.Config()
 	runtime := map[string]any{}

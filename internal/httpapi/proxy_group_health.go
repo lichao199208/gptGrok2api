@@ -88,6 +88,10 @@ func (s *Server) proxyGroupTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
+	if err := s.refreshProxyRuntime(); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
 	response := map[string]any{"results": results, "groups": mapList(updated["proxy_groups"])}
 	if nodeID != "" && len(results) == 1 {
 		response["result"] = results[0].Result

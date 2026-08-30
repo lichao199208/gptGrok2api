@@ -70,6 +70,8 @@ type Config struct {
 	RequestTimeout         time.Duration
 	ChatMaxRetries         int
 	ChatRetryCodes         map[int]bool
+	ImageAccountLimit      int
+	ImageMaxConcurrency    int
 	ImageRetentionDays     int
 	ImageCleanupInterval   time.Duration
 }
@@ -119,6 +121,20 @@ func Load(root string) (Config, error) {
 	}
 	if chatMaxRetries > 3 {
 		chatMaxRetries = 3
+	}
+	imageAccountConcurrency := envInt("GO_IMAGE_ACCOUNT_CONCURRENCY", 1)
+	if imageAccountConcurrency < 1 {
+		imageAccountConcurrency = 1
+	}
+	if imageAccountConcurrency > 4 {
+		imageAccountConcurrency = 4
+	}
+	imageMaxConcurrency := envInt("GO_IMAGE_MAX_CONCURRENCY", 128)
+	if imageMaxConcurrency < 1 {
+		imageMaxConcurrency = 1
+	}
+	if imageMaxConcurrency > 1024 {
+		imageMaxConcurrency = 1024
 	}
 	imageRetentionDays := envInt("GO_IMAGE_RETENTION_DAYS", 1)
 	if imageRetentionDays < 1 {
@@ -189,7 +205,9 @@ func Load(root string) (Config, error) {
 		AllowAnonymous:         envBool("GO_ALLOW_ANONYMOUS", false),
 		RequestTimeout:         time.Duration(requestTimeoutSeconds) * time.Second,
 		ChatMaxRetries:         chatMaxRetries,
-		ChatRetryCodes:         parseStatusCodes(env("GO_CHAT_RETRY_CODES", "401,403,429,500,502,503")),
+		ChatRetryCodes:         parseStatusCodes(env("GO_CHAT_RETRY_CODES", "401,403,429,500,502,503,504")),
+		ImageAccountLimit:      imageAccountConcurrency,
+		ImageMaxConcurrency:    imageMaxConcurrency,
 		ImageRetentionDays:     imageRetentionDays,
 		ImageCleanupInterval:   time.Duration(imageCleanupIntervalSeconds) * time.Second,
 	}
@@ -260,6 +278,16 @@ func applyProxyConfig(cfg *Config, values map[string]any) {
 	}
 }
 
+// ApplyProxyConfig applies the persisted proxy portion of the configuration.
+// It is exported so the HTTP runtime can hot-reload proxy changes without
+// rebuilding the entire server configuration.
+func ApplyProxyConfig(cfg *Config, values map[string]any) {
+	if cfg == nil {
+		return
+	}
+	applyProxyConfig(cfg, values)
+}
+
 func parseProxyGroups(value any) []ProxyGroup {
 	rawGroups, _ := value.([]any)
 	groups := make([]ProxyGroup, 0, len(rawGroups))
@@ -286,7 +314,7 @@ func parseProxyGroups(value any) []ProxyGroup {
 				RuntimeSuccesses: configInt(nodeMap["runtime_success_count"]),
 			}
 			if node.ImageConcurrencyLimit < 1 {
-				node.ImageConcurrencyLimit = 20
+				node.ImageConcurrencyLimit = 3
 			}
 			group.Nodes = append(group.Nodes, node)
 		}

@@ -264,6 +264,12 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
 	}
+	if configKey == "proxy_groups" {
+		if err := s.refreshProxyRuntime(); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": id, responseKey: mapList(updated[configKey])})
 }
 

@@ -264,6 +264,9 @@ func (s *Server) applyProxySubscription(id, subscriptionURL string, proxyURLs []
 	if err != nil {
 		return nil, nil, err
 	}
+	if err := s.refreshProxyRuntime(); err != nil {
+		return nil, nil, err
+	}
 	return updatedGroup, mapList(updated["proxy_groups"]), nil
 }
 
