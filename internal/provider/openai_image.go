@@ -162,30 +162,30 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	notifyOpenAIImageStage(ctx, "prepare_conversation_ms", stageStarted)
 
 	stageStarted = time.Now()
-	conversationID, fileIDs, err := o.start(ctx, account, requirements, conduit, prompt, model, size, quality, references)
+	conversationID, imageRefs, err := o.start(ctx, account, requirements, conduit, prompt, model, size, quality, references)
 	if err != nil {
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "generation_start_ms", stageStarted)
 	notifyOpenAIImageStage(ctx, "conversation_stream_ms", stageStarted)
-	if conversationID == "" && len(fileIDs) == 0 {
+	if conversationID == "" && len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image stream returned no conversation id")
 	}
-	if len(fileIDs) == 0 {
+	if len(imageRefs) == 0 {
 		if conversationID == "" {
 			return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 		}
 		stageStarted = time.Now()
-		fileIDs, err = o.pollConversation(ctx, account, conversationID)
+		imageRefs, err = o.pollConversation(ctx, account, conversationID)
 		if err != nil {
 			return nil, err
 		}
 		notifyOpenAIImageStage(ctx, "resolve_ms", stageStarted)
 	}
-	if len(fileIDs) == 0 {
+	if len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image generation completed without image files")
 	}
-	results := make([]ImageResult, 0, len(fileIDs))
+	results := make([]ImageResult, 0, len(imageRefs))
 	seen := map[string]bool{}
 	inputFileIDs := map[string]bool{}
 	var lastDownloadErr error
@@ -194,16 +194,17 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 			inputFileIDs[ref.FileID] = true
 		}
 	}
-	for _, fileID := range fileIDs {
+	for _, imageRef := range imageRefs {
+		fileID := strings.TrimPrefix(imageRef, "file-service://")
 		// The upstream SSE/poll response can echo uploaded reference assets.
 		// Those are inputs, not generated outputs, and must never be returned or
 		// persisted in the generated-image gallery.
-		if fileID == "" || seen[fileID] || inputFileIDs[fileID] {
+		if imageRef == "" || seen[imageRef] || inputFileIDs[fileID] {
 			continue
 		}
-		seen[fileID] = true
+		seen[imageRef] = true
 		downloadStarted := time.Now()
-		raw, mime, err := o.downloadFile(ctx, account, fileID)
+		raw, mime, err := o.downloadImageRef(ctx, account, conversationID, imageRef)
 		if err != nil {
 			lastDownloadErr = err
 			continue
@@ -243,26 +244,23 @@ func NormalizeOpenAIImageSize(size string) string {
 	}
 }
 
-func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, image ImageResult, responseFormat, imageDir, publicBase string) (map[string]string, error) {
+func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, image ImageResult, responseFormat, imageDir, publicBase string) (map[string]string, string, error) {
 	format := strings.ToLower(strings.TrimSpace(responseFormat))
 	if format == "" {
 		format = "url"
 	}
 	if format != "url" && format != "b64_json" {
-		return nil, fmt.Errorf("response_format must be url or b64_json")
+		return nil, "", fmt.Errorf("response_format must be url or b64_json")
 	}
 	if image.Base64 == "" {
-		return nil, fmt.Errorf("OpenAI image result has no image bytes")
-	}
-	if format == "b64_json" {
-		return map[string]string{"b64_json": image.Base64}, nil
+		return nil, "", fmt.Errorf("OpenAI image result has no image bytes")
 	}
 	raw, err := base64.StdEncoding.DecodeString(image.Base64)
 	if err != nil {
-		return nil, fmt.Errorf("decode OpenAI image: %w", err)
+		return nil, "", fmt.Errorf("decode OpenAI image: %w", err)
 	}
 	if err := ensureDir(imageDir); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	id := randomMediaID()
 	ext := ".png"
@@ -270,13 +268,16 @@ func (o *OpenAIImage) Resolve(ctx context.Context, account accounts.Account, ima
 		ext = ".jpg"
 	}
 	if err := writeMediaFile(imageDir, id, ext, raw); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	value := "/v1/files/image?id=" + id
 	if strings.TrimSpace(publicBase) != "" {
 		value = strings.TrimRight(publicBase, "/") + value
 	}
-	return map[string]string{"url": value}, nil
+	if format == "b64_json" {
+		return map[string]string{"b64_json": image.Base64}, value, nil
+	}
+	return map[string]string{"url": value}, value, nil
 }
 
 type openAIRequirements struct {
@@ -577,13 +578,37 @@ func (o *OpenAIImage) downloadFile(ctx context.Context, account accounts.Account
 	if err != nil {
 		return nil, "", err
 	}
+	return o.readImageDownloadResponse(ctx, account, response)
+}
+
+func (o *OpenAIImage) downloadImageRef(ctx context.Context, account accounts.Account, conversationID, imageRef string) ([]byte, string, error) {
+	if strings.HasPrefix(imageRef, "sediment://") {
+		attachmentID := strings.TrimPrefix(imageRef, "sediment://")
+		if conversationID == "" || attachmentID == "" {
+			return nil, "", fmt.Errorf("OpenAI sediment image reference is incomplete")
+		}
+		path := "/backend-api/conversation/" + url.PathEscape(conversationID) + "/attachment/" + url.PathEscape(attachmentID) + "/download"
+		response, err := o.do(ctx, http.MethodGet, path, account, nil, map[string]string{
+			"Accept":                "application/json, image/*, */*",
+			"Referer":               o.BaseURL + "/c/" + conversationID,
+			"X-OpenAI-Target-Route": "/backend-api/conversation/{conversation_id}/attachment/{attachment_id}/download",
+		}, false)
+		if err != nil {
+			return nil, "", err
+		}
+		return o.readImageDownloadResponse(ctx, account, response)
+	}
+	return o.downloadFile(ctx, account, strings.TrimPrefix(imageRef, "file-service://"))
+}
+
+func (o *OpenAIImage) readImageDownloadResponse(ctx context.Context, account accounts.Account, response *http.Response) ([]byte, string, error) {
 	var value map[string]any
 	raw, err := io.ReadAll(io.LimitReader(response.Body, 4<<20))
 	_ = response.Body.Close()
 	if err != nil {
 		return nil, "", err
 	}
-	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
+	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "application/json") || json.Valid(raw) {
 		if json.Unmarshal(raw, &value) != nil {
 			return nil, "", fmt.Errorf("decode OpenAI image download metadata")
 		}
@@ -783,6 +808,8 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 				pointer := stringValue(item)
 				if strings.HasPrefix(pointer, "file-service://") {
 					*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
+				} else if strings.HasPrefix(pointer, "sediment://") {
+					*fileIDs = append(*fileIDs, pointer)
 				}
 			case "file_id", "fileid":
 				id := stringValue(item)
@@ -805,6 +832,11 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 		for _, match := range regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
 				*fileIDs = append(*fileIDs, match[1])
+			}
+		}
+		for _, match := range regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
+			if len(match) == 2 {
+				*fileIDs = append(*fileIDs, "sediment://"+match[1])
 			}
 		}
 		for _, match := range regexp.MustCompile(`(?i)\b(file_[a-z0-9][a-z0-9_-]{5,})\b`).FindAllStringSubmatch(typed, -1) {

@@ -195,13 +195,13 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	}
 	parts := make([]string, 0, len(images))
 	for _, image := range images {
-		item, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
+		item, localURL, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
 			s.accountPool.Feedback(selected, upstreamStatus(resolveErr), resolveErr)
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
 			return
 		}
-		s.recordGeneratedMedia(r.Context(), item)
+		s.recordGeneratedMedia(r.Context(), map[string]string{"url": localURL})
 		parts = append(parts, fmt.Sprintf("![image](%s)", item["url"]))
 	}
 	s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"total_ms": time.Since(started).Milliseconds()})

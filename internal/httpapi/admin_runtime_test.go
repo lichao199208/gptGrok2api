@@ -3,6 +3,7 @@ package httpapi
 import (
 	"archive/zip"
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"mime/multipart"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/auucoder/gptgrok2api-go/internal/accounts"
 	"github.com/auucoder/gptgrok2api-go/internal/config"
 )
 
@@ -48,6 +50,36 @@ func TestRuntimeMonitorLifecycle(t *testing.T) {
 	item, ok = monitor.detail("call-1")
 	if !ok || item.Status != "success" || item.Progress != 100 || item.Duration < 0 {
 		t.Fatalf("unexpected completed item: %#v %v", item, ok)
+	}
+}
+
+func TestRequestMonitorEnrichmentUpdatesLiveEgressAndAccount(t *testing.T) {
+	server := &Server{monitor: newRuntimeMonitor()}
+	server.monitor.start("call-egress", "/v1/images/generations", "gpt-image-2", "test")
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil)
+	request = request.WithContext(context.WithValue(request.Context(), monitorCallIDKey{}, "call-egress"))
+
+	server.enrichMonitorAccount(request, accounts.Account{Pool: "basic", Fields: map[string]any{
+		"email":     "image@example.test",
+		"proxy_url": "http://proxy-user:proxy-pass@203.0.113.8:8080",
+	}})
+	server.enrichRequestMonitor(request, map[string]any{
+		"egress_label": "http://203.0.113.8:8080",
+		"has_proxy":    true,
+	})
+
+	record, ok := server.monitor.detail("call-egress")
+	if !ok {
+		t.Fatal("active monitor record missing")
+	}
+	if record.AccountEmail != "image@example.test" {
+		t.Fatalf("unexpected account email: %q", record.AccountEmail)
+	}
+	if record.ProxySource != "account" || record.EgressLabel != "http://203.0.113.8:8080" || !record.HasProxy {
+		t.Fatalf("unexpected egress metadata: %#v", record)
+	}
+	if strings.Contains(record.EgressLabel, "proxy-user") || strings.Contains(record.EgressLabel, "proxy-pass") {
+		t.Fatalf("proxy credentials leaked into monitor label: %q", record.EgressLabel)
 	}
 }
 

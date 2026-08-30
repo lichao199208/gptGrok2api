@@ -78,6 +78,7 @@ type Server struct {
 	survivalWake       chan struct{}
 	probeStop          chan struct{}
 	probeWake          chan struct{}
+	proxyProbeURL      string
 }
 
 func New(cfg config.Config) *Server {
@@ -253,7 +254,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/proxy/test", s.proxyTest)
 	mux.HandleFunc("/api/proxy/sample-test", s.proxyTest)
 	mux.HandleFunc("/api/proxy/profiles/test", s.proxyTest)
-	mux.HandleFunc("/api/proxy/groups/test", s.proxyTest)
+	mux.HandleFunc("/api/proxy/groups/test", s.proxyGroupTest)
 	mux.HandleFunc("/api/proxy/clearance/test", s.proxyTest)
 	mux.HandleFunc("/api/backup/test", s.backupTest)
 	mux.HandleFunc("/api/image-storage/test", s.imageStorageTest)
@@ -398,6 +399,10 @@ func (s *Server) enrichRequestMonitor(r *http.Request, meta map[string]any) {
 	if id == "" {
 		return
 	}
+	// Keep live monitor columns in sync with request metadata. Previously these
+	// values were only stored under request_meta, so the active-request table
+	// could not show the selected account or actual egress proxy.
+	s.monitor.enrich(id, meta)
 	s.monitor.mu.Lock()
 	defer s.monitor.mu.Unlock()
 	if item := s.monitor.active[id]; item != nil {
@@ -461,6 +466,18 @@ func (s *Server) enrichMonitorAccount(r *http.Request, account accounts.Account)
 			meta["key_name"] = value
 			break
 		}
+	}
+	for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+		proxyURL := strings.TrimSpace(accountFieldValue(account.Fields, key))
+		if proxyURL == "" || strings.HasPrefix(strings.ToLower(proxyURL), "group:") {
+			continue
+		}
+		if label := sanitizedEgressLabel(proxyURL); label != "" {
+			meta["proxy_source"] = "account"
+			meta["egress_label"] = label
+			meta["has_proxy"] = true
+		}
+		break
 	}
 	if _, ok := meta["account_id"]; !ok {
 		// The token is intentionally never logged; a stable pool label is a

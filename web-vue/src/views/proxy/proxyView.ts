@@ -52,6 +52,7 @@ function proxyNodeSignature(node: ProxyNode) {
     boundedSignatureText(node.url, 96),
     node.enabled !== false ? 1 : 0,
     node.image_concurrency_limit,
+    node.last_status,
     node.last_latency_ms,
     node.fail_count,
     boundedSignatureText(node.last_error),
@@ -174,9 +175,15 @@ export function proxyNodeTestSummary(
   if (isProxyNodeTesting(group, node, testingKey)) return '检测中...'
   const result = testResults[proxyNodeTestKey(group, node)]
   if (result?.ok) return `HTTP ${result.status || '-'} · ${result.latency_ms || 0}ms`
-  if (result && !result.ok) return result.error || '检测失败'
-  if (node.last_error) return node.last_error
-  if (node.last_checked_at) return `${node.last_latency_ms || 0}ms`
+  if (result && !result.ok) {
+    if (result.status) return `HTTP ${result.status} · ${result.latency_ms || 0}ms`
+    return result.error || '检测失败'
+  }
+  if (node.last_error) {
+    if (node.last_status) return `HTTP ${node.last_status} · ${node.last_latency_ms || 0}ms`
+    return node.last_error
+  }
+  if (node.last_checked_at) return `HTTP ${node.last_status || '-'} · ${node.last_latency_ms || 0}ms`
   return '尚未测试'
 }
 

@@ -222,6 +222,12 @@ func (s *Server) proxyProfileByID(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) proxyGroupByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy/groups/"), "/")
+	if strings.HasSuffix(path, "/subscription/refresh") {
+		id := strings.TrimSuffix(path, "/subscription/refresh")
+		s.refreshProxyGroupSubscription(w, r, id)
+		return
+	}
 	s.proxyResourceByID(w, r, "proxy_groups", "/api/proxy/groups/", "groups")
 }
 
@@ -230,14 +236,6 @@ func (s *Server) proxyResourceByID(w http.ResponseWriter, r *http.Request, confi
 		return
 	}
 	id := strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
-	refresh := strings.HasSuffix(id, "/subscription/refresh")
-	if refresh {
-		id = strings.TrimSuffix(id, "/subscription/refresh")
-	}
-	if refresh && r.Method == http.MethodPost {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": id, "refreshed_at": time.Now().UTC()})
-		return
-	}
 	if r.Method != http.MethodDelete {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return

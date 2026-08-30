@@ -3,6 +3,8 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -54,6 +56,29 @@ func TestHTTPProxyTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
+}
+
+func TestSOCKS4aConnectUsesDomainName(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	packetCh := make(chan []byte, 1)
+	go func() {
+		packet := make([]byte, 9+len("example.com")+1)
+		_, _ = io.ReadFull(server, packet)
+		packetCh <- packet
+		_, _ = server.Write([]byte{0x00, 0x5a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
+	}()
+	if err := socks4Connect(client, "example.com:443", nil); err != nil {
+		t.Fatal(err)
+	}
+	packet := <-packetCh
+	if len(packet) < 10 || packet[0] != 0x04 || packet[1] != 0x01 || packet[2] != 0x01 || packet[3] != 0xbb {
+		t.Fatalf("unexpected SOCKS4 request header: %x", packet)
+	}
+	if got := string(packet[9 : len(packet)-1]); got != "example.com" {
+		t.Fatalf("unexpected SOCKS4a domain: %q", got)
+	}
 }
 
 func TestUpstreamRouterReadsFileAndNormalizesEntries(t *testing.T) {

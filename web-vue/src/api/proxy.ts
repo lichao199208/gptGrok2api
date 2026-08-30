@@ -40,6 +40,7 @@ export interface ProxyNode {
   url: string
   enabled: boolean
   image_concurrency_limit?: number
+  last_status?: number
   last_latency_ms?: number
   fail_count?: number
   last_error?: string

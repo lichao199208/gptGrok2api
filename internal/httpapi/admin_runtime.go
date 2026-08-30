@@ -286,8 +286,8 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		if response != nil {
 			defer response.Body.Close()
 			result["status"] = response.StatusCode
-			result["ok"] = response.StatusCode < 500
-			if response.StatusCode >= 500 {
+			result["ok"] = proxyTestStatusOK(response.StatusCode)
+			if !proxyTestStatusOK(response.StatusCode) {
 				result["error"] = fmt.Sprintf("HTTP %d", response.StatusCode)
 			}
 		}
@@ -302,7 +302,7 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func redactProxyError(value string) string {
-	for _, scheme := range []string{"http://", "https://", "socks5://", "socks5h://", "socks://"} {
+	for _, scheme := range []string{"http://", "https://", "socks4://", "socks4a://", "socks5://", "socks5h://", "socks://"} {
 		for {
 			start := strings.Index(strings.ToLower(value), scheme)
 			if start < 0 {

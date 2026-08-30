@@ -227,12 +227,12 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 				items := make([]map[string]string, 0, len(generated))
 				var resolveErr error
 				for _, image := range generated {
-					value, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
+					value, localURL, err := s.openAIImage.Resolve(ctx, lease.Account, image, responseFormat, s.cfg.ImageDataDir, publicBase)
 					if err != nil {
 						resolveErr = err
 						break
 					}
-					s.recordGeneratedMedia(ctx, value)
+					s.recordGeneratedMedia(ctx, map[string]string{"url": localURL})
 					items = append(items, value)
 				}
 				if resolveErr != nil {
@@ -723,10 +723,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		if size == "" {
 			size = "1024x1024"
 		}
-		format := request.ResponseFormat
-		if format == "" {
-			format = "url"
-		}
+		format := imageEditResponseFormat(request.ResponseFormat)
 		data, err := s.generateOpenAIImageData(r, r.Context(), prompt, modelName, size, request.Quality, inputs, format, requestPublicBase(r), n)
 		if err != nil {
 			writeError(w, upstreamStatus(err), err.Error(), "upstream_error")
@@ -781,10 +778,7 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := make([]map[string]string, 0, minInt(n, len(images)))
-	format := request.ResponseFormat
-	if format == "" {
-		format = "url"
-	}
+	format := imageEditResponseFormat(request.ResponseFormat)
 	for _, image := range images[:minInt(n, len(images))] {
 		value, resolveErr := s.mediaProvider.ResolveImage(r.Context(), lease.Account, image, format, s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
@@ -796,6 +790,10 @@ func (s *Server) imageEdits(w http.ResponseWriter, r *http.Request) {
 	}
 	s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
 	writeJSON(w, http.StatusOK, map[string]any{"created": time.Now().Unix(), "data": data})
+}
+
+func imageEditResponseFormat(string) string {
+	return "url"
 }
 
 func (s *Server) imageFile(w http.ResponseWriter, r *http.Request) {
@@ -828,9 +826,15 @@ func (s *Server) monitorOpenAIImageContext(r *http.Request, ctx context.Context)
 		s.stageRequestMonitor(r, stage.name, stage.progress, map[string]any{metric: elapsed.Milliseconds()})
 	})
 	return provider.WithOpenAIImageEgress(ctx, func(proxyURL string) {
-		if label := sanitizedEgressLabel(proxyURL); label != "" {
-			s.enrichRequestMonitor(r, map[string]any{"egress_label": label})
+		label := sanitizedEgressLabel(proxyURL)
+		meta := map[string]any{"has_proxy": label != ""}
+		if label == "" {
+			meta["proxy_source"] = "direct"
+			meta["egress_label"] = "direct"
+		} else {
+			meta["egress_label"] = label
 		}
+		s.enrichRequestMonitor(r, meta)
 	})
 }
 

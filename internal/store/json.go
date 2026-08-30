@@ -91,6 +91,24 @@ func (s *Store) UpdateConfig(key string, value any) (map[string]any, error) {
 	return current, nil
 }
 
+func (s *Store) MutateConfig(key string, mutate func(any) (any, error)) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, err := loadMap(s.configPath)
+	if err != nil {
+		return nil, err
+	}
+	next, err := mutate(current[key])
+	if err != nil {
+		return nil, err
+	}
+	current[key] = next
+	if err := writeJSON(s.configPath, current); err != nil {
+		return nil, err
+	}
+	return current, nil
+}
+
 func (s *Store) ReplaceConfig(value map[string]any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

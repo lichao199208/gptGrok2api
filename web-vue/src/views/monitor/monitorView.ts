@@ -173,6 +173,7 @@ export function metricValue(row: RealtimeMonitorRecord, key: string) {
 
 export function proxySourceLabel(value: unknown) {
   const source = String(value || 'direct')
+  if (source.includes('fallback')) return '备用'
   if (source.includes('account_group')) return '账号组'
   if (source.includes('account')) return '账号'
   if (source.includes('default')) return '默认'
@@ -201,7 +202,7 @@ export function egressLabelText(row: RealtimeMonitorRecord) {
 export function egressText(row: RealtimeMonitorRecord) {
   const label = proxySourceLabel(row.proxy_source)
   const egressLabel = egressLabelText(row)
-  if (egressLabel) return `${label} ${egressLabel}`
+  if (egressLabel) return `${label} · ${egressLabel}`
   const hash = String(row.proxy_hash || '')
   if (hash && hash !== 'direct') return `${label} ${hash}`
   return label

@@ -38,7 +38,10 @@ func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error)
 	if err != nil || parsed.Host == "" {
 		return nil, fmt.Errorf("invalid proxy URL %q", proxyURL)
 	}
-	if strings.HasPrefix(strings.ToLower(parsed.Scheme), "socks") {
+	switch strings.ToLower(parsed.Scheme) {
+	case "socks4", "socks4a":
+		return (&socks4Dialer{proxy: parsed}).DialContext(ctx, "tcp", target)
+	case "socks", "socks5", "socks5h":
 		return (&socks5Dialer{proxy: parsed}).DialContext(ctx, "tcp", target)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
@@ -236,6 +239,11 @@ func (t *Transport) forProxy(proxyURL string) (http.RoundTripper, error) {
 		transport := cloneHTTPTransport(t.base)
 		transport.Proxy = http.ProxyURL(parsed)
 		roundTripper = transport
+	case "socks4", "socks4a":
+		transport := cloneHTTPTransport(t.base)
+		transport.Proxy = nil
+		transport.DialContext = (&socks4Dialer{proxy: parsed}).DialContext
+		roundTripper = transport
 	case "socks5", "socks5h", "socks":
 		transport := cloneHTTPTransport(t.base)
 		transport.Proxy = nil
@@ -262,6 +270,64 @@ func cloneHTTPTransport(base http.RoundTripper) *http.Transport {
 }
 
 type socks5Dialer struct{ proxy *url.URL }
+
+type socks4Dialer struct{ proxy *url.URL }
+
+func (d *socks4Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, fmt.Errorf("SOCKS4 only supports TCP, got %s", network)
+	}
+	proxyAddress := d.proxy.Host
+	if _, _, err := net.SplitHostPort(proxyAddress); err != nil {
+		proxyAddress = net.JoinHostPort(proxyAddress, "1080")
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", proxyAddress)
+	if err != nil {
+		return nil, err
+	}
+	if err := socks4Connect(conn, address, d.proxy.User); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	return conn, nil
+}
+
+func socks4Connect(conn io.ReadWriter, address string, user *url.Userinfo) error {
+	host, portText, err := net.SplitHostPort(address)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid target port %q", portText)
+	}
+	packet := []byte{0x04, 0x01, byte(port >> 8), byte(port)}
+	ip := net.ParseIP(host).To4()
+	if ip == nil {
+		packet = append(packet, 0x00, 0x00, 0x00, 0x01)
+	} else {
+		packet = append(packet, ip...)
+	}
+	if user != nil {
+		packet = append(packet, []byte(user.Username())...)
+	}
+	packet = append(packet, 0x00)
+	if ip == nil {
+		packet = append(packet, []byte(host)...)
+		packet = append(packet, 0x00)
+	}
+	if _, err := conn.Write(packet); err != nil {
+		return err
+	}
+	var reply [8]byte
+	if _, err := io.ReadFull(conn, reply[:]); err != nil {
+		return err
+	}
+	if reply[1] != 0x5a {
+		return fmt.Errorf("SOCKS4 connect failed with code 0x%02x", reply[1])
+	}
+	return nil
+}
 
 func (d *socks5Dialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	if network != "tcp" && network != "tcp4" && network != "tcp6" {
