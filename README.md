@@ -14,6 +14,8 @@ GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关，使用 Go 运行时�
 - OAuth 账号支持使用 `refresh_token` 刷新并持久化新的 access token；密码和 2FA Secret 不会被当作自动登录凭据。
 - 图片本地存储、公开下载 URL、图片管理和批量清理。
 - 实时显示入口排队、账号等待、出口代理、上游准备、生成、下载和总耗时。
+- 代理订阅支持纯文本和 Base64，自动去重并保留手工节点。
+- 代理组支持并发批量检测，持久化节点状态、HTTP 状态码、延迟和错误信息。
 - Vue 管理控制台、Redis 队列、健康检查和 Docker Compose 部署。
 
 ## Docker 部署
@@ -24,6 +26,7 @@ GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关，使用 Go 运行时�
 git clone https://github.com/lichao199208/gptGrok2api.git
 cd gptGrok2api
 cp .env.example .env
+docker network inspect gptgrok2api_default >/dev/null 2>&1 || docker network create gptgrok2api_default
 ~~~
 
 在 `.env` 中至少设置：
@@ -89,6 +92,8 @@ http://your-server:8000/v1/files/image?id=<image-id>
 
 该链接由 Go 服务直接提供下载，不依赖上游临时链接。
 
+Go 版会同时识别 ChatGPT 图片流程返回的 `file-service://` 和 `sediment://` 文件引用，使用对应会话和附件 ID 下载结果，然后写入本地图片存储并返回本站 `/v1/files/image` URL。`sediment://` 不会作为不可下载文本继续轮询，因此可避免结果已经生成但最终仍报 `OpenAI image result polling timed out`。
+
 ### 图片生成和编辑
 
 ~~~bash
@@ -123,6 +128,8 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | 实时监控 | `GET /api/monitor/realtime` |
 | 日志管理 | `GET /api/logs` |
 | 图片管理 | `GET /api/images` |
+| 代理订阅刷新 | `POST /api/proxy/groups/{id}/subscription/refresh` |
+| 代理组节点检测 | `POST /api/proxy/groups/test` |
 | 账号异常清理预览 | `POST /api/settings/account-cleanup/preview` |
 | 账号异常清理执行 | `POST /api/settings/account-cleanup/run` |
 | 管理控制台 | `GET /` |
@@ -145,6 +152,21 @@ curl http://127.0.0.1:8000/v1/images/edits \
 
 账号编辑弹窗中的“账户密码”和“2FA Secret”支持点击“复制”；字段为空时复制按钮会自动禁用。
 
+## 代理订阅与节点检测
+
+在控制台的代理组中填写订阅 URL 后，可以直接刷新订阅。Go 服务会真实请求该地址，支持以下内容：
+
+- 每行一个 `http://`、`https://`、`socks4://`、`socks5://` 或 `socks5h://` 节点。
+- 没有协议的 `host:port`，按 HTTP 代理导入。
+- Base64 编码的上述纯文本代理列表。
+- 自动规范化和去重，单次最多导入 5000 个订阅节点。
+- 刷新时替换旧的订阅节点，同时保留管理员手工添加的节点。
+- 请求、解析或并发修改失败时，保留旧配置并记录最近刷新时间和错误。
+
+“检测全部节点”会以最多 32 路并发真实经过每个代理访问 ChatGPT 探测地址。只有 `2xx` 和 `3xx` 判定为可用，`403`、其他 `4xx/5xx`、连接失败和超时均判定为不可用。每个节点的检测时间、延迟、HTTP 状态和错误会保存到配置，刷新页面后仍可查看。
+
+实时监控的活跃请求会显示本次请求实际租用的出口代理；直连、代理组节点和备用出口会分别标识，便于根据同一请求 ID 排查失败链路。
+
 ## Go 配置
 
 | 环境变量 | 默认值 | 说明 |
@@ -152,7 +174,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `CHATGPT2API_AUTH_KEY` | 无 | API 认证密钥 |
 | `CHATGPT2API_ADMIN_KEY` | 无 | 管理密钥 |
 | `CHATGPT2API_GO_PORT` | `3000` | 宿主机端口 |
-| `GO_LISTEN_ADDR` | `:8080` | 容器内监听地址 |
+| `GO_LISTEN_ADDR` | 程序默认 `:8080` | 监听地址；Go Docker 镜像固定为容器内 `:80` |
 | `GO_PUBLIC_BASE_URL` | 空 | 图片公开 URL 基础地址 |
 | `GO_CONFIG_PATH` | `/app/data/config.json` | 配置文件路径 |
 | `GO_ACCOUNTS_PATH` | `data/accounts.json` | OpenAI 账号文件 |
@@ -177,6 +199,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 git clone https://github.com/lichao199208/gptGrok2api.git /opt/gpt2api-go
 cd /opt/gpt2api-go
 cp .env.example .env
+docker network inspect gptgrok2api_default >/dev/null 2>&1 || docker network create gptgrok2api_default
 docker compose -f docker-compose.go.yml up -d --build
 curl -fsS http://127.0.0.1:8000/health
 ~~~
