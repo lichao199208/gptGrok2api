@@ -34,6 +34,9 @@ func (s *Server) persistProxyGroupRuntimeResult(event proxyruntime.ImageNodeRunt
 				nextNode := cloneMap(node)
 				nextNode["runtime_failure_count"] = event.Failures
 				nextNode["runtime_success_count"] = event.Successes
+				if event.LatencyMS > 0 {
+					nextNode["runtime_latency_ms"] = event.LatencyMS
+				}
 				if event.Failures > 0 {
 					nextNode["runtime_last_failure_at"] = now
 				} else {

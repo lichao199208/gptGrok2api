@@ -167,6 +167,72 @@ func TestAcquireStableImageRequiresThreeSuccessfulRequests(t *testing.T) {
 	lease.Release(false)
 }
 
+func TestImageGroupPrefersStableNodesAndCanariesFivePercent(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "new", URL: "http://new.invalid:8080", Enabled: true},
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, RuntimeSuccesses: 10, RuntimeLatencyMS: 500},
+	}}})
+	counts := map[string]int{}
+	for request := 0; request < 40; request++ {
+		lease := manager.AcquireImage(nil)
+		if lease == nil {
+			t.Fatal("expected image proxy lease")
+		}
+		counts[lease.NodeID]++
+		lease.Release(false)
+	}
+	if counts["new"] != 2 || counts["stable"] != 38 {
+		t.Fatalf("unexpected stable/canary distribution: %#v", counts)
+	}
+}
+
+func TestImageGroupPrefersLowLatencyStableNodeAndRespectsCapacity(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "slow", URL: "http://slow.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 10, RuntimeLatencyMS: 5000},
+		{ID: "fast", URL: "http://fast.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 10, RuntimeLatencyMS: 500},
+	}}})
+	fast := manager.AcquireImage(nil)
+	if fast == nil || fast.NodeID != "fast" {
+		t.Fatalf("low-latency stable node was not preferred: %#v", fast)
+	}
+	slow := manager.AcquireImage(nil)
+	if slow == nil || slow.NodeID != "slow" {
+		fast.Release(false)
+		t.Fatalf("request was not shifted away from the full fast node: %#v", slow)
+	}
+	fast.Release(false)
+	slow.Release(false)
+}
+
+func TestSuccessfulSlowImageLeaseCoolsWithoutCountingFailure(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "fast", URL: "http://fast.invalid:8080", Enabled: true, RuntimeSuccesses: 10, RuntimeLatencyMS: 500},
+		{ID: "backup", URL: "http://backup.invalid:8080", Enabled: true, RuntimeSuccesses: 10, RuntimeLatencyMS: 1000},
+	}}})
+	lease := manager.AcquireImage(nil)
+	if lease == nil || lease.NodeID != "fast" {
+		t.Fatalf("unexpected initial lease: %#v", lease)
+	}
+	lease.ObserveLatency(31*time.Second, 30*time.Second)
+	lease.Release(false)
+
+	next := manager.AcquireImage(nil)
+	if next == nil || next.NodeID != "backup" {
+		t.Fatalf("slow successful node was not cooled: %#v", next)
+	}
+	next.Release(false)
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	for _, node := range manager.imageGroups["images"].nodes {
+		if node.id == "fast" && node.failures != 0 {
+			t.Fatalf("slow success incorrectly counted as transport failure: %d", node.failures)
+		}
+	}
+}
+
 func TestImageGroupSkipsSOCKS4ForBrowserImageFlow(t *testing.T) {
 	manager := NewManager("socks4://default.invalid:1080", nil)
 	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{

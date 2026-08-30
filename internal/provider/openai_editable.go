@@ -76,13 +76,9 @@ func (o *OpenAIImage) ExportEditable(ctx context.Context, account accounts.Accou
 	if extra := strings.TrimSpace(userPrompt); extra != "" {
 		prompt += "\n\n以下是用户补充需求，请直接结合执行：\n" + extra
 	}
-	references := make([]openAIImageReference, 0, len(inputs))
-	for index, input := range inputs {
-		ref, err := o.uploadInput(ctx, account, input, index+1)
-		if err != nil {
-			return EditableExportResult{}, err
-		}
-		references = append(references, ref)
+	references, err := o.uploadInputs(ctx, account, inputs)
+	if err != nil {
+		return EditableExportResult{}, err
 	}
 	scripts, build, err := o.bootstrap(ctx, account)
 	if err != nil {

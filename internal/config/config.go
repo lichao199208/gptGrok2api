@@ -94,6 +94,7 @@ type ProxyNode struct {
 	LastError             string
 	RuntimeFailures       int
 	RuntimeSuccesses      int
+	RuntimeLatencyMS      int64
 }
 
 func Load(root string) (Config, error) {
@@ -312,6 +313,7 @@ func parseProxyGroups(value any) []ProxyGroup {
 				LastStatus: configInt(nodeMap["last_status"]), LastError: firstString(nodeMap, "last_error"),
 				RuntimeFailures:  configInt(nodeMap["runtime_failure_count"]),
 				RuntimeSuccesses: configInt(nodeMap["runtime_success_count"]),
+				RuntimeLatencyMS: int64(configInt(nodeMap["runtime_latency_ms"])),
 			}
 			if node.ImageConcurrencyLimit < 1 {
 				node.ImageConcurrencyLimit = 3

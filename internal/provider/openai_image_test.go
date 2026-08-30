@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -129,6 +130,63 @@ func TestOpenAIImageSuccessfulUploadDoesNotReserveUnusedStableProxy(t *testing.T
 	stable.Release(false)
 }
 
+func TestOpenAIImageUploadsReferencesConcurrentlyAndKeepsOrder(t *testing.T) {
+	var active atomic.Int32
+	var maximum atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/files":
+			current := active.Add(1)
+			for {
+				previous := maximum.Load()
+				if current <= previous || maximum.CompareAndSwap(previous, current) {
+					break
+				}
+			}
+			defer active.Add(-1)
+			var payload map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			time.Sleep(80 * time.Millisecond)
+			name := stringValue(payload["file_name"])
+			_ = json.NewEncoder(w).Encode(map[string]any{"file_id": "file_" + name, "upload_url": serverURL(r) + "/blob/" + name})
+		case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/blob/"):
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/uploaded"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 5*time.Second)
+	pngBytes := onePixelPNG(t)
+	inputs := []OpenAIImageInput{
+		{Name: "first.png", MIME: "image/png", Data: pngBytes},
+		{Name: "second.png", MIME: "image/png", Data: pngBytes},
+		{Name: "third.png", MIME: "image/png", Data: pngBytes},
+	}
+	started := time.Now()
+	references, err := client.uploadInputs(context.Background(), accounts.Account{}, inputs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
+		t.Fatalf("reference uploads did not overlap: %s", elapsed)
+	}
+	if maximum.Load() < 2 {
+		t.Fatalf("expected concurrent uploads, maximum active=%d", maximum.Load())
+	}
+	for index, reference := range references {
+		if reference.FileName != inputs[index].Name {
+			t.Fatalf("reference order changed at %d: got %q want %q", index, reference.FileName, inputs[index].Name)
+		}
+	}
+}
+
 func TestOpenAIImageDownloadRetriesThroughStableProxyAndCoolsPrimary(t *testing.T) {
 	attempts := []string{}
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -149,7 +207,17 @@ func TestOpenAIImageDownloadRetriesThroughStableProxyAndCoolsPrimary(t *testing.
 		{ID: "current", URL: "http://current.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1},
 		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 3},
 	}}})
+	for request := 1; request < 20; request++ {
+		warmup := manager.AcquireImage(nil)
+		if warmup == nil || warmup.NodeID != "stable" {
+			t.Fatalf("stable proxy was not preferred before canary request: %#v", warmup)
+		}
+		warmup.Release(false)
+	}
 	primary := manager.AcquireImage(nil)
+	if primary == nil || primary.NodeID != "current" {
+		t.Fatalf("expected twentieth request to validate canary proxy: %#v", primary)
+	}
 	ctx := proxyruntime.WithImageLease(proxyruntime.WithURL(context.Background(), primary.URL), primary)
 	imageClient := NewOpenAIImage("https://example.invalid", client, manager, time.Second)
 	raw, mime, err := imageClient.downloadImageRefWithRetry(ctx, accounts.Account{}, "conversation", "file_test_download")

@@ -93,6 +93,15 @@ func notifyOpenAIImageEgress(ctx context.Context, proxyURL string) {
 const openAIImageDefaultPollTimeout = 3 * time.Minute
 const openAIImageUploadAttemptTimeout = 60 * time.Second
 const openAIImagePollAttemptTimeout = 20 * time.Second
+const openAIImageReferenceUploadConcurrency = 3
+
+const (
+	openAIImageSlowUpload       = 30 * time.Second
+	openAIImageSlowBootstrap    = 15 * time.Second
+	openAIImageSlowRequirements = 15 * time.Second
+	openAIImageSlowPrepare      = 15 * time.Second
+	openAIImageSlowDownload     = 20 * time.Second
+)
 
 func NewOpenAIImage(baseURL string, client *http.Client, proxy *proxyruntime.Manager, timeout time.Duration) *OpenAIImage {
 	if client == nil {
@@ -144,17 +153,14 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		defer func() { lease.Release(openAIImageProxyFailure(err)) }()
 	}
 	prompt = strings.TrimSpace(prompt) + "\n\n输出图片尺寸为 " + size + "。\n输出图片质量为 " + quality + "。"
-	references := make([]openAIImageReference, 0, len(inputs))
 	inputStarted := time.Now()
-	for index, input := range inputs {
-		ref, err := o.uploadInput(ctx, account, input, index+1)
-		if err != nil {
-			return nil, err
-		}
-		references = append(references, ref)
+	references, err := o.uploadInputs(ctx, account, inputs)
+	if err != nil {
+		return nil, err
 	}
 	if len(inputs) > 0 {
 		notifyOpenAIImageStage(ctx, "upload_ms", inputStarted)
+		proxyruntime.ObserveImageLeaseStage(ctx, time.Since(inputStarted), openAIImageSlowUpload)
 	}
 
 	stageStarted := time.Now()
@@ -163,6 +169,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "bootstrap_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowBootstrap)
 
 	stageStarted = time.Now()
 	requirements, err := o.chatRequirements(ctx, account, scripts, build)
@@ -170,6 +177,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "requirements_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowRequirements)
 
 	stageStarted = time.Now()
 	conduit, err := o.prepare(ctx, account, requirements, prompt, model)
@@ -177,6 +185,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, err
 	}
 	notifyOpenAIImageStage(ctx, "prepare_conversation_ms", stageStarted)
+	proxyruntime.ObserveImageLeaseStage(ctx, time.Since(stageStarted), openAIImageSlowPrepare)
 
 	stageStarted = time.Now()
 	conversationID, imageRefs, err := o.start(ctx, account, requirements, conduit, prompt, model, size, quality, references)
@@ -227,6 +236,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 			continue
 		}
 		notifyOpenAIImageStage(ctx, "download_ms", downloadStarted)
+		proxyruntime.ObserveImageLeaseStage(ctx, time.Since(downloadStarted), openAIImageSlowDownload)
 		results = append(results, ImageResult{
 			Base64: base64.StdEncoding.EncodeToString(raw),
 			MIME:   mime,
@@ -242,6 +252,50 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 	}
 	return results, nil
+}
+
+func (o *OpenAIImage) uploadInputs(ctx context.Context, account accounts.Account, inputs []OpenAIImageInput) ([]openAIImageReference, error) {
+	if len(inputs) == 0 {
+		return nil, nil
+	}
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	references := make([]openAIImageReference, len(inputs))
+	jobs := make(chan int, len(inputs))
+	for index := range inputs {
+		jobs <- index
+	}
+	close(jobs)
+
+	workerCount := min(len(inputs), openAIImageReferenceUploadConcurrency)
+	var workers sync.WaitGroup
+	var firstErr error
+	var errOnce sync.Once
+	workers.Add(workerCount)
+	for worker := 0; worker < workerCount; worker++ {
+		go func() {
+			defer workers.Done()
+			for index := range jobs {
+				if uploadCtx.Err() != nil {
+					return
+				}
+				ref, uploadErr := o.uploadInput(uploadCtx, account, inputs[index], index+1)
+				if uploadErr != nil {
+					errOnce.Do(func() {
+						firstErr = uploadErr
+						cancel()
+					})
+					return
+				}
+				references[index] = ref
+			}
+		}()
+	}
+	workers.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return references, nil
 }
 
 // NormalizeOpenAIImageSize keeps legacy UI presets compatible with the
@@ -741,7 +795,9 @@ func (o *OpenAIImage) prepareInputUpload(ctx context.Context, account accounts.A
 		return nil, ctx.Err()
 	case <-time.After(200 * time.Millisecond):
 	}
+	retryStarted := time.Now()
 	meta, err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowUpload)
 	stable.Release(openAIImageProxyFailure(err))
 	if err != nil {
 		return nil, fmt.Errorf("OpenAI image upload prepare failed after retry: %w", err)
@@ -779,7 +835,9 @@ func (o *OpenAIImage) uploadInputBlob(ctx context.Context, account accounts.Acco
 		return ctx.Err()
 	case <-time.After(200 * time.Millisecond):
 	}
+	retryStarted := time.Now()
 	err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowUpload)
 	stable.Release(openAIImageProxyFailure(err))
 	if err != nil {
 		return fmt.Errorf("OpenAI image upload failed after retry: %w", err)
@@ -841,7 +899,9 @@ func (o *OpenAIImage) downloadImageRefWithRetry(ctx context.Context, account acc
 	if stable == nil {
 		return nil, "", err
 	}
+	retryStarted := time.Now()
 	raw, mime, err = request(proxyruntime.WithURL(ctx, stable.URL))
+	stable.ObserveLatency(time.Since(retryStarted), openAIImageSlowDownload)
 	stable.Release(openAIImageProxyFailure(err))
 	if err != nil {
 		return nil, "", fmt.Errorf("OpenAI image download failed after retry: %w", err)

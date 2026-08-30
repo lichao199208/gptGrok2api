@@ -169,7 +169,7 @@ func runtimeProxyGroups(groups []config.ProxyGroup) []proxyruntime.GroupConfig {
 			item.Nodes = append(item.Nodes, proxyruntime.NodeConfig{
 				ID: node.ID, Name: node.Name, URL: node.URL, Enabled: node.Enabled,
 				ImageConcurrencyLimit: node.ImageConcurrencyLimit, LastStatus: node.LastStatus, LastError: node.LastError,
-				RuntimeFailures: node.RuntimeFailures, RuntimeSuccesses: node.RuntimeSuccesses,
+				RuntimeFailures: node.RuntimeFailures, RuntimeSuccesses: node.RuntimeSuccesses, RuntimeLatencyMS: node.RuntimeLatencyMS,
 			})
 		}
 		result = append(result, item)

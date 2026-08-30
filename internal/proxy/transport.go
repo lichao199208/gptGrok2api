@@ -96,19 +96,20 @@ func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error)
 
 // Manager resolves an account-specific proxy first, then rotates the global pool.
 type Manager struct {
-	mu             sync.Mutex
-	url            string
-	pool           []string
-	cursor         int
-	resourceURL    string
-	resourcePool   []string
-	resourceCursor int
-	upstreamRouter *UpstreamRouter
-	imageGroups    map[string]*imageGroup
-	imageGroupID   string
-	imageCursor    int
-	imageWake      chan struct{}
-	onImageResult  func(ImageNodeRuntimeResult)
+	mu              sync.Mutex
+	url             string
+	pool            []string
+	cursor          int
+	resourceURL     string
+	resourcePool    []string
+	resourceCursor  int
+	upstreamRouter  *UpstreamRouter
+	imageGroups     map[string]*imageGroup
+	imageGroupID    string
+	imageCursor     int
+	imageSelections uint64
+	imageWake       chan struct{}
+	onImageResult   func(ImageNodeRuntimeResult)
 }
 
 type GroupConfig struct {
@@ -125,6 +126,7 @@ type NodeConfig struct {
 	LastError             string
 	RuntimeFailures       int
 	RuntimeSuccesses      int
+	RuntimeLatencyMS      int64
 }
 
 type imageGroup struct {
@@ -135,6 +137,7 @@ type imageGroup struct {
 type imageNode struct {
 	id, name, url                        string
 	limit, inFlight, failures, successes int
+	latencyMS                            int64
 	cooldownUntil                        time.Time
 	evicted                              bool
 }
@@ -150,6 +153,8 @@ type Lease struct {
 	NodeName  string
 	once      sync.Once
 	failed    atomic.Bool
+	slow      atomic.Bool
+	latencyMS atomic.Int64
 }
 
 type EgressInfo struct {
@@ -159,13 +164,16 @@ type EgressInfo struct {
 type ImageNodeRuntimeResult struct {
 	GroupID, GroupName, NodeID, NodeName, URL string
 	Failures, Successes                       int
+	LatencyMS                                 int64
 	Removed                                   bool
 }
 
 const (
 	imageNodeFailureLimit  = 3
 	imageNodeStableSuccess = 3
+	imageNodeCanaryEvery   = 20
 	defaultImageNodeLimit  = 3
+	imageNodeSlowCooldown  = time.Minute
 )
 
 type imageLeaseContextKey struct{}
@@ -183,6 +191,19 @@ func MarkImageLeaseFailure(ctx context.Context) {
 	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
 	if lease != nil {
 		lease.failed.Store(true)
+	}
+}
+
+// ObserveImageLeaseStage records only proxy-sensitive stage latency. The
+// upstream image-generation duration must not be included in this score.
+func ObserveImageLeaseStage(ctx context.Context, elapsed, slowAfter time.Duration) {
+	lease, _ := ctx.Value(imageLeaseContextKey{}).(*Lease)
+	if lease == nil || elapsed <= 0 {
+		return
+	}
+	lease.latencyMS.Add(max(elapsed.Milliseconds(), 1))
+	if slowAfter > 0 && elapsed > slowAfter {
+		lease.slow.Store(true)
 	}
 }
 
@@ -256,7 +277,11 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 			if successes < 0 {
 				successes = 0
 			}
-			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes})
+			latencyMS := node.RuntimeLatencyMS
+			if latencyMS < 0 {
+				latencyMS = 0
+			}
+			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit, failures: failures, successes: successes, latencyMS: latencyMS})
 		}
 		next[id] = item
 	}
@@ -268,6 +293,7 @@ func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
 	m.imageGroups = next
 	m.imageGroupID = groupID
 	m.imageCursor = 0
+	m.imageSelections = 0
 	m.signalImageLocked()
 	m.mu.Unlock()
 }
@@ -407,23 +433,92 @@ func (m *Manager) acquireGroupLocked(groupID string) (*Lease, bool, time.Time) {
 	}
 	now := time.Now()
 	var retryAt time.Time
+	stableExists := false
+	stableCooling := false
+	for _, node := range group.nodes {
+		if node.evicted {
+			continue
+		}
+		if node.successes >= imageNodeStableSuccess && node.failures == 0 {
+			stableExists = true
+			if node.inFlight < node.limit && now.Before(node.cooldownUntil) {
+				stableCooling = true
+			}
+		}
+		if now.Before(node.cooldownUntil) && (retryAt.IsZero() || node.cooldownUntil.Before(retryAt)) {
+			retryAt = node.cooldownUntil
+		}
+	}
+	canary := stableExists && (m.imageSelections+1)%imageNodeCanaryEvery == 0
+	index := -1
+	if canary {
+		index = m.pickProbeNodeLocked(group, now, "")
+	}
+	if index < 0 && stableExists {
+		index = m.pickStableNodeLocked(group, now, "")
+		if index < 0 && stableCooling {
+			index = m.pickProbeNodeLocked(group, now, "")
+		}
+	} else if index < 0 {
+		index = m.pickProbeNodeLocked(group, now, "")
+	}
+	if index >= 0 {
+		node := group.nodes[index]
+		node.inFlight++
+		m.imageSelections++
+		m.imageCursor = (index + 1) % len(group.nodes)
+		return newImageLease(m, group, node), true, time.Time{}
+	}
+	return nil, true, retryAt
+}
+
+func (m *Manager) pickStableNodeLocked(group *imageGroup, now time.Time, excludedURL string) int {
+	best := -1
 	for offset := 0; offset < len(group.nodes); offset++ {
 		index := (m.imageCursor + offset) % len(group.nodes)
 		node := group.nodes[index]
-		if node.inFlight >= node.limit {
+		if node.evicted || node.url == excludedURL || node.successes < imageNodeStableSuccess || node.failures > 0 ||
+			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
 			continue
 		}
-		if now.Before(node.cooldownUntil) {
-			if retryAt.IsZero() || node.cooldownUntil.Before(retryAt) {
-				retryAt = node.cooldownUntil
-			}
-			continue
+		if best < 0 || imageNodeBetter(node, group.nodes[best]) {
+			best = index
 		}
-		node.inFlight++
-		m.imageCursor = (index + 1) % len(group.nodes)
-		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}, true, time.Time{}
 	}
-	return nil, true, retryAt
+	return best
+}
+
+func (m *Manager) pickProbeNodeLocked(group *imageGroup, now time.Time, excludedURL string) int {
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.evicted || node.url == excludedURL || node.successes >= imageNodeStableSuccess ||
+			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
+			continue
+		}
+		return index
+	}
+	return -1
+}
+
+func imageNodeBetter(candidate, current *imageNode) bool {
+	left := candidate.inFlight * current.limit
+	right := current.inFlight * candidate.limit
+	if left != right {
+		return left < right
+	}
+	return effectiveImageNodeLatency(candidate) < effectiveImageNodeLatency(current)
+}
+
+func effectiveImageNodeLatency(node *imageNode) int64 {
+	if node == nil || node.latencyMS <= 0 {
+		return int64((60 * time.Second) / time.Millisecond)
+	}
+	return node.latencyMS
+}
+
+func newImageLease(manager *Manager, group *imageGroup, node *imageNode) *Lease {
+	return &Lease{manager: manager, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
 }
 
 func (m *Manager) resolveImageFallback() (string, bool) {
@@ -502,18 +597,24 @@ func (m *Manager) AcquireStableImage(fields map[string]any, excludedURL string) 
 	}
 	now := time.Now()
 	excludedURL = normalizeURL(excludedURL)
-	for offset := 0; offset < len(group.nodes); offset++ {
-		index := (m.imageCursor + offset) % len(group.nodes)
-		node := group.nodes[index]
-		if node.evicted || node.url == excludedURL || node.successes < imageNodeStableSuccess || node.failures > 0 ||
-			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
-			continue
-		}
-		node.inFlight++
-		m.imageCursor = (index + 1) % len(group.nodes)
-		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+	index := m.pickStableNodeLocked(group, now, excludedURL)
+	if index < 0 {
+		return nil
 	}
-	return nil
+	node := group.nodes[index]
+	node.inFlight++
+	m.imageCursor = (index + 1) % len(group.nodes)
+	return newImageLease(m, group, node)
+}
+
+func (l *Lease) ObserveLatency(elapsed time.Duration, slowAfter time.Duration) {
+	if l == nil || elapsed <= 0 {
+		return
+	}
+	l.latencyMS.Add(max(elapsed.Milliseconds(), 1))
+	if slowAfter > 0 && elapsed > slowAfter {
+		l.slow.Store(true)
+	}
 }
 
 func (l *Lease) Release(runtimeFailure bool) {
@@ -530,6 +631,7 @@ func (l *Lease) Release(runtimeFailure bool) {
 			l.node.inFlight--
 		}
 		runtimeFailure = runtimeFailure || l.failed.Load()
+		observedLatencyMS := l.latencyMS.Load()
 		if runtimeFailure && !l.node.evicted {
 			l.node.failures++
 			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
@@ -552,14 +654,25 @@ func (l *Lease) Release(runtimeFailure bool) {
 					}
 				}
 			}
-			event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Failures: l.node.failures, Successes: l.node.successes, Removed: removed}
+			event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Failures: l.node.failures, Successes: l.node.successes, LatencyMS: l.node.latencyMS, Removed: removed}
 		} else if !runtimeFailure && !l.node.evicted {
 			hadFailures := l.node.failures > 0
 			l.node.failures = 0
-			l.node.cooldownUntil = time.Time{}
 			l.node.successes++
-			if hadFailures || l.node.successes == imageNodeStableSuccess || l.node.successes%25 == 0 {
-				event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Successes: l.node.successes}
+			if observedLatencyMS > 0 {
+				if l.node.latencyMS <= 0 {
+					l.node.latencyMS = observedLatencyMS
+				} else {
+					l.node.latencyMS = (l.node.latencyMS*7 + observedLatencyMS*3) / 10
+				}
+			}
+			if l.slow.Load() {
+				l.node.cooldownUntil = time.Now().Add(imageNodeSlowCooldown)
+			} else {
+				l.node.cooldownUntil = time.Time{}
+			}
+			if hadFailures || l.slow.Load() || l.node.successes == imageNodeStableSuccess || l.node.successes%25 == 0 {
+				event = &ImageNodeRuntimeResult{GroupID: l.GroupID, GroupName: l.GroupName, NodeID: l.NodeID, NodeName: l.NodeName, URL: l.URL, Successes: l.node.successes, LatencyMS: l.node.latencyMS}
 			}
 		}
 		callback := l.manager.onImageResult
