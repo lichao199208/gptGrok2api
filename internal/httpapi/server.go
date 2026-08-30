@@ -173,7 +173,10 @@ func New(cfg config.Config) *Server {
 // token remain available for the normal AT refresh flow, and the setting is
 // checked on every event so changes take effect without restarting the server.
 func (s *Server) maybeAutoRemoveInvalidAccount(account accounts.Account) {
-	if strings.TrimSpace(account.Token) == "" || strings.TrimSpace(stringValue(account.Fields["refresh_token"])) != "" {
+	if strings.TrimSpace(account.Token) == "" ||
+		strings.TrimSpace(stringValue(account.Fields["refresh_token"])) != "" ||
+		(strings.TrimSpace(stringValue(account.Fields["login_password"])) != "" &&
+			strings.TrimSpace(firstNonEmpty(stringValue(account.Fields["two_factor_secret"]), stringValue(account.Fields["totp_secret"]))) != "") {
 		return
 	}
 	settings, err := s.store.Config()
@@ -1859,13 +1862,7 @@ func accountStatusCategory(account map[string]any) string {
 	switch errorKind {
 	case "quota_exhausted", "media_pending", "media_generation_unavailable", "media_degraded", "lane_degraded", "text_pending":
 		return "limited"
-	case "auth_invalid", "parse_failure", "upstream_error":
-		return "abnormal"
-	}
-	if stringValue(account["last_refresh_error"]) != "" || stringValue(account["last_token_refresh_error"]) != "" {
-		return "abnormal"
-	}
-	if intValue(account["invalid_count"]) > 0 {
+	case "auth_invalid", "parse_failure":
 		return "abnormal"
 	}
 	if status == "abnormal" || status == "invalid" || status == "error" || status == "incomplete" || status == "异常" {
@@ -1888,6 +1885,10 @@ func accountAutoRemoveInvalid(account map[string]any) bool {
 	if strings.TrimSpace(stringValue(account["refresh_token"])) != "" {
 		return false
 	}
+	if strings.TrimSpace(stringValue(account["login_password"])) != "" &&
+		strings.TrimSpace(firstNonEmpty(stringValue(account["two_factor_secret"]), stringValue(account["totp_secret"]))) != "" {
+		return false
+	}
 
 	status := strings.ToLower(strings.TrimSpace(stringValue(account["status"])))
 	reason := strings.ToLower(strings.TrimSpace(stringValue(account["status_reason_code"])))
@@ -1899,7 +1900,7 @@ func accountAutoRemoveInvalid(account map[string]any) bool {
 	if status == "invalid" || status == "expired" || status == "unauthorized" {
 		return true
 	}
-	return errorKind == "auth_invalid" && (errorStatus == http.StatusUnauthorized || errorStatus == http.StatusForbidden)
+	return errorKind == "auth_invalid" && errorStatus == http.StatusUnauthorized
 }
 
 func accountStatusMatches(account map[string]any, filter string) bool {

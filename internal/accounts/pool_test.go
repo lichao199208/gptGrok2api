@@ -77,8 +77,41 @@ func TestPoolFeedbackInvokesInvalidCallbackOnlyForAuthFailures(t *testing.T) {
 	if called != 0 {
 		t.Fatalf("temporary upstream error invoked invalid callback %d times", called)
 	}
+	p.Feedback(account, 403, errors.New("cloudflare forbidden"))
+	if called != 0 {
+		t.Fatalf("temporary forbidden response invoked invalid callback %d times", called)
+	}
+	items, err := repository.AccountList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := items[0]["status"]; got != "正常" {
+		t.Fatalf("403 marked account abnormal: %#v", items[0])
+	}
 	p.Feedback(account, 401, errors.New("unauthorized"))
 	if called != 1 {
 		t.Fatalf("expected one invalid callback, got %d", called)
+	}
+}
+
+func TestPoolSuccessfulFeedbackClearsStaleRequestAbnormalState(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	stored := map[string]any{
+		"access_token": "one", "pool": "basic", "enabled": true, "status": "异常",
+		"status_reason_code": "auth_invalid", "last_error_kind": "auth_invalid",
+		"last_error_status": 403, "last_error_message": "temporary forbidden", "invalid_count": 1,
+	}
+	if err := repository.SaveAccounts([]map[string]any{stored}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(repository)
+	p.Feedback(Account{Token: "one", Pool: "basic", Fields: stored}, 200, nil)
+	items, err := repository.AccountList()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if items[0]["status"] != "正常" || intValue(items[0]["invalid_count"]) != 0 || stringValue(items[0]["last_error_kind"]) != "" {
+		t.Fatalf("successful request did not recover account: %#v", items[0])
 	}
 }

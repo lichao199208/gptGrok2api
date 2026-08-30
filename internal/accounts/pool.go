@@ -136,12 +136,29 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 		delete(p.cooldowns, account.Token)
 		delete(p.failures, account.Token)
 		p.mu.Unlock()
+		// A completed upstream request is positive proof that the credential is
+		// usable. Clear stale request markers left by an earlier proxy/CDN error.
+		if hasRequestErrorMarkers(account.Fields) {
+			updates := map[string]any{
+				"last_error_kind":    nil,
+				"last_error_status":  nil,
+				"last_error_message": nil,
+				"last_error_at":      nil,
+				"status_reason_code": nil,
+				"invalid_count":      0,
+				"cooldown_until":     nil,
+			}
+			if isRequestMarkedAbnormal(account.Fields) {
+				updates["status"] = "正常"
+			}
+			_, _, _ = p.repository.UpdateAccount(account.Token, updates)
+		}
 		return
 	}
 	p.failures[account.Token]++
 	failureCount := p.failures[account.Token]
 	cooldown := time.Duration(5*(1<<min(failureCount-1, 5))) * time.Second
-	if status == 401 || status == 403 {
+	if status == 401 {
 		cooldown = 10 * time.Minute
 	} else if status == 429 {
 		if parsed := retryAfterDuration(err); parsed > 0 {
@@ -156,9 +173,10 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 		"last_error_status": status,
 		"last_error_at":     time.Now().UTC().Format(time.RFC3339),
 	}
-	if status == 401 || status == 403 {
+	if status == 401 {
 		updates["status"] = "异常"
 		updates["status_reason_code"] = "auth_invalid"
+		updates["last_error_kind"] = "auth_invalid"
 	} else if status == 429 {
 		updates["status_reason_code"] = "lane_backoff"
 		updates["last_error_kind"] = "rate_limited"
@@ -168,7 +186,7 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 		updates["last_error_message"] = truncate(err.Error(), 300)
 	}
 	_, _, _ = p.repository.UpdateAccount(account.Token, updates)
-	if status == 401 || status == 403 {
+	if status == 401 {
 		p.mu.Lock()
 		callback := p.onInvalid
 		p.mu.Unlock()
@@ -176,6 +194,26 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 			callback(account)
 		}
 	}
+}
+
+func hasRequestErrorMarkers(fields map[string]any) bool {
+	if fields == nil {
+		return false
+	}
+	for _, key := range []string{"last_error_kind", "last_error_status", "last_error_message", "last_error_at", "status_reason_code", "cooldown_until"} {
+		if fields[key] != nil && strings.TrimSpace(fmt.Sprint(fields[key])) != "" {
+			return true
+		}
+	}
+	return intValue(fields["invalid_count"]) > 0
+}
+
+func isRequestMarkedAbnormal(fields map[string]any) bool {
+	status := strings.ToLower(strings.TrimSpace(stringValue(fields["status"])))
+	reason := strings.ToLower(strings.TrimSpace(stringValue(fields["status_reason_code"])))
+	kind := strings.ToLower(strings.TrimSpace(stringValue(fields["last_error_kind"])))
+	return status == "异常" || status == "abnormal" || status == "invalid" || status == "unauthorized" ||
+		reason == "auth_invalid" || reason == "account_invalid" || kind == "auth_invalid"
 }
 
 func retryAfterDuration(err error) time.Duration {

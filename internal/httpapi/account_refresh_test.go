@@ -48,6 +48,8 @@ func TestAccountRefreshHTTPFlowPersistsRemoteFieldsAndRedactsSecrets(t *testing.
 	server := New(cfg)
 	_, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
 		"access_token": "access-1", "refresh_token": "refresh-secret", "id_token": "id-secret", "source_type": "chatgpt_web",
+		"status": "异常", "invalid_count": 2, "status_reason_code": "auth_invalid", "last_error_kind": "auth_invalid",
+		"last_error_status": 403, "last_refresh_error": "stale error", "cooldown_until": time.Now().Add(time.Hour).Format(time.RFC3339),
 	}})
 	if err != nil {
 		t.Fatal(err)
@@ -104,6 +106,9 @@ func TestAccountRefreshHTTPFlowPersistsRemoteFieldsAndRedactsSecrets(t *testing.
 	}
 	if account[0]["email"] != "account@example.test" || account[0]["quota"] != float64(9) || account[0]["status"] != "正常" {
 		t.Fatalf("remote fields were not persisted: %#v", account[0])
+	}
+	if intValue(account[0]["invalid_count"]) != 0 || stringValue(account[0]["last_error_kind"]) != "" || stringValue(account[0]["cooldown_until"]) != "" {
+		t.Fatalf("successful refresh kept stale abnormal markers: %#v", account[0])
 	}
 }
 

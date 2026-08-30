@@ -138,6 +138,16 @@ func TestAccountAutoRemoveInvalidRequiresDefinitiveExpiredToken(t *testing.T) {
 			item: map[string]any{"access_token": "temporary", "status": "正常", "last_error_kind": "upstream_error", "last_error_status": 503},
 			want: false,
 		},
+		{
+			name: "forbidden proxy response retained",
+			item: map[string]any{"access_token": "forbidden", "status": "正常", "last_error_kind": "upstream_error", "last_error_status": 403},
+			want: false,
+		},
+		{
+			name: "password and two factor account retained",
+			item: map[string]any{"access_token": "recoverable", "status": "异常", "status_reason_code": "auth_invalid", "last_error_status": 401, "login_password": "secret", "two_factor_secret": "JBSWY3DPEHPK3PXP"},
+			want: false,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -145,5 +155,15 @@ func TestAccountAutoRemoveInvalidRequiresDefinitiveExpiredToken(t *testing.T) {
 				t.Fatalf("accountAutoRemoveInvalid() = %v, want %v: %#v", got, test.want, test.item)
 			}
 		})
+	}
+}
+
+func TestAccountStatusCategoryDoesNotTreatTransientMarkersAsAbnormal(t *testing.T) {
+	account := map[string]any{
+		"status": "正常", "quota": 7, "last_error_kind": "upstream_error",
+		"last_error_status": 403, "last_refresh_error": "temporary proxy failure", "invalid_count": 1,
+	}
+	if category := accountStatusCategory(account); category != "normal" {
+		t.Fatalf("expected transient markers to remain normal, got %q", category)
 	}
 }

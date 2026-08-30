@@ -403,6 +403,9 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 	updates["last_token_refresh_at"] = time.Now().UTC().Format(time.RFC3339)
 	updates["last_token_refresh_error"] = nil
 	updates["last_token_refresh_error_at"] = nil
+	updates["invalid_count"] = 0
+	updates["cooldown_until"] = nil
+	updates["next_retry_at"] = nil
 	// A successful remote refresh supersedes every error marker left by an
 	// earlier refresh or request attempt. Keeping any of these fields makes the
 	// admin status endpoint classify an otherwise healthy account as abnormal.
