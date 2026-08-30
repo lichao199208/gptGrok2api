@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"image"
 	"image/color"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +19,57 @@ import (
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/accounts"
+	proxyruntime "github.com/auucoder/gptgrok2api-go/internal/proxy"
 )
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+func TestOpenAIImageUploadRetriesProxyThenFallsBackToDirect(t *testing.T) {
+	payload := []byte("replayable-image-payload")
+	proxyAttempts := 0
+	directAttempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		raw, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(raw, payload) {
+			t.Fatalf("upload body changed between retries: %q", raw)
+		}
+		if proxyruntime.URLFromContext(request.Context()) != "" {
+			proxyAttempts++
+			return nil, errors.New("read: connection reset by peer")
+		}
+		directAttempts++
+		return &http.Response{StatusCode: http.StatusCreated, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("")), Request: request}, nil
+	})}
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, nil, 10*time.Second)
+	ctx := proxyruntime.WithURL(context.Background(), "http://proxy.invalid:8080")
+	err := imageClient.uploadInputBlob(ctx, accounts.Account{}, "https://storage.invalid/upload", payload, map[string]string{"Content-Type": "image/png"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxyAttempts != 2 || directAttempts != 1 {
+		t.Fatalf("unexpected attempts: proxy=%d direct=%d", proxyAttempts, directAttempts)
+	}
+}
+
+func TestOpenAIImageUploadDoesNotRetryNonRetryableResponse(t *testing.T) {
+	attempts := 0
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		attempts++
+		return &http.Response{StatusCode: http.StatusBadRequest, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("invalid upload")), Request: request}, nil
+	})}
+	imageClient := NewOpenAIImage("https://chatgpt.invalid", client, nil, 10*time.Second)
+	err := imageClient.uploadInputBlob(proxyruntime.WithURL(context.Background(), "http://proxy.invalid:8080"), accounts.Account{}, "https://storage.invalid/upload", []byte("image"), nil)
+	if err == nil || attempts != 1 {
+		t.Fatalf("expected one non-retryable attempt, attempts=%d err=%v", attempts, err)
+	}
+}
 
 func TestOpenAIImageGenerationFlow(t *testing.T) {
 	fileID := "file_000000001234567890abcdef12345678"
