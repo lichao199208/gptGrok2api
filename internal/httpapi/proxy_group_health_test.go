@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestProxyGroupTestPersistsEachNodeAndRejectsHTTP403(t *testing.T) {
+func TestProxyGroupTestPersistsEachNodeAndKeepsHTTP403ForAPIVerification(t *testing.T) {
 	root := t.TempDir()
 	cfg := adminTestConfig(root)
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
@@ -59,8 +59,8 @@ func TestProxyGroupTestPersistsEachNodeAndRejectsHTTP403(t *testing.T) {
 	if !boolValue(byNode["node-ok"]["ok"], false) || intValue(byNode["node-ok"]["status"]) != http.StatusNoContent {
 		t.Fatalf("available node was not healthy: %#v", byNode["node-ok"])
 	}
-	if boolValue(byNode["node-403"]["ok"], true) || intValue(byNode["node-403"]["status"]) != http.StatusForbidden || stringValue(byNode["node-403"]["error"]) != "HTTP 403" {
-		t.Fatalf("HTTP 403 node was not rejected: %#v", byNode["node-403"])
+	if !boolValue(byNode["node-403"]["ok"], false) || intValue(byNode["node-403"]["status"]) != http.StatusForbidden || stringValue(byNode["node-403"]["verification"]) != "api_required" {
+		t.Fatalf("HTTP 403 node was not retained for API verification: %#v", byNode["node-403"])
 	}
 
 	stored, err := server.store.Config()
@@ -76,8 +76,8 @@ func TestProxyGroupTestPersistsEachNodeAndRejectsHTTP403(t *testing.T) {
 	if intValue(persisted["node-ok"]["last_status"]) != http.StatusNoContent || stringValue(persisted["node-ok"]["last_checked_at"]) == "" || stringValue(persisted["node-ok"]["last_error"]) != "" {
 		t.Fatalf("healthy node status was not persisted: %#v", persisted["node-ok"])
 	}
-	if intValue(persisted["node-403"]["last_status"]) != http.StatusForbidden || stringValue(persisted["node-403"]["last_error"]) != "HTTP 403" || stringValue(persisted["node-403"]["last_error_at"]) == "" {
-		t.Fatalf("failed node status was not persisted: %#v", persisted["node-403"])
+	if intValue(persisted["node-403"]["last_status"]) != http.StatusForbidden || stringValue(persisted["node-403"]["last_error"]) != "" || stringValue(persisted["node-403"]["last_verification"]) != "api_required" {
+		t.Fatalf("indeterminate node status was not persisted: %#v", persisted["node-403"])
 	}
 }
 
@@ -85,7 +85,7 @@ func TestProxyTestStatusOK(t *testing.T) {
 	for _, test := range []struct {
 		status int
 		ok     bool
-	}{{199, false}, {200, true}, {302, true}, {399, true}, {400, false}, {403, false}, {500, false}} {
+	}{{199, false}, {200, true}, {302, true}, {399, true}, {400, false}, {403, true}, {500, false}} {
 		if got := proxyTestStatusOK(test.status); got != test.ok {
 			t.Fatalf("status %d: got %v, want %v", test.status, got, test.ok)
 		}

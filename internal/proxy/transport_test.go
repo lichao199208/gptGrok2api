@@ -27,6 +27,52 @@ func TestManagerUsesAccountThenRotatesPool(t *testing.T) {
 	}
 }
 
+func TestImageGroupLeasesIncludeHTTP403AndKeepRequestAffinity(t *testing.T) {
+	manager := NewManager("http://default.invalid:8080", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{
+		ID: "images", Enabled: true, Nodes: []NodeConfig{
+			{ID: "forbidden-probe", URL: "http://one.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, LastStatus: http.StatusForbidden, LastError: "HTTP 403"},
+			{ID: "healthy", URL: "http://two.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, LastStatus: http.StatusNoContent},
+			{ID: "dead", URL: "http://dead.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, LastStatus: http.StatusBadGateway, LastError: "HTTP 502"},
+		},
+	}})
+
+	first := manager.AcquireImage(nil)
+	if first.NodeID != "forbidden-probe" || first.URL != "http://one.invalid:8080" {
+		t.Fatalf("HTTP 403 node was not selected for runtime validation: %#v", first)
+	}
+	ctx := WithURL(context.Background(), first.URL)
+	if selected, ok := URLSelectionFromContext(ctx); !ok || selected != first.URL {
+		t.Fatalf("request-scoped proxy affinity was lost: %q, %v", selected, ok)
+	}
+	second := manager.AcquireImage(nil)
+	if second.NodeID != "healthy" {
+		t.Fatalf("second request did not rotate to the next node: %#v", second)
+	}
+	third := manager.AcquireImage(nil)
+	if third.URL != "http://default.invalid:8080" || third.Source != "default" {
+		t.Fatalf("default proxy was not retained as capacity fallback: %#v", third)
+	}
+	first.Release(false)
+	second.Release(false)
+	third.Release(false)
+}
+
+func TestImageGroupRuntimeFailureCoolsNodeAndSwitches(t *testing.T) {
+	manager := NewManager("http://default.invalid:8080", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "one", URL: "http://one.invalid:8080", Enabled: true, LastStatus: http.StatusForbidden},
+		{ID: "two", URL: "http://two.invalid:8080", Enabled: true, LastStatus: http.StatusForbidden},
+	}}})
+	failed := manager.AcquireImage(nil)
+	failed.Release(true)
+	retry := manager.AcquireImage(nil)
+	defer retry.Release(false)
+	if failed.NodeID == retry.NodeID || retry.NodeID != "two" {
+		t.Fatalf("retry did not switch away from cooled node: failed=%s retry=%s", failed.NodeID, retry.NodeID)
+	}
+}
+
 func TestHTTPProxyTransport(t *testing.T) {
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("target-ok")) }))
 	defer target.Close()

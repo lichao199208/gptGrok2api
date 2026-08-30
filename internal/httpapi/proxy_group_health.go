@@ -127,7 +127,7 @@ func (s *Server) testProxyGroupNodes(ctx context.Context, nodes []map[string]any
 
 func (s *Server) testProxyGroupCandidate(parent context.Context, client *http.Client, candidate string) map[string]any {
 	started := time.Now()
-	result := map[string]any{"ok": false, "status": 0, "latency_ms": int64(0), "has_proxy": true, "proxy_source": "group"}
+	result := map[string]any{"ok": false, "reachable": false, "verification": "failed", "status": 0, "latency_ms": int64(0), "has_proxy": true, "proxy_source": "group"}
 	parsed, err := url.Parse(strings.TrimSpace(candidate))
 	if err != nil || parsed.Host == "" {
 		result["error"] = "invalid proxy url"
@@ -148,7 +148,14 @@ func (s *Server) testProxyGroupCandidate(parent context.Context, client *http.Cl
 			_ = response.Body.Close()
 			result["status"] = response.StatusCode
 			result["ok"] = proxyTestStatusOK(response.StatusCode)
-			if !proxyTestStatusOK(response.StatusCode) {
+			result["reachable"] = proxyTestReachable(response.StatusCode)
+			if response.StatusCode == http.StatusForbidden {
+				result["verification"] = "api_required"
+				result["status_label"] = "可连接，需真实图片验证"
+			} else if proxyTestStatusOK(response.StatusCode) {
+				result["verification"] = "probe_ok"
+				result["status_label"] = "可用"
+			} else {
 				result["error"] = fmt.Sprintf("HTTP %d", response.StatusCode)
 			}
 		}
@@ -163,7 +170,11 @@ func (s *Server) testProxyGroupCandidate(parent context.Context, client *http.Cl
 }
 
 func proxyTestStatusOK(status int) bool {
-	return status >= http.StatusOK && status < http.StatusBadRequest
+	return (status >= http.StatusOK && status < http.StatusBadRequest) || status == http.StatusForbidden
+}
+
+func proxyTestReachable(status int) bool {
+	return status >= http.StatusOK && status < http.StatusInternalServerError
 }
 
 func failedProxyTestResult(err error) map[string]any {
@@ -171,7 +182,7 @@ func failedProxyTestResult(err error) map[string]any {
 	if err != nil {
 		message = err.Error()
 	}
-	return map[string]any{"ok": false, "status": 0, "latency_ms": int64(0), "error": message, "has_proxy": true, "proxy_source": "group"}
+	return map[string]any{"ok": false, "reachable": false, "verification": "failed", "status": 0, "latency_ms": int64(0), "error": message, "has_proxy": true, "proxy_source": "group"}
 }
 
 func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNodeTest) (map[string]any, error) {
@@ -201,6 +212,8 @@ func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNod
 				nextNode["last_checked_at"] = checkedAt
 				nextNode["last_latency_ms"] = intValue(result["latency_ms"])
 				nextNode["last_status"] = intValue(result["status"])
+				nextNode["last_verification"] = stringValue(result["verification"])
+				nextNode["last_status_label"] = stringValue(result["status_label"])
 				if boolValue(result["ok"], false) {
 					nextNode["last_error"] = ""
 					nextNode["last_error_at"] = ""

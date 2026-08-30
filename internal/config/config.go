@@ -41,6 +41,8 @@ type Config struct {
 	ImagineWSURL           string
 	ProxyURL               string
 	ProxyPool              []string
+	FallbackProxy          string
+	ProxyGroups            []ProxyGroup
 	ResourceProxyURL       string
 	ResourceProxyPool      []string
 	ProxyUpstreamsFile     string
@@ -70,6 +72,24 @@ type Config struct {
 	ChatRetryCodes         map[int]bool
 	ImageRetentionDays     int
 	ImageCleanupInterval   time.Duration
+}
+
+type ProxyGroup struct {
+	ID       string
+	Name     string
+	Enabled  bool
+	Strategy string
+	Nodes    []ProxyNode
+}
+
+type ProxyNode struct {
+	ID                    string
+	Name                  string
+	URL                   string
+	Enabled               bool
+	ImageConcurrencyLimit int
+	LastStatus            int
+	LastError             string
 }
 
 func Load(root string) (Config, error) {
@@ -209,6 +229,8 @@ func Load(root string) (Config, error) {
 }
 
 func applyProxyConfig(cfg *Config, values map[string]any) {
+	cfg.FallbackProxy = firstString(values, "fallback_proxy")
+	cfg.ProxyGroups = parseProxyGroups(values["proxy_groups"])
 	if proxyURL, ok := values["proxy"].(string); ok {
 		if cfg.ProxyURL == "" {
 			cfg.ProxyURL = strings.TrimSpace(proxyURL)
@@ -233,6 +255,61 @@ func applyProxyConfig(cfg *Config, values map[string]any) {
 	}
 	if len(cfg.ResourceProxyPool) == 0 {
 		cfg.ResourceProxyPool = anyStringList(proxyValue["resource_proxy_pool"])
+	}
+}
+
+func parseProxyGroups(value any) []ProxyGroup {
+	rawGroups, _ := value.([]any)
+	groups := make([]ProxyGroup, 0, len(rawGroups))
+	for _, rawGroup := range rawGroups {
+		groupMap, _ := rawGroup.(map[string]any)
+		if groupMap == nil {
+			continue
+		}
+		group := ProxyGroup{
+			ID: firstString(groupMap, "id"), Name: firstString(groupMap, "name"),
+			Enabled: configBool(groupMap["enabled"], true), Strategy: firstString(groupMap, "strategy"),
+		}
+		rawNodes, _ := groupMap["nodes"].([]any)
+		for _, rawNode := range rawNodes {
+			nodeMap, _ := rawNode.(map[string]any)
+			if nodeMap == nil {
+				continue
+			}
+			node := ProxyNode{
+				ID: firstString(nodeMap, "id"), Name: firstString(nodeMap, "name"), URL: firstString(nodeMap, "url"),
+				Enabled: configBool(nodeMap["enabled"], true), ImageConcurrencyLimit: configInt(nodeMap["image_concurrency_limit"]),
+				LastStatus: configInt(nodeMap["last_status"]), LastError: firstString(nodeMap, "last_error"),
+			}
+			if node.ImageConcurrencyLimit < 1 {
+				node.ImageConcurrencyLimit = 20
+			}
+			group.Nodes = append(group.Nodes, node)
+		}
+		groups = append(groups, group)
+	}
+	return groups
+}
+
+func configBool(value any, fallback bool) bool {
+	if parsed, ok := value.(bool); ok {
+		return parsed
+	}
+	return fallback
+}
+
+func configInt(value any) int {
+	switch typed := value.(type) {
+	case float64:
+		return int(typed)
+	case int:
+		return typed
+	case json.Number:
+		parsed, _ := strconv.Atoi(typed.String())
+		return parsed
+	default:
+		parsed, _ := strconv.Atoi(strings.TrimSpace(fmt.Sprint(value)))
+		return parsed
 	}
 }
 

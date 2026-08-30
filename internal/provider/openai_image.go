@@ -112,7 +112,7 @@ func (o *OpenAIImage) SetProxyManager(manager *proxyruntime.Manager) {
 	o.Proxy = manager
 }
 
-func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, prompt, model, size, quality string, inputs []OpenAIImageInput) ([]ImageResult, error) {
+func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, prompt, model, size, quality string, inputs []OpenAIImageInput) (results []ImageResult, err error) {
 	if strings.TrimSpace(account.Token) == "" {
 		return nil, fmt.Errorf("OpenAI image generation requires an access token")
 	}
@@ -125,6 +125,12 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	size = NormalizeOpenAIImageSize(size)
 	if quality == "" {
 		quality = "auto"
+	}
+	if o.Proxy != nil {
+		lease := o.Proxy.AcquireImage(account.Fields)
+		ctx = proxyruntime.WithURL(ctx, lease.URL)
+		notifyOpenAIImageEgress(ctx, lease.URL)
+		defer func() { lease.Release(openAIImageProxyFailure(err)) }()
 	}
 	prompt = strings.TrimSpace(prompt) + "\n\n输出图片尺寸为 " + size + "。\n输出图片质量为 " + quality + "。"
 	references := make([]openAIImageReference, 0, len(inputs))
@@ -185,7 +191,7 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	if len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image generation completed without image files")
 	}
-	results := make([]ImageResult, 0, len(imageRefs))
+	results = make([]ImageResult, 0, len(imageRefs))
 	seen := map[string]bool{}
 	inputFileIDs := map[string]bool{}
 	var lastDownloadErr error
@@ -680,8 +686,8 @@ func (o *OpenAIImage) doAbsolute(ctx context.Context, method, endpoint string, a
 }
 
 func (o *OpenAIImage) doRequest(ctx context.Context, method, endpoint, targetPath string, account accounts.Account, body io.Reader, extra map[string]string, stream, authenticated bool) (*http.Response, error) {
-	proxyURL := ""
-	if o.Proxy != nil {
+	proxyURL, selected := proxyruntime.URLSelectionFromContext(ctx)
+	if !selected && o.Proxy != nil {
 		proxyURL = o.Proxy.Resolve(account.Fields, false)
 		ctx = proxyruntime.WithURL(ctx, proxyURL)
 	}
@@ -719,6 +725,22 @@ func (o *OpenAIImage) doRequest(ctx context.Context, method, endpoint, targetPat
 		return nil, upstreamErr
 	}
 	return response, nil
+}
+
+func openAIImageProxyFailure(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	var upstream *protocol.UpstreamError
+	if errors.As(err, &upstream) {
+		switch upstream.Status {
+		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound, http.StatusConflict,
+			http.StatusUnprocessableEntity, http.StatusTooManyRequests:
+			return false
+		}
+		return upstream.Status == http.StatusForbidden || upstream.Status >= http.StatusInternalServerError
+	}
+	return true
 }
 
 func (o *OpenAIImage) browserFor(proxyURL string) (*browserHTTP, error) {

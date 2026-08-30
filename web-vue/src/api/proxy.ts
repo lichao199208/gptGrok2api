@@ -3,6 +3,9 @@ import type { ClearanceTestResult, ProxyRuntimeSettings, ProxyRuntimeStatus } fr
 
 export interface ProxyTestResult {
   ok: boolean
+  reachable?: boolean
+  verification?: 'probe_ok' | 'api_required' | 'failed'
+  status_label?: string
   status: number
   latency_ms: number
   error?: string | null
@@ -46,6 +49,8 @@ export interface ProxyNode {
   last_error?: string
   last_checked_at?: string
   last_error_at?: string
+  last_verification?: string
+  last_status_label?: string
   cooldown_until?: string
   notes?: string
   source?: string

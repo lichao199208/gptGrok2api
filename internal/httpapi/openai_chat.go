@@ -130,7 +130,9 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 
 func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request, request protocol.ChatRequest) {
 	started := time.Now()
-	imageContext := s.monitorOpenAIImageContext(r, r.Context())
+	imageContext, cancelImageRequest := context.WithTimeout(r.Context(), imageRequestTotalTimeout(s.cfg.RequestTimeout))
+	defer cancelImageRequest()
+	imageContext = s.monitorOpenAIImageContext(r, imageContext)
 	s.enrichRequestMonitor(r, map[string]any{"model": request.Model})
 	prompt := protocol.ExtractMessage(request.Messages)
 	if strings.TrimSpace(prompt) == "" {

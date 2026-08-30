@@ -176,6 +176,8 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		count = 1
 	}
 	results := make([][]map[string]string, count)
+	ctx, timeoutCancel := context.WithTimeout(ctx, imageRequestTotalTimeout(s.cfg.RequestTimeout))
+	defer timeoutCancel()
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	ctx = s.monitorOpenAIImageContext(r, ctx)
@@ -275,6 +277,20 @@ func (s *Server) generateOpenAIImageData(r *http.Request, ctx context.Context, p
 		data = data[:count]
 	}
 	return data, nil
+}
+
+func imageRequestTotalTimeout(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 {
+		requestTimeout = 3 * time.Minute
+	}
+	total := requestTimeout * 2
+	if total < 2*time.Minute {
+		return 2 * time.Minute
+	}
+	if total > 6*time.Minute {
+		return 6 * time.Minute
+	}
+	return total
 }
 
 func (s *Server) parseImageEditRequest(r *http.Request) (imageEditRequest, error) {
@@ -837,6 +853,15 @@ func (s *Server) monitorOpenAIImageContext(r *http.Request, ctx context.Context)
 			meta["egress_label"] = "direct"
 		} else {
 			meta["egress_label"] = label
+			info := s.proxyManager.DescribeImageEgress(proxyURL)
+			meta["proxy_source"] = info.Source
+			if info.Source == "group" {
+				meta["egress_mode"] = "proxy_group"
+				meta["proxy_group_id"] = info.GroupID
+				meta["proxy_group_name"] = info.GroupName
+				meta["proxy_node_id"] = info.NodeID
+				meta["proxy_node_name"] = info.NodeName
+			}
 		}
 		s.enrichRequestMonitor(r, meta)
 	})

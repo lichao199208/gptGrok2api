@@ -84,6 +84,18 @@ type Server struct {
 func New(cfg config.Config) *Server {
 	repository := store.New(cfg.AccountsPath, cfg.AuthKeysPath, cfg.ConfigPath)
 	proxyManager := proxyruntime.NewManager(cfg.ProxyURL, cfg.ProxyPool)
+	groups := make([]proxyruntime.GroupConfig, 0, len(cfg.ProxyGroups))
+	for _, group := range cfg.ProxyGroups {
+		item := proxyruntime.GroupConfig{ID: group.ID, Name: group.Name, Enabled: group.Enabled, Strategy: group.Strategy}
+		for _, node := range group.Nodes {
+			item.Nodes = append(item.Nodes, proxyruntime.NodeConfig{
+				ID: node.ID, Name: node.Name, URL: node.URL, Enabled: node.Enabled,
+				ImageConcurrencyLimit: node.ImageConcurrencyLimit, LastStatus: node.LastStatus, LastError: node.LastError,
+			})
+		}
+		groups = append(groups, item)
+	}
+	proxyManager.ConfigureImageGroups(cfg.FallbackProxy, groups)
 	proxyManager.SetResource(cfg.ResourceProxyURL, cfg.ResourceProxyPool)
 	proxyManager.SetUpstreamsFile(cfg.ProxyUpstreamsFile)
 	proxyTransport := proxyruntime.NewTransport(http.DefaultTransport)

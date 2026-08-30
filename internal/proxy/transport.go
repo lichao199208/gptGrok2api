@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type contextKey struct{}
@@ -27,6 +28,11 @@ func WithURL(ctx context.Context, value string) context.Context {
 func URLFromContext(ctx context.Context) string {
 	value, _ := ctx.Value(contextKey{}).(string)
 	return strings.TrimSpace(value)
+}
+
+func URLSelectionFromContext(ctx context.Context) (string, bool) {
+	value, ok := ctx.Value(contextKey{}).(string)
+	return strings.TrimSpace(value), ok
 }
 
 func DialContext(ctx context.Context, target, proxyURL string) (net.Conn, error) {
@@ -97,6 +103,50 @@ type Manager struct {
 	resourcePool   []string
 	resourceCursor int
 	upstreamRouter *UpstreamRouter
+	imageGroups    map[string]*imageGroup
+	imageGroupID   string
+	imageCursor    int
+}
+
+type GroupConfig struct {
+	ID, Name, Strategy string
+	Enabled            bool
+	Nodes              []NodeConfig
+}
+
+type NodeConfig struct {
+	ID, Name, URL         string
+	Enabled               bool
+	ImageConcurrencyLimit int
+	LastStatus            int
+	LastError             string
+}
+
+type imageGroup struct {
+	id, name, strategy string
+	nodes              []*imageNode
+}
+
+type imageNode struct {
+	id, name, url             string
+	limit, inFlight, failures int
+	cooldownUntil             time.Time
+}
+
+type Lease struct {
+	manager   *Manager
+	node      *imageNode
+	URL       string
+	Source    string
+	GroupID   string
+	GroupName string
+	NodeID    string
+	NodeName  string
+	once      sync.Once
+}
+
+type EgressInfo struct {
+	Source, GroupID, GroupName, NodeID, NodeName string
 }
 
 func NewManager(single string, pool []string) *Manager {
@@ -106,7 +156,151 @@ func NewManager(single string, pool []string) *Manager {
 			clean = append(clean, value)
 		}
 	}
-	return &Manager{url: normalizeURL(single), pool: clean}
+	return &Manager{url: normalizeURL(single), pool: clean, imageGroups: map[string]*imageGroup{}}
+}
+
+// ConfigureImageGroups enables request-scoped image egress selection. A
+// fallback group is used as the active image pool; the default proxy remains
+// available when every group node is busy or cooling down.
+func (m *Manager) ConfigureImageGroups(fallback string, groups []GroupConfig) {
+	if m == nil {
+		return
+	}
+	next := map[string]*imageGroup{}
+	for _, group := range groups {
+		id := strings.TrimSpace(group.ID)
+		if id == "" || !group.Enabled {
+			continue
+		}
+		item := &imageGroup{id: id, name: strings.TrimSpace(group.Name), strategy: strings.TrimSpace(group.Strategy)}
+		for _, node := range group.Nodes {
+			proxyURL := normalizeURL(node.URL)
+			if !node.Enabled || proxyURL == "" || !probeAllowsRuntimeValidation(node.LastStatus, node.LastError) {
+				continue
+			}
+			limit := node.ImageConcurrencyLimit
+			if limit < 1 {
+				limit = 20
+			}
+			item.nodes = append(item.nodes, &imageNode{id: strings.TrimSpace(node.ID), name: strings.TrimSpace(node.Name), url: proxyURL, limit: limit})
+		}
+		next[id] = item
+	}
+	groupID := ""
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(fallback)), "group:") {
+		groupID = strings.TrimSpace(strings.TrimSpace(fallback)[len("group:"):])
+	}
+	m.mu.Lock()
+	m.imageGroups = next
+	m.imageGroupID = groupID
+	m.imageCursor = 0
+	m.mu.Unlock()
+}
+
+func probeAllowsRuntimeValidation(status int, lastError string) bool {
+	if status == http.StatusForbidden || (status >= 200 && status < 400) {
+		return true
+	}
+	return status == 0 && strings.TrimSpace(lastError) == ""
+}
+
+// AcquireImage chooses one proxy for the complete multi-stage image request.
+// The caller must release the lease so node concurrency and cooldown state stay accurate.
+func (m *Manager) AcquireImage(fields map[string]any) *Lease {
+	if m == nil {
+		return &Lease{}
+	}
+	if fields != nil {
+		for _, key := range []string{"proxy", "proxy_url", "proxyUrl"} {
+			value := strings.TrimSpace(stringValue(fields[key]))
+			if value == "" {
+				continue
+			}
+			if strings.HasPrefix(strings.ToLower(value), "group:") {
+				if lease := m.acquireGroup(strings.TrimSpace(value[len("group:"):])); lease != nil {
+					return lease
+				}
+				break
+			}
+			if normalized := normalizeURL(value); normalized != "" {
+				return &Lease{URL: normalized, Source: "account"}
+			}
+		}
+	}
+	m.mu.Lock()
+	groupID := m.imageGroupID
+	m.mu.Unlock()
+	if groupID != "" {
+		if lease := m.acquireGroup(groupID); lease != nil {
+			return lease
+		}
+	}
+	return &Lease{URL: m.Resolve(nil, false), Source: "default"}
+}
+
+func (m *Manager) acquireGroup(groupID string) *Lease {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	group := m.imageGroups[groupID]
+	if group == nil || len(group.nodes) == 0 {
+		return nil
+	}
+	now := time.Now()
+	for offset := 0; offset < len(group.nodes); offset++ {
+		index := (m.imageCursor + offset) % len(group.nodes)
+		node := group.nodes[index]
+		if node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
+			continue
+		}
+		node.inFlight++
+		m.imageCursor = (index + 1) % len(group.nodes)
+		return &Lease{manager: m, node: node, URL: node.url, Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+	}
+	return nil
+}
+
+func (l *Lease) Release(runtimeFailure bool) {
+	if l == nil {
+		return
+	}
+	l.once.Do(func() {
+		if l.manager == nil || l.node == nil {
+			return
+		}
+		l.manager.mu.Lock()
+		if l.node.inFlight > 0 {
+			l.node.inFlight--
+		}
+		if runtimeFailure {
+			l.node.failures++
+			cooldown := time.Duration(1<<min(l.node.failures-1, 4)) * time.Minute
+			l.node.cooldownUntil = time.Now().Add(cooldown)
+		} else {
+			l.node.failures = 0
+			l.node.cooldownUntil = time.Time{}
+		}
+		l.manager.mu.Unlock()
+	})
+}
+
+func (m *Manager) DescribeImageEgress(proxyURL string) EgressInfo {
+	if m == nil {
+		return EgressInfo{Source: "direct"}
+	}
+	normalized := normalizeURL(proxyURL)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, group := range m.imageGroups {
+		for _, node := range group.nodes {
+			if node.url == normalized {
+				return EgressInfo{Source: "group", GroupID: group.id, GroupName: group.name, NodeID: node.id, NodeName: node.name}
+			}
+		}
+	}
+	if normalized == "" {
+		return EgressInfo{Source: "direct"}
+	}
+	return EgressInfo{Source: "default"}
 }
 
 func (m *Manager) SetResource(single string, pool []string) {
@@ -190,6 +384,12 @@ func (m *Manager) Snapshot() map[string]any {
 		mode = "single_proxy"
 	}
 	snapshot := map[string]any{"mode": mode, "count": len(m.pool), "resource_count": len(m.resourcePool), "proxy_configured": m.url != "" || len(m.pool) > 0 || m.resourceURL != "" || len(m.resourcePool) > 0}
+	if group := m.imageGroups[m.imageGroupID]; group != nil {
+		snapshot["mode"] = "proxy_group"
+		snapshot["image_group_id"] = group.id
+		snapshot["image_group_count"] = len(group.nodes)
+		snapshot["proxy_configured"] = len(group.nodes) > 0 || snapshot["proxy_configured"] == true
+	}
 	if m.upstreamRouter != nil {
 		snapshot["upstreams"] = m.upstreamRouter.Snapshot()
 	}
