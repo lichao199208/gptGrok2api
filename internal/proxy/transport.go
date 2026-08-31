@@ -434,16 +434,12 @@ func (m *Manager) acquireGroupLocked(groupID string) (*Lease, bool, time.Time) {
 	now := time.Now()
 	var retryAt time.Time
 	stableExists := false
-	stableCooling := false
 	for _, node := range group.nodes {
 		if node.evicted {
 			continue
 		}
 		if node.successes >= imageNodeStableSuccess && node.failures == 0 {
 			stableExists = true
-			if node.inFlight < node.limit && now.Before(node.cooldownUntil) {
-				stableCooling = true
-			}
 		}
 		if now.Before(node.cooldownUntil) && (retryAt.IsZero() || node.cooldownUntil.Before(retryAt)) {
 			retryAt = node.cooldownUntil
@@ -456,10 +452,11 @@ func (m *Manager) acquireGroupLocked(groupID string) (*Lease, bool, time.Time) {
 	}
 	if index < 0 && stableExists {
 		index = m.pickStableNodeLocked(group, now, "")
-		if index < 0 && stableCooling {
-			index = m.pickProbeNodeLocked(group, now, "")
-		}
-	} else if index < 0 {
+	}
+	// When every stable node is busy or cooling down, use spare validation
+	// capacity instead of consuming the caller's entire request deadline in
+	// the egress queue.
+	if index < 0 {
 		index = m.pickProbeNodeLocked(group, now, "")
 	}
 	if index >= 0 {
@@ -492,7 +489,7 @@ func (m *Manager) pickProbeNodeLocked(group *imageGroup, now time.Time, excluded
 	for offset := 0; offset < len(group.nodes); offset++ {
 		index := (m.imageCursor + offset) % len(group.nodes)
 		node := group.nodes[index]
-		if node.evicted || node.url == excludedURL || node.successes >= imageNodeStableSuccess ||
+		if node.evicted || node.url == excludedURL || (node.successes >= imageNodeStableSuccess && node.failures == 0) ||
 			node.inFlight >= node.limit || now.Before(node.cooldownUntil) {
 			continue
 		}
