@@ -33,8 +33,9 @@ func (s *Server) proxyGroupTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		ID     string `json:"id"`
-		NodeID string `json:"node_id"`
+		ID          string `json:"id"`
+		NodeID      string `json:"node_id"`
+		PruneFailed bool   `json:"prune_failed"`
 	}
 	if !decodeJSON(w, r, &request) {
 		return
@@ -83,7 +84,7 @@ func (s *Server) proxyGroupTest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := s.testProxyGroupNodes(r.Context(), nodes)
-	updated, err := s.persistProxyGroupHealth(groupID, results)
+	updated, err := s.persistProxyGroupHealth(groupID, results, request.PruneFailed && nodeID == "")
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
 		return
@@ -189,7 +190,7 @@ func failedProxyTestResult(err error) map[string]any {
 	return map[string]any{"ok": false, "reachable": false, "verification": "failed", "status": 0, "latency_ms": int64(0), "error": message, "has_proxy": true, "proxy_source": "group"}
 }
 
-func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNodeTest) (map[string]any, error) {
+func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNodeTest, pruneFailed bool) (map[string]any, error) {
 	byNodeID := make(map[string]map[string]any, len(results))
 	for _, item := range results {
 		if id := slugID(item.NodeID); id != "" {
@@ -207,9 +208,22 @@ func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNod
 			found = true
 			nextGroup := cloneMap(currentGroup)
 			nodes := mapList(currentGroup["nodes"])
-			for nodeIndex, currentNode := range nodes {
+			failed := make(map[string]bool)
+			if pruneFailed {
+				for _, item := range results {
+					if !boolValue(item.Result["ok"], false) {
+						failed[slugID(item.NodeID)] = true
+					}
+				}
+			}
+			kept := make([]map[string]any, 0, len(nodes))
+			for _, currentNode := range nodes {
+				if pruneFailed && boolValue(currentNode["enabled"], true) && failed[slugID(stringValue(currentNode["id"]))] {
+					continue
+				}
 				result := byNodeID[slugID(stringValue(currentNode["id"]))]
 				if result == nil {
+					kept = append(kept, currentNode)
 					continue
 				}
 				nextNode := cloneMap(currentNode)
@@ -225,9 +239,9 @@ func (s *Server) persistProxyGroupHealth(groupID string, results []proxyGroupNod
 					nextNode["last_error"] = firstNonEmpty(stringValue(result["error"]), "检测失败")
 					nextNode["last_error_at"] = checkedAt
 				}
-				nodes[nodeIndex] = nextNode
+				kept = append(kept, nextNode)
 			}
-			nextGroup["nodes"] = nodes
+			nextGroup["nodes"] = kept
 			groups[groupIndex] = nextGroup
 			break
 		}

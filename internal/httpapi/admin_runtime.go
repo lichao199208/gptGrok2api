@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -259,11 +260,22 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var request struct {
-		URL string `json:"url"`
+		ID          string `json:"id"`
+		NodeID      string `json:"node_id"`
+		URL         string `json:"url"`
+		PruneFailed bool   `json:"prune_failed"`
 	}
 	if r.Body != nil && r.ContentLength != 0 && !decodeJSON(w, r, &request) {
 		return
 	}
+
+	// The group endpoint supports checking every configured node. Keep the
+	// explicit URL path below unchanged for the other proxy test endpoints.
+	if r.URL.Path == "/api/proxy/groups/test" && strings.TrimSpace(request.URL) == "" {
+		s.testProxyGroup(w, r, request.ID, request.NodeID, request.PruneFailed)
+		return
+	}
+
 	candidate := strings.TrimSpace(request.URL)
 	if candidate == "" {
 		candidate = s.proxyManager.Resolve(nil, false)
@@ -272,20 +284,113 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "proxy url is required", "invalid_request_error")
 		return
 	}
+	writeJSON(w, http.StatusOK, map[string]any{"result": s.testProxyCandidate(r.Context(), candidate)})
+}
+
+func (s *Server) testProxyGroup(w http.ResponseWriter, r *http.Request, groupID, nodeID string, pruneFailed bool) {
+	groupID = slugID(groupID)
+	if groupID == "" {
+		writeError(w, http.StatusBadRequest, "proxy group id or url is required", "invalid_request_error")
+		return
+	}
+	cfg, err := s.store.Config()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error(), "server_error")
+		return
+	}
+	groups := mapList(cfg["proxy_groups"])
+	var group map[string]any
+	for _, item := range groups {
+		if slugID(stringValue(item["id"])) == groupID {
+			group = item
+			break
+		}
+	}
+	if group == nil {
+		writeError(w, http.StatusNotFound, "proxy group not found", "not_found")
+		return
+	}
+
+	nodeID = slugID(nodeID)
+	type testedNode struct {
+		index  int
+		id     string
+		result map[string]any
+	}
+	tested := make([]testedNode, 0)
+	for index, node := range mapList(group["nodes"]) {
+		if !boolValue(node["enabled"], true) {
+			continue
+		}
+		id := strings.TrimSpace(stringValue(node["id"]))
+		candidate := strings.TrimSpace(stringValue(node["url"]))
+		if candidate == "" || (nodeID != "" && id != nodeID && slugID(id) != slugID(nodeID)) {
+			continue
+		}
+		tested = append(tested, testedNode{index: index, id: id, result: s.testProxyCandidate(r.Context(), candidate)})
+	}
+	if len(tested) == 0 {
+		writeError(w, http.StatusBadRequest, "proxy group node url is required", "invalid_request_error")
+		return
+	}
+
+	results := make([]map[string]any, 0, len(tested))
+	failedIndexes := make(map[int]bool)
+	for _, item := range tested {
+		results = append(results, map[string]any{"node_id": item.id, "result": item.result})
+		if !boolValue(item.result["ok"], false) {
+			failedIndexes[item.index] = true
+		}
+	}
+
+	updatedGroups := groups
+	// Only the all-node action prunes. A single-node check must never delete a
+	// node, even if a caller sends prune_failed=true accidentally.
+	if pruneFailed && nodeID == "" && len(failedIndexes) > 0 {
+		nextGroups := make([]map[string]any, 0, len(groups))
+		for _, item := range groups {
+			if slugID(stringValue(item["id"])) != groupID {
+				nextGroups = append(nextGroups, item)
+				continue
+			}
+			updated := cloneMap(item)
+			keptNodes := make([]map[string]any, 0)
+			for index, node := range mapList(item["nodes"]) {
+				if !failedIndexes[index] {
+					keptNodes = append(keptNodes, node)
+				}
+			}
+			updated["nodes"] = keptNodes
+			nextGroups = append(nextGroups, updated)
+		}
+		updatedConfig, updateErr := s.store.UpdateConfig("proxy_groups", nextGroups)
+		if updateErr != nil {
+			writeError(w, http.StatusInternalServerError, updateErr.Error(), "server_error")
+			return
+		}
+		updatedGroups = mapList(updatedConfig["proxy_groups"])
+	}
+	var singleResult map[string]any
+	if len(results) == 1 {
+		singleResult = results[0]["result"].(map[string]any)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"results": results, "result": singleResult, "groups": updatedGroups})
+}
+
+func (s *Server) testProxyCandidate(ctx context.Context, candidate string) map[string]any {
 	parsed, err := url.Parse(candidate)
 	if err != nil || parsed.Host == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"result": map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "invalid proxy url", "has_proxy": true}})
-		return
+		return map[string]any{"ok": false, "status": 0, "latency_ms": 0, "error": "invalid proxy url", "proxy_source": "input", "has_proxy": true}
 	}
 	client := &http.Client{Transport: proxyruntime.NewTransport(http.DefaultTransport), Timeout: 15 * time.Second}
 	started := time.Now()
-	req, err := http.NewRequestWithContext(proxyruntime.WithURL(r.Context(), candidate), http.MethodGet, "https://chatgpt.com/api/auth/csrf", nil)
+	req, err := http.NewRequestWithContext(proxyruntime.WithURL(ctx, candidate), http.MethodGet, "https://chatgpt.com/api/auth/csrf", nil)
 	result := map[string]any{"proxy_source": "input", "has_proxy": true}
 	if err == nil {
 		var response *http.Response
 		response, err = client.Do(req)
 		if response != nil {
-			defer response.Body.Close()
+			response.Body.Close()
 			result["status"] = response.StatusCode
 			result["ok"] = proxyTestStatusOK(response.StatusCode)
 			if !proxyTestStatusOK(response.StatusCode) {
@@ -299,7 +404,7 @@ func (s *Server) proxyTest(w http.ResponseWriter, r *http.Request) {
 		result["status"] = 0
 		result["error"] = redactProxyError(err.Error())
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"result": result})
+	return result
 }
 
 func redactProxyError(value string) string {

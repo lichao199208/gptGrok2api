@@ -310,7 +310,7 @@ func (s *Server) refreshGrokRuntimeSnapshot(w http.ResponseWriter) {
 			continue
 		}
 		result["eligible"] = intValue(result["eligible"]) + 1
-		added, skipped, _, addErr := s.store.AddAccounts([]string{token}, nil)
+		added, skipped, _, addErr := s.store.AddAccounts(nil, []map[string]any{{"access_token": token, "source_type": "grok_sso", "type": "grok", "status": "正常", "enabled": true}})
 		if addErr != nil {
 			errors, _ := result["errors"].([]any)
 			errors = append(errors, map[string]any{"id": stringValue(item["id"]), "error": addErr.Error()})
@@ -319,6 +319,7 @@ func (s *Server) refreshGrokRuntimeSnapshot(w http.ResponseWriter) {
 		}
 		result["added"] = intValue(result["added"]) + added
 		result["skipped"] = intValue(result["skipped"]) + skipped
+		_, _, _ = s.store.UpdateAccount(token, map[string]any{"source_type": "grok_sso", "type": "grok"})
 		jobs = append(jobs, quotaJob{item: item, token: token})
 	}
 	var wg sync.WaitGroup
@@ -472,13 +473,15 @@ func (s *Server) syncRegisteredGrokAccounts(w http.ResponseWriter, r *http.Reque
 		if token == "" {
 			continue
 		}
-		count, _, _, addErr := s.store.AddAccounts([]string{token}, nil)
+		count, _, _, addErr := s.store.AddAccounts(nil, []map[string]any{{"access_token": token, "source_type": "grok_sso", "type": "grok", "status": "正常", "enabled": true}})
 		if addErr != nil {
 			continue
 		}
 		if count > 0 {
 			added += count
-		} else {
+		}
+		_, _, _ = s.store.UpdateAccount(token, map[string]any{"source_type": "grok_sso", "type": "grok"})
+		if count == 0 {
 			skipped++
 		}
 	}

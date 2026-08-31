@@ -1,6 +1,7 @@
 import { computed, reactive, ref } from 'vue'
 
 import { proxyApi, type ProxyGroup, type ProxyNode, type ProxyTestResult } from '@/api/proxy'
+import { parseProxyNodeLinks } from '@/views/proxy/proxyNodeImport'
 import { useConfirmDialog } from '@/composables/useConfirmDialog'
 import { useToast } from '@/composables/useToast'
 import { errorMessage } from '@/lib/errorMessage'
@@ -153,6 +154,7 @@ export function useProxyGroupRuntime() {
   const groups = ref<ProxyGroup[]>([])
   const testResults = reactive<Record<string, ProxyTestResult>>({})
   const groupForm = reactive<ProxyGroupForm>(createDefaultGroupForm())
+  const groupNodeImportText = ref('')
 
   const filteredGroups = computed(() => {
     const query = groupKeyword.value.trim().toLowerCase()
@@ -185,9 +187,12 @@ export function useProxyGroupRuntime() {
         input.style.position = 'fixed'
         input.style.opacity = '0'
         document.body.appendChild(input)
-        input.select()
-        document.execCommand('copy')
-        document.body.removeChild(input)
+        try {
+          input.select()
+          if (!document.execCommand('copy')) throw new Error('copy command failed')
+        } finally {
+          input.remove()
+        }
       }
       toast.success(message)
     } catch {
@@ -201,6 +206,7 @@ export function useProxyGroupRuntime() {
 
   function resetGroupForm() {
     editingGroupId.value = ''
+    groupNodeImportText.value = ''
     Object.assign(groupForm, createDefaultGroupForm())
   }
 
@@ -238,6 +244,35 @@ export function useProxyGroupRuntime() {
 
   function addGroupNode() {
     groupForm.nodes.push(createDefaultNode(groupForm.nodes.length))
+  }
+
+  function importGroupNodes() {
+    const result = parseProxyNodeLinks(
+      groupNodeImportText.value,
+      groupForm.nodes.map((node) => node.url),
+      groupForm.subscription_node_image_concurrency_limit,
+    )
+    if (!result.inputCount) {
+      toast.warning('请先输入代理节点链接')
+      return
+    }
+    if (!result.nodes.length) {
+      toast.warning(`没有解析到有效节点（无效 ${result.invalidCount} 个，重复 ${result.duplicateCount} 个）`)
+      return
+    }
+
+    const hasConfiguredNode = groupForm.nodes.some((node) => node.url.trim())
+    if (!hasConfiguredNode && groupForm.nodes.length === 1 && !groupForm.nodes[0].notes?.trim()) {
+      groupForm.nodes = result.nodes
+    } else {
+      groupForm.nodes.push(...result.nodes)
+    }
+    groupNodeImportText.value = ''
+    const skipped = result.duplicateCount + result.invalidCount
+    const details = []
+    if (skipped) details.push(`跳过 ${skipped} 个`)
+    if (result.truncatedCount) details.push(`超出导入上限 ${result.truncatedCount} 个`)
+    toast.success(`已导入 ${result.nodes.length} 个节点${details.length ? `，${details.join('，')}` : ''}`)
   }
 
   function removeGroupNode(index: number) {
@@ -410,7 +445,7 @@ export function useProxyGroupRuntime() {
   async function testProxyGroupAll(group: ProxyGroup) {
     const confirmed = await confirmDialog.ask({
       title: '确认测试代理组',
-      message: `即将测试代理组 ${group.name || group.id} 内的 ${group.nodes.length} 个节点。每个节点都会发起外部网络测试请求，是否继续？`,
+      message: `即将检测代理组 ${group.name || group.id} 内的 ${group.nodes.length} 个节点。检测失败或无法连接的节点会从节点组中永久剔除，是否继续？`,
       confirmText: '开始测试',
       cancelText: '取消',
     })
@@ -419,7 +454,7 @@ export function useProxyGroupRuntime() {
     const key = `group:${group.id}:all`
     testingKey.value = key
     try {
-      const response = await proxyApi.testGroup({ id: group.id })
+      const response = await proxyApi.testGroup({ id: group.id, prune_failed: true })
       if (response.groups) updateGroups(response.groups)
       const results = response.results || []
       for (const item of results) {
@@ -428,8 +463,9 @@ export function useProxyGroupRuntime() {
         }
       }
       const failed = results.filter((item) => !item.result.ok)
-      if (failed.length) toast.warning(`代理组检测完成，失败 ${failed.length} 个节点`)
-      else toast.success(`代理组检测通过，共 ${results.length} 个节点`)
+      const kept = results.length - failed.length
+      if (failed.length) toast.warning(`检测完成，已剔除 ${failed.length} 个节点，保留 ${kept} 个节点`)
+      else toast.success(`检测通过，共保留 ${kept} 个节点`)
     } catch (error) {
       toast.error(errorMessage(error, '代理组检测失败'))
     } finally {
@@ -456,6 +492,7 @@ export function useProxyGroupRuntime() {
     groups,
     testResults,
     groupForm,
+    groupNodeImportText,
     filteredGroups,
     updateGroups,
     proxyActionError,
@@ -466,6 +503,7 @@ export function useProxyGroupRuntime() {
     openEditGroupModal,
     closeGroupModal,
     addGroupNode,
+    importGroupNodes,
     removeGroupNode,
     saveProxyGroup,
     refreshProxyGroupSubscription,

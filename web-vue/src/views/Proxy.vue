@@ -303,6 +303,34 @@
           </div>
         </FormSection>
 
+        <FormSection title="手动批量导入节点" surface="plain">
+          <div class="space-y-2.5">
+            <label class="text-xs">
+              <span class="ui-field-label">节点链接</span>
+              <textarea
+                v-model="groupNodeImportText"
+                rows="5"
+                class="min-h-28 w-full resize-y rounded-lg border border-border bg-background px-3 py-2 font-mono text-xs text-foreground outline-none transition focus:border-primary focus:ring-2 focus:ring-primary/20"
+                placeholder="每行一个，也支持空格、逗号或分号分隔：
+http://user:password@127.0.0.1:7890
+socks5://127.0.0.1:1080
+127.0.0.1:8080"
+              />
+            </label>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <p class="text-xs text-muted-foreground">支持 http、https、socks4、socks5、socks5h；纯 host:port 默认按 HTTP。导入会追加到当前节点并自动去重。</p>
+              <Button
+                size="xs"
+                variant="outline"
+                :disabled="!groupNodeImportText.trim()"
+                @click="importGroupNodes"
+              >
+                解析并导入节点
+              </Button>
+            </div>
+          </div>
+        </FormSection>
+
               <div class="space-y-3">
                 <div class="flex flex-wrap items-center justify-between gap-2">
                   <p class="text-xs font-medium text-foreground">代理节点</p>
@@ -432,6 +460,7 @@ const showGroupModal = proxyGroupsRuntime.showGroupModal
 const editingGroupId = proxyGroupsRuntime.editingGroupId
 const groups = proxyGroupsRuntime.groups
 const groupForm = proxyGroupsRuntime.groupForm
+const groupNodeImportText = proxyGroupsRuntime.groupNodeImportText
 const filteredGroups = proxyGroupsRuntime.filteredGroups
 const updateGroups = proxyGroupsRuntime.updateGroups
 const copyProxyGroupReference = proxyGroupsRuntime.copyProxyGroupReference
@@ -439,6 +468,7 @@ const openCreateGroupModal = proxyGroupsRuntime.openCreateGroupModal
 const openEditGroupModal = proxyGroupsRuntime.openEditGroupModal
 const closeGroupModal = proxyGroupsRuntime.closeGroupModal
 const addGroupNode = proxyGroupsRuntime.addGroupNode
+const importGroupNodes = proxyGroupsRuntime.importGroupNodes
 const removeGroupNode = proxyGroupsRuntime.removeGroupNode
 const saveProxyGroup = proxyGroupsRuntime.saveProxyGroup
 const refreshProxyGroupSubscription = proxyGroupsRuntime.refreshProxyGroupSubscription

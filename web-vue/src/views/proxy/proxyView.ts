@@ -96,7 +96,7 @@ export function proxyGroupActionItems(
     [
       {
         key: 'test-all',
-        label: testingKey === allKey ? '检测中...' : '检测全部节点',
+        label: testingKey === allKey ? '检测中...' : '检测并剔除',
         disabled: testingKey === allKey || group.nodes.length === 0,
       },
     ],

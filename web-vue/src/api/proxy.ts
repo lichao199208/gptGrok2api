@@ -161,9 +161,9 @@ export const proxyApi = {
       `/api/proxy/groups/${encodeURIComponent(id)}`,
     ),
 
-  testGroup: (payload: { id?: string; node_id?: string; url?: string }) =>
+  testGroup: (payload: { id?: string; node_id?: string; url?: string; prune_failed?: boolean }) =>
     apiClient.post<
-      { id?: string; node_id?: string; url?: string },
+      { id?: string; node_id?: string; url?: string; prune_failed?: boolean },
       { result?: ProxyTestResult | null; results?: Array<{ node_id: string; result: ProxyTestResult }>; groups?: ProxyGroup[] }
     >('/api/proxy/groups/test', payload),
 

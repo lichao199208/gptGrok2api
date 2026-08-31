@@ -41,7 +41,7 @@ func (s *Server) completeConsoleChat(w http.ResponseWriter, r *http.Request, req
 	var usage map[string]any
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.Reserve(r.Context(), []string{"basic"}, excluded)
+		lease, err := s.accountPool.ReserveMatching(r.Context(), []string{"basic"}, excluded, isGrokAccount)
 		if err != nil {
 			lastErr = err
 			break
@@ -141,7 +141,7 @@ func (s *Server) streamConsoleChat(w http.ResponseWriter, r *http.Request, reque
 	emitted := false
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.Reserve(r.Context(), []string{"basic"}, excluded)
+		lease, err := s.accountPool.ReserveMatching(r.Context(), []string{"basic"}, excluded, isGrokAccount)
 		if err != nil {
 			lastErr = err
 			break
@@ -426,7 +426,7 @@ func (s *Server) streamConsoleResponses(w http.ResponseWriter, r *http.Request, 
 		flusher.Flush()
 	}
 
-	lease, err := s.accountPool.Reserve(r.Context(), []string{"basic"}, nil)
+	lease, err := s.accountPool.ReserveMatching(r.Context(), []string{"basic"}, nil, isGrokAccount)
 	if err != nil {
 		writeEventSSE(w, "error", map[string]any{"type": "error", "message": err.Error()})
 		_, _ = io.WriteString(w, "data: [DONE]\n\n")

@@ -26,6 +26,7 @@ type Identity struct {
 
 type Store struct {
 	accountsPath     string
+	deletedPath      string
 	authKeysPath     string
 	configPath       string
 	mu               sync.RWMutex
@@ -43,6 +44,7 @@ const accountRuntimeFlushDelay = time.Second
 func New(accountsPath, authKeysPath, configPath string) *Store {
 	return &Store{
 		accountsPath: accountsPath,
+		deletedPath:  filepath.Join(filepath.Dir(accountsPath), "deleted_accounts.json"),
 		authKeysPath: authKeysPath,
 		configPath:   configPath,
 	}
@@ -321,6 +323,10 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 	if err := s.loadAccountsLocked(); err != nil {
 		return 0, 0, nil, err
 	}
+	deleted, err := loadDeletedTokens(s.deletedPath)
+	if err != nil {
+		return 0, 0, nil, err
+	}
 	accounts := cloneAccountList(s.accountsCache)
 	byToken := make(map[string]int, len(accounts))
 	for index, item := range accounts {
@@ -332,6 +338,10 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 	for _, payload := range payloads {
 		token := accountToken(payload)
 		if token == "" {
+			continue
+		}
+		if deleted[tokenHash(token)] {
+			skipped++
 			continue
 		}
 		if _, ok := byToken[token]; ok {
@@ -347,6 +357,10 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 	for _, rawToken := range tokens {
 		token := strings.TrimSpace(rawToken)
 		if token == "" {
+			continue
+		}
+		if deleted[tokenHash(token)] {
+			skipped++
 			continue
 		}
 		if _, ok := byToken[token]; ok {
@@ -383,12 +397,19 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 	if err := s.loadAccountsLocked(); err != nil {
 		return 0, nil, err
 	}
+	deleted, err := loadDeletedTokens(s.deletedPath)
+	if err != nil {
+		return 0, nil, err
+	}
 	accounts := s.accountsCache
 	targets := make(map[string]struct{}, len(tokens))
 	for _, token := range tokens {
-		if clean := strings.TrimSpace(token); clean != "" {
+		if clean := normalizeToken(token); clean != "" {
 			targets[clean] = struct{}{}
 		}
+	}
+	for token := range targets {
+		deleted[tokenHash(token)] = true
 	}
 	filtered := make([]map[string]any, 0, len(accounts))
 	removed := 0
@@ -406,7 +427,56 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 		s.replaceAccountsLocked(filtered)
 		s.accountsDirty = false
 	}
+	if len(targets) > 0 {
+		if err := writeDeletedTokens(s.deletedPath, deleted); err != nil {
+			return 0, nil, err
+		}
+	}
 	return removed, cloneAccountList(filtered), nil
+}
+
+func normalizeToken(token string) string {
+	token = strings.TrimSpace(token)
+	if len(token) >= 4 && strings.EqualFold(token[:4], "sso=") {
+		return strings.TrimSpace(token[4:])
+	}
+	return token
+}
+
+func tokenHash(token string) string {
+	sum := sha256.Sum256([]byte(normalizeToken(token)))
+	return hex.EncodeToString(sum[:])
+}
+
+func loadDeletedTokens(path string) (map[string]bool, error) {
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return map[string]bool{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var hashes []string
+	if len(raw) > 0 {
+		if err := json.Unmarshal(raw, &hashes); err != nil {
+			return nil, err
+		}
+	}
+	result := make(map[string]bool, len(hashes))
+	for _, hash := range hashes {
+		if strings.TrimSpace(hash) != "" {
+			result[strings.TrimSpace(hash)] = true
+		}
+	}
+	return result, nil
+}
+
+func writeDeletedTokens(path string, deleted map[string]bool) error {
+	hashes := make([]string, 0, len(deleted))
+	for hash := range deleted {
+		hashes = append(hashes, hash)
+	}
+	return writeJSON(path, hashes)
 }
 
 func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]any, []map[string]any, error) {
@@ -816,10 +886,12 @@ func hashKey(value string) string {
 }
 
 func accountToken(item map[string]any) string {
-	if token := stringValue(item["access_token"]); token != "" {
-		return token
+	for _, key := range []string{"access_token", "accessToken", "token", "sso", "session_token"} {
+		if token := stringValue(item[key]); token != "" {
+			return normalizeToken(token)
+		}
 	}
-	return stringValue(item["accessToken"])
+	return ""
 }
 
 func normalizeAccount(item map[string]any) {
