@@ -206,6 +206,81 @@ func TestImageGroupPrefersLowLatencyStableNodeAndRespectsCapacity(t *testing.T) 
 	slow.Release(false)
 }
 
+func TestImageGroupUsesValidationCapacityWhenStableNodesAreFull(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "stable", URL: "http://stable.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1, RuntimeSuccesses: 10},
+		{ID: "candidate", URL: "http://candidate.invalid:8080", Enabled: true, ImageConcurrencyLimit: 1},
+	}}})
+	stable, err := manager.AcquireImageContext(context.Background(), nil)
+	if err != nil || stable == nil || stable.NodeID != "stable" {
+		t.Fatalf("stable node was not selected first: lease=%#v err=%v", stable, err)
+	}
+	defer stable.Release(false)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	candidate, err := manager.AcquireImageContext(ctx, nil)
+	if err != nil || candidate == nil || candidate.NodeID != "candidate" {
+		t.Fatalf("full stable capacity did not spill into validation capacity: lease=%#v err=%v", candidate, err)
+	}
+	candidate.Release(false)
+}
+
+func TestImageGroupBurstUsesValidationCapacityWithoutQueueing(t *testing.T) {
+	nodes := make([]NodeConfig, 0, 108)
+	for index := 0; index < 8; index++ {
+		nodes = append(nodes, NodeConfig{
+			ID: fmt.Sprintf("stable-%d", index), URL: fmt.Sprintf("http://stable-%d.invalid:8080", index),
+			Enabled: true, ImageConcurrencyLimit: 3, RuntimeSuccesses: 10,
+		})
+	}
+	for index := 0; index < 100; index++ {
+		nodes = append(nodes, NodeConfig{
+			ID: fmt.Sprintf("candidate-%d", index), URL: fmt.Sprintf("http://candidate-%d.invalid:8080", index),
+			Enabled: true, ImageConcurrencyLimit: 3,
+		})
+	}
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: nodes}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	leases := make([]*Lease, 0, 100)
+	for request := 0; request < 100; request++ {
+		lease, err := manager.AcquireImageContext(ctx, nil)
+		if err != nil || lease == nil {
+			for _, acquired := range leases {
+				acquired.Release(false)
+			}
+			t.Fatalf("burst request %d queued despite spare validation capacity: lease=%#v err=%v", request, lease, err)
+		}
+		leases = append(leases, lease)
+	}
+	for _, lease := range leases {
+		lease.Release(false)
+	}
+}
+
+func TestImageGroupRevalidatesStableNodeAfterRuntimeFailure(t *testing.T) {
+	manager := NewManager("", nil)
+	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{
+		{ID: "recovering", URL: "http://recovering.invalid:8080", Enabled: true, RuntimeSuccesses: 10, RuntimeFailures: 1},
+	}}})
+	lease, err := manager.AcquireImageContext(context.Background(), nil)
+	if err != nil || lease == nil || lease.NodeID != "recovering" {
+		t.Fatalf("recovering node remained outside both scheduling lanes: lease=%#v err=%v", lease, err)
+	}
+	lease.Release(false)
+
+	manager.mu.Lock()
+	node := manager.imageGroups["images"].nodes[0]
+	manager.mu.Unlock()
+	if node.failures != 0 || node.successes != 11 {
+		t.Fatalf("successful recovery did not restore stable state: failures=%d successes=%d", node.failures, node.successes)
+	}
+}
+
 func TestSuccessfulSlowImageLeaseCoolsWithoutCountingFailure(t *testing.T) {
 	manager := NewManager("", nil)
 	manager.ConfigureImageGroups("group:images", []GroupConfig{{ID: "images", Enabled: true, Nodes: []NodeConfig{

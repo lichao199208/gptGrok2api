@@ -2,15 +2,24 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+)
+
+const (
+	projectRepositoryURL = "https://github.com/lichao199208/gptGrok2api"
+	projectVersionURL    = "https://raw.githubusercontent.com/lichao199208/gptGrok2api/main/VERSION"
+	projectChangelogURL  = "https://raw.githubusercontent.com/lichao199208/gptGrok2api/main/CHANGELOG.md"
 )
 
 func (s *Server) metaUpdate(w http.ResponseWriter, r *http.Request) {
@@ -18,7 +27,94 @@ func (s *Server) metaUpdate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed", "invalid_request_error")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"version": s.cfg.Version, "runtime": "go", "update_available": false})
+	currentVersion := strings.TrimSpace(s.cfg.Version)
+	ctx, cancel := context.WithTimeout(r.Context(), 12*time.Second)
+	defer cancel()
+	latestVersion, versionErr := fetchProjectText(ctx, s.requestClient, projectVersionURL, 256)
+	changelog, changelogErr := fetchProjectText(ctx, s.requestClient, projectChangelogURL, 2<<20)
+	response := map[string]any{
+		"current_version":  currentVersion,
+		"latest_version":   strings.TrimSpace(latestVersion),
+		"release_name":     strings.TrimSpace(latestVersion),
+		"release_url":      projectRepositoryURL,
+		"changelog":        changelog,
+		"release_notes":    changelog,
+		"runtime":          "go",
+		"update_available": projectVersionNewer(latestVersion, currentVersion),
+		"status":           "ok",
+	}
+	if versionErr != nil {
+		response["latest_version"] = currentVersion
+		response["release_name"] = currentVersion
+		response["update_available"] = false
+		response["status"] = "error"
+		response["error"] = "GitHub VERSION 读取失败"
+	}
+	if changelogErr != nil {
+		if local, err := os.ReadFile(s.cfg.RelativePath("CHANGELOG.md")); err == nil {
+			response["changelog"] = string(local)
+			response["release_notes"] = string(local)
+		} else if versionErr == nil {
+			response["status"] = "error"
+			response["error"] = "GitHub 更新日志读取失败"
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func fetchProjectText(ctx context.Context, client *http.Client, endpoint string, limit int64) (string, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	request.Header.Set("Accept", "text/plain, text/markdown, */*")
+	request.Header.Set("User-Agent", "gptgrok2api-go-version-check")
+	response, err := client.Do(request)
+	if err != nil {
+		return "", err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return "", fmt.Errorf("GitHub returned HTTP %d", response.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(response.Body, limit))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(raw)), nil
+}
+
+func projectVersionNewer(latest, current string) bool {
+	left := projectVersionParts(latest)
+	right := projectVersionParts(current)
+	for index := 0; index < max(len(left), len(right)); index++ {
+		var leftValue, rightValue int
+		if index < len(left) {
+			leftValue = left[index]
+		}
+		if index < len(right) {
+			rightValue = right[index]
+		}
+		if leftValue != rightValue {
+			return leftValue > rightValue
+		}
+	}
+	return false
+}
+
+func projectVersionParts(value string) []int {
+	value = strings.TrimSpace(strings.TrimPrefix(strings.ToLower(value), "v"))
+	parts := []int{}
+	for _, segment := range strings.FieldsFunc(value, func(r rune) bool { return r < '0' || r > '9' }) {
+		parsed, err := strconv.Atoi(segment)
+		if err == nil {
+			parts = append(parts, parsed)
+		}
+	}
+	return parts
 }
 
 func (s *Server) importAccountsAPI(w http.ResponseWriter, r *http.Request) {
