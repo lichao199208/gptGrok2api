@@ -297,7 +297,7 @@ func TestImageGenerationsRunsOpenAIBatchesConcurrently(t *testing.T) {
 			}
 			time.Sleep(100 * time.Millisecond)
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
+			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://" + fileID + "\"}]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			inflight.Add(-1)
 		case "/backend-api/files/" + fileID + "/download":
@@ -373,7 +373,7 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
 		case "/backend-api/f/conversation":
 			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://%s\",\"file-service://%s\"]}}}\n\n", fileIDs[0], fileIDs[1])
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://%s\"},{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://%s\"}]}}}\n\n", fileIDs[0], fileIDs[1])
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 		case "/backend-api/files/" + fileIDs[0] + "/download", "/backend-api/files/" + fileIDs[1] + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})

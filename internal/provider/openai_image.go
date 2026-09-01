@@ -1153,55 +1153,142 @@ func scanOpenAISSE(reader io.Reader, onPayload func([]byte) bool) error {
 	return nil
 }
 
-func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string) {
+func collectOpenAIImageRefs(value any, conversationID *string, imageRefs *[]string) {
+	var walk func(any)
+	walk = func(current any) {
+		switch typed := current.(type) {
+		case map[string]any:
+			for key, item := range typed {
+				switch strings.ToLower(strings.TrimSpace(key)) {
+				case "conversation_id", "conversationid", "conversation-id":
+					if *conversationID == "" {
+						*conversationID = stringValue(item)
+					}
+				}
+			}
+			if isOpenAIConversationMessage(typed) {
+				collectOpenAIGeneratedMessageRefs(typed, imageRefs)
+				return
+			}
+			for _, item := range typed {
+				walk(item)
+			}
+		case []any:
+			for _, item := range typed {
+				walk(item)
+			}
+		case string:
+			if *conversationID == "" {
+				if match := regexp.MustCompile(`(?i)"conversation[_-]?id"\s*:\s*"([^"]+)"`).FindStringSubmatch(typed); len(match) == 2 {
+					*conversationID = strings.TrimSpace(match[1])
+				}
+			}
+		}
+	}
+	walk(value)
+}
+
+func isOpenAIConversationMessage(value map[string]any) bool {
+	_, ok := value["author"]
+	return ok
+}
+
+func collectOpenAIGeneratedMessageRefs(message map[string]any, imageRefs *[]string) {
+	author, _ := message["author"].(map[string]any)
+	role := strings.ToLower(strings.TrimSpace(stringValue(author["role"])))
+	content := message["content"]
+	metadata := message["metadata"]
+	hasAssetPointer := hasOpenAIImageAssetPointer(content) || hasOpenAIImageAssetPointer(metadata)
+	isImageGeneration := false
+	if metadataMap, ok := metadata.(map[string]any); ok {
+		isImageGeneration = strings.EqualFold(strings.TrimSpace(stringValue(metadataMap["async_task_type"])), "image_gen")
+	}
+
+	candidateRefs := []string{}
+	collectOpenAIImageReferenceValues(map[string]any{"content": content, "metadata": metadata}, &candidateRefs)
+
+	switch role {
+	case "tool":
+		if !isImageGeneration && !hasAssetPointer {
+			return
+		}
+	case "assistant":
+		// Assistant image outputs have appeared as image asset pointers, file IDs,
+		// and string references. Accept every recognized image reference form, but
+		// only after the message role has established it is not a user upload.
+		if len(candidateRefs) == 0 {
+			return
+		}
+	default:
+		// Uploaded references are user messages. Never treat their echoed file or
+		// sediment references as generated output.
+		return
+	}
+	*imageRefs = append(*imageRefs, candidateRefs...)
+}
+
+func hasOpenAIImageAssetPointer(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		if strings.EqualFold(strings.TrimSpace(stringValue(typed["content_type"])), "image_asset_pointer") {
+			return true
+		}
+		pointer := strings.TrimSpace(stringValue(typed["asset_pointer"]))
+		if strings.HasPrefix(pointer, "file-service://") || strings.HasPrefix(pointer, "sediment://") {
+			return true
+		}
+		for _, item := range typed {
+			if hasOpenAIImageAssetPointer(item) {
+				return true
+			}
+		}
+	case []any:
+		for _, item := range typed {
+			if hasOpenAIImageAssetPointer(item) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func collectOpenAIImageReferenceValues(value any, imageRefs *[]string) {
 	switch typed := value.(type) {
 	case map[string]any:
 		for key, item := range typed {
 			switch strings.ToLower(strings.TrimSpace(key)) {
-			case "conversation_id", "conversationid", "conversation-id":
-				if *conversationID == "" {
-					*conversationID = stringValue(item)
-				}
-			}
-			switch strings.ToLower(strings.TrimSpace(key)) {
 			case "asset_pointer", "assetpointer":
-				pointer := stringValue(item)
+				pointer := strings.TrimSpace(stringValue(item))
 				if strings.HasPrefix(pointer, "file-service://") {
-					*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
+					*imageRefs = append(*imageRefs, strings.TrimPrefix(pointer, "file-service://"))
 				} else if strings.HasPrefix(pointer, "sediment://") {
-					*fileIDs = append(*fileIDs, pointer)
+					*imageRefs = append(*imageRefs, pointer)
 				}
 			case "file_id", "fileid":
-				id := stringValue(item)
-				if isOpenAIImageFileID(id) {
-					*fileIDs = append(*fileIDs, id)
+				if id := stringValue(item); isOpenAIImageFileID(id) {
+					*imageRefs = append(*imageRefs, id)
 				}
 			}
-			collectOpenAIImageRefs(item, conversationID, fileIDs)
+			collectOpenAIImageReferenceValues(item, imageRefs)
 		}
 	case []any:
 		for _, item := range typed {
-			collectOpenAIImageRefs(item, conversationID, fileIDs)
+			collectOpenAIImageReferenceValues(item, imageRefs)
 		}
 	case string:
-		if *conversationID == "" {
-			if match := regexp.MustCompile(`(?i)"conversation[_-]?id"\s*:\s*"([^"]+)"`).FindStringSubmatch(typed); len(match) == 2 {
-				*conversationID = strings.TrimSpace(match[1])
-			}
-		}
 		for _, match := range regexp.MustCompile(`file-service://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
-				*fileIDs = append(*fileIDs, match[1])
+				*imageRefs = append(*imageRefs, match[1])
 			}
 		}
 		for _, match := range regexp.MustCompile(`sediment://([A-Za-z0-9_-]+)`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
-				*fileIDs = append(*fileIDs, "sediment://"+match[1])
+				*imageRefs = append(*imageRefs, "sediment://"+match[1])
 			}
 		}
 		for _, match := range regexp.MustCompile(`(?i)\b(file_[a-z0-9][a-z0-9_-]{5,})\b`).FindAllStringSubmatch(typed, -1) {
 			if len(match) == 2 {
-				*fileIDs = append(*fileIDs, match[1])
+				*imageRefs = append(*imageRefs, match[1])
 			}
 		}
 	}
