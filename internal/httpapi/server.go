@@ -385,6 +385,12 @@ func (s *Server) withMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		if s.shouldMonitorRequest(r) {
+			// Authenticate before reading or decompressing a monitored body. This
+			// keeps anonymous requests from consuming monitoring parse resources.
+			if !s.requireAPI(w, r) {
+				return
+			}
+			r = r.WithContext(context.WithValue(r.Context(), preauthenticatedAPIKey{}, true))
 			s.withRequestMonitor(w, r, next)
 			return
 		}
@@ -398,7 +404,10 @@ type statusCaptureWriter struct {
 	body   bytes.Buffer
 }
 
-const maxJSONBodyBytes = 64 << 20
+const (
+	maxJSONBodyBytes        = 64 << 20
+	maxWrappedJSONBodyBytes = 4 << 20
+)
 
 func (w *statusCaptureWriter) WriteHeader(status int) {
 	if w.status == 0 {
@@ -473,6 +482,7 @@ func (s *Server) withRequestMonitor(w http.ResponseWriter, r *http.Request, next
 }
 
 type monitorCallIDKey struct{}
+type preauthenticatedAPIKey struct{}
 
 func (s *Server) enrichRequestMonitor(r *http.Request, meta map[string]any) {
 	if r == nil {
@@ -628,16 +638,20 @@ func monitorRequestShape(r *http.Request) (string, string, any) {
 	if contentType != "application/json" && contentType != "" {
 		return "", "", contentType
 	}
-	raw, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes))
+	raw, err := io.ReadAll(io.LimitReader(r.Body, maxJSONBodyBytes+1))
 	if err != nil {
 		r.Body = io.NopCloser(strings.NewReader(""))
 		return "", "", "application/json"
 	}
-	r.Body = io.NopCloser(strings.NewReader(string(raw)))
-	decoded, ok := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
-	if !ok {
+	r.Body = io.NopCloser(bytes.NewReader(raw))
+	if len(raw) > maxJSONBodyBytes {
 		return "", "", "application/json"
 	}
+	decoded, err := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
+	if err != nil {
+		return "", "", "application/json"
+	}
+	decoded, _ = unwrapDoubleEncodedJSONObject(decoded)
 	r.Body = io.NopCloser(bytes.NewReader(decoded))
 	var payload map[string]any
 	if json.Unmarshal(decoded, &payload) != nil {
@@ -1845,12 +1859,22 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		}
 		return false
 	}
-	decoded, ok := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
-	if !ok {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: body is empty, truncated, or has invalid content encoding", "invalid_request_error")
+	decoded, err := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
+	if err != nil {
+		if errors.Is(err, errJSONBodyTooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, "JSON body exceeds 64MB limit", "invalid_request_error")
+		} else {
+			writeError(w, http.StatusBadRequest, "invalid JSON body: body is empty, truncated, or has invalid content encoding", "invalid_request_error")
+		}
 		return false
 	}
 	if err := json.Unmarshal(decoded, target); err != nil {
+		// A few reverse proxies forward an already JSON-encoded object as a
+		// quoted string. Accept one wrapped object layer only, with a separate
+		// small limit so the compatibility path cannot multiply 64 MiB requests.
+		if inner, wrapped := unwrapDoubleEncodedJSONObject(decoded); wrapped && json.Unmarshal(inner, target) == nil {
+			return true
+		}
 		writeError(w, http.StatusBadRequest, describeJSONBodyError(err), "invalid_request_error")
 		return false
 	}
@@ -1878,9 +1902,14 @@ func describeJSONBodyError(err error) string {
 	return "invalid JSON body: malformed JSON"
 }
 
+var errJSONBodyTooLarge = errors.New("JSON body exceeds 64MB limit")
+
 // normalizeJSONBytes accepts the encodings emitted by common API gateways.
 // Some clients prepend a UTF-8 BOM and some compress JSON request bodies.
-func normalizeJSONBytes(raw []byte, contentEncoding string) ([]byte, bool) {
+func normalizeJSONBytes(raw []byte, contentEncoding string) ([]byte, error) {
+	if len(raw) > maxJSONBodyBytes {
+		return nil, errJSONBodyTooLarge
+	}
 	encoding := strings.ToLower(strings.TrimSpace(strings.Split(contentEncoding, ",")[0]))
 	// A few reverse proxies strip Content-Encoding while forwarding the body.
 	// The gzip magic bytes let us still recognize and decode those requests.
@@ -1888,25 +1917,47 @@ func normalizeJSONBytes(raw []byte, contentEncoding string) ([]byte, bool) {
 	if encoding == "gzip" || encoding == "x-gzip" || isGzip {
 		reader, err := gzip.NewReader(bytes.NewReader(raw))
 		if err == nil {
-			decompressed, readErr := io.ReadAll(io.LimitReader(reader, maxJSONBodyBytes))
+			decompressed, readErr := io.ReadAll(io.LimitReader(reader, maxJSONBodyBytes+1))
 			_ = reader.Close()
 			if readErr != nil {
-				return nil, false
+				return nil, readErr
+			}
+			if len(decompressed) > maxJSONBodyBytes {
+				return nil, errJSONBodyTooLarge
 			}
 			raw = decompressed
 		} else if isGzip {
 			// A malformed gzip body must not be treated as JSON. If only the
 			// header was retained by a proxy, however, the body is already plain.
-			return nil, false
+			return nil, err
 		}
 	}
 	raw = bytes.TrimSpace(raw)
 	raw = bytes.TrimPrefix(raw, []byte{0xef, 0xbb, 0xbf})
 	raw = bytes.TrimSpace(raw)
 	if len(raw) == 0 {
-		return nil, false
+		return nil, errors.New("empty JSON body")
 	}
-	return raw, true
+	return raw, nil
+}
+
+// unwrapDoubleEncodedJSONObject accepts one JSON string layer around an object
+// payload. It is intentionally capped well below maxJSONBodyBytes because
+// decoding a JSON string temporarily retains both the escaped and unescaped
+// representations in memory.
+func unwrapDoubleEncodedJSONObject(raw []byte) ([]byte, bool) {
+	if len(raw) == 0 || raw[0] != '"' || len(raw) > maxWrappedJSONBodyBytes {
+		return raw, false
+	}
+	var wrapped string
+	if err := json.Unmarshal(raw, &wrapped); err != nil {
+		return raw, false
+	}
+	inner := strings.TrimSpace(wrapped)
+	if len(inner) == 0 || inner[0] != '{' {
+		return raw, false
+	}
+	return []byte(inner), true
 }
 
 func positiveInt(raw string, fallback int) int {
@@ -2348,6 +2399,9 @@ func (s *Server) static(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) requireAPI(w http.ResponseWriter, r *http.Request) bool {
+	if authenticated, _ := r.Context().Value(preauthenticatedAPIKey{}).(bool); authenticated {
+		return true
+	}
 	if s.auth.ValidAPIRequest(r) {
 		return true
 	}

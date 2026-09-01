@@ -94,10 +94,31 @@ export function useSettingsUserKeysRuntime(options: SettingsUserKeysRuntimeOptio
 
   async function createUserKey() {
     userKeyBusy.value = 'create'
+    newUserKey.value = ''
     try {
       const response = await userKeysApi.create(userKeyForm.value.name.trim())
-      userKeys.value = response.items || []
-      newUserKey.value = response.key || ''
+      const items = Array.isArray(response.items) ? response.items : null
+      const key = typeof response.key === 'string' ? response.key.trim() : ''
+
+      if (items) {
+        userKeys.value = items
+      } else {
+        // Preserve the visible list if the create response is malformed, then
+        // reconcile it from the authoritative list endpoint.
+        await loadUserKeys()
+      }
+
+      if (!key) {
+        // The server may have persisted a key even though the one-time raw key
+        // was lost in transit. Close the dialog so a retry cannot create a
+        // duplicate before the user reviews the refreshed list.
+        toast.error('服务器未返回新密钥；密钥可能已创建，请先刷新列表确认后再操作')
+        userKeyModal.value = ''
+        resetUserKeyForm()
+        return
+      }
+
+      newUserKey.value = key
       toast.success('用户密钥已创建')
       userKeyModal.value = ''
       resetUserKeyForm()

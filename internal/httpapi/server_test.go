@@ -2,6 +2,8 @@ package httpapi
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -24,6 +26,84 @@ func testConfig() config.Config {
 		APIKey:       "api-secret",
 		AdminKey:     "admin-secret",
 		Version:      "test",
+	}
+}
+
+type trackedRequestBody struct {
+	reads int
+}
+
+func (b *trackedRequestBody) Read(_ []byte) (int, error) {
+	b.reads++
+	return 0, io.EOF
+}
+
+func (b *trackedRequestBody) Close() error { return nil }
+
+func TestMonitoredRequestAuthenticatesBeforeReadingBody(t *testing.T) {
+	body := &trackedRequestBody{}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	request.Header.Set("Content-Type", "application/json")
+	request.Body = body
+	request.ContentLength = -1
+	response := httptest.NewRecorder()
+
+	New(testConfig()).Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d: %s", response.Code, response.Body.String())
+	}
+	if body.reads != 0 {
+		t.Fatalf("unauthenticated monitored request body was read %d times", body.reads)
+	}
+}
+
+func TestDecodeJSONAcceptsWrappedJSONObject(t *testing.T) {
+	wrapped, err := json.Marshal(`{"name":"demo"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(wrapped)))
+	response := httptest.NewRecorder()
+	var body struct {
+		Name string `json:"name"`
+	}
+	if !decodeJSON(response, request, &body) {
+		t.Fatalf("wrapped object was rejected: %s", response.Body.String())
+	}
+	if body.Name != "demo" {
+		t.Fatalf("wrapped object decoded incorrectly: %#v", body)
+	}
+}
+
+func TestMonitorRequestShapeAcceptsWrappedJSONObject(t *testing.T) {
+	wrapped, err := json.Marshal(`{"model":"gpt-test","prompt":"describe this"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(string(wrapped)))
+	request.Header.Set("Content-Type", "application/json")
+	model, summary, shape := monitorRequestShape(request)
+	if model != "gpt-test" || summary != "describe this" {
+		t.Fatalf("wrapped request was not monitored correctly: model=%q summary=%q", model, summary)
+	}
+	shapeMap, ok := shape.(map[string]any)
+	if !ok || shapeMap["content_type"] != "application/json" {
+		t.Fatalf("unexpected request shape: %#v", shape)
+	}
+}
+
+func TestUnwrapDoubleEncodedJSONObjectRejectsOversizedPayload(t *testing.T) {
+	wrapped, err := json.Marshal("{" + strings.Repeat("x", maxWrappedJSONBodyBytes) + "}")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wrapped) <= maxWrappedJSONBodyBytes {
+		t.Fatalf("test payload did not exceed wrapped limit: %d", len(wrapped))
+	}
+	actual, ok := unwrapDoubleEncodedJSONObject(wrapped)
+	if ok || string(actual) != string(wrapped) {
+		t.Fatal("oversized wrapped payload was accepted")
 	}
 }
 

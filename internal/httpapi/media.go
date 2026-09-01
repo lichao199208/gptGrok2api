@@ -354,8 +354,11 @@ func (s *Server) parseJSONImageEditRequest(r *http.Request) (imageEditRequest, e
 	if len(raw) > maxJSONBodyBytes {
 		return imageEditRequest{}, imageEditParseError{Message: "JSON body exceeds 64MB limit", Status: http.StatusRequestEntityTooLarge}
 	}
-	decoded, ok := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
-	if !ok {
+	decoded, err := normalizeJSONBytes(raw, r.Header.Get("Content-Encoding"))
+	if err != nil {
+		if errors.Is(err, errJSONBodyTooLarge) {
+			return imageEditRequest{}, imageEditParseError{Message: "JSON body exceeds 64MB limit", Status: http.StatusRequestEntityTooLarge}
+		}
 		return imageEditRequest{}, imageEditParseError{Message: "invalid JSON body: body is empty, truncated, or has invalid content encoding"}
 	}
 	var body map[string]any
