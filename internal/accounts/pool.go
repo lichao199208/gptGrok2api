@@ -182,7 +182,9 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 			if isRequestMarkedAbnormal(account.Fields) {
 				updates["status"] = "正常"
 			}
-			_, _ = p.repository.UpdateAccountRuntime(account.Token, updates)
+			_, _ = p.repository.RecordAccountRequestResult(account.Token, true, updates)
+		} else {
+			_, _ = p.repository.RecordAccountRequestResult(account.Token, true, nil)
 		}
 		return
 	}
@@ -216,7 +218,7 @@ func (p *Pool) Feedback(account Account, status int, err error) {
 	if err != nil {
 		updates["last_error_message"] = truncate(err.Error(), 300)
 	}
-	_, _ = p.repository.UpdateAccountRuntime(account.Token, updates)
+	_, _ = p.repository.RecordAccountRequestResult(account.Token, false, updates)
 	if status == 401 {
 		p.mu.Lock()
 		callback := p.onInvalid

@@ -526,6 +526,47 @@ func (s *Store) UpdateAccountRuntime(token string, updates map[string]any) (map[
 	return result, nil
 }
 
+// RecordAccountRequestResult records one completed upstream task for an account
+// together with optional runtime state updates. The counter increment happens
+// while holding the account cache lock so concurrent task completions cannot
+// lose each other's success/failure counts.
+func (s *Store) RecordAccountRequestResult(token string, successful bool, updates map[string]any) (map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return nil, err
+	}
+	index, ok := s.accountsIndex[strings.TrimSpace(token)]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return nil, os.ErrNotExist
+	}
+
+	runtimeUpdates := cloneMap(updates)
+	counter := "fail"
+	if successful {
+		counter = "success"
+	}
+	runtimeUpdates[counter] = nonNegativeAccountCount(s.accountsCache[index][counter]) + 1
+
+	accounts, next, ok := s.updatedAccountsLocked(token, runtimeUpdates)
+	if !ok {
+		return nil, os.ErrNotExist
+	}
+	s.replaceAccountsLocked(accounts)
+	s.accountsDirty = true
+	s.scheduleAccountFlushLocked(accountRuntimeFlushDelay)
+	return cloneMap(next), nil
+}
+
+func nonNegativeAccountCount(value any) int {
+	var count int
+	_, _ = fmt.Sscanf(strings.TrimSpace(fmt.Sprint(value)), "%d", &count)
+	if count < 0 {
+		return 0
+	}
+	return count
+}
+
 // FlushAccounts persists pending runtime feedback. It is primarily useful for
 // orderly shutdowns and deterministic tests; normal requests use the timer.
 func (s *Store) FlushAccounts() error {

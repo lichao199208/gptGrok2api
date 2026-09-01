@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 )
 
@@ -120,6 +121,51 @@ func TestRotateAccountTokensClearsStaleErrorMarkers(t *testing.T) {
 		if updated[key] != nil {
 			t.Fatalf("stale marker %q was not cleared: %#v", key, updated[key])
 		}
+	}
+}
+
+func TestRecordAccountRequestResultAccumulatesConcurrentCounts(t *testing.T) {
+	root := t.TempDir()
+	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "success": 2, "fail": "3"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	const successes = 40
+	const failures = 25
+	var wait sync.WaitGroup
+	for range successes {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, err := repository.RecordAccountRequestResult("one", true, nil); err != nil {
+				t.Errorf("record success: %v", err)
+			}
+		}()
+	}
+	for range failures {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, err := repository.RecordAccountRequestResult("one", false, map[string]any{"last_error_status": 502}); err != nil {
+				t.Errorf("record failure: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	if err := repository.FlushAccounts(); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := repository.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	if got := nonNegativeAccountCount(items[0]["success"]); got != 2+successes {
+		t.Fatalf("success count lost concurrent updates: got %d, want %d", got, 2+successes)
+	}
+	if got := nonNegativeAccountCount(items[0]["fail"]); got != 3+failures {
+		t.Fatalf("failure count lost concurrent updates: got %d, want %d", got, 3+failures)
 	}
 }
 

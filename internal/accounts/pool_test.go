@@ -95,6 +95,32 @@ func TestPoolFeedbackInvokesInvalidCallbackOnlyForAuthFailures(t *testing.T) {
 	}
 }
 
+func TestPoolFeedbackRecordsAccountTaskCounts(t *testing.T) {
+	root := t.TempDir()
+	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
+	if err := repository.SaveAccounts([]map[string]any{{"access_token": "one", "pool": "basic", "enabled": true, "status": "正常"}}); err != nil {
+		t.Fatal(err)
+	}
+	p := New(repository)
+	account := Account{Token: "one", Pool: "basic", Fields: map[string]any{}}
+	p.Feedback(account, 200, nil)
+	p.Feedback(account, 502, errors.New("upstream error"))
+	if err := repository.FlushAccounts(); err != nil {
+		t.Fatal(err)
+	}
+
+	items, err := repository.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	if got := intValue(items[0]["success"]); got != 1 {
+		t.Fatalf("success feedback was not counted: %#v", items[0])
+	}
+	if got := intValue(items[0]["fail"]); got != 1 {
+		t.Fatalf("failure feedback was not counted: %#v", items[0])
+	}
+}
+
 func TestPoolSuccessfulFeedbackClearsStaleRequestAbnormalState(t *testing.T) {
 	root := t.TempDir()
 	repository := store.New(filepath.Join(root, "accounts.json"), filepath.Join(root, "keys.json"), filepath.Join(root, "config.json"))
