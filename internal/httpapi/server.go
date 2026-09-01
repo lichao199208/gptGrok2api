@@ -1845,6 +1845,15 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, target any) bool {
 		return false
 	}
 	if err := json.Unmarshal(decoded, target); err != nil {
+		// A few reverse proxies forward an already JSON-encoded body as a
+		// quoted string (for example, {\"name\":\"demo\"}). Accept that
+		// representation for object payloads before rejecting the request.
+		var wrapped string
+		if json.Unmarshal(decoded, &wrapped) == nil {
+			if inner := strings.TrimSpace(wrapped); inner != "" && json.Unmarshal([]byte(inner), target) == nil {
+				return true
+			}
+		}
 		writeError(w, http.StatusBadRequest, describeJSONBodyError(err), "invalid_request_error")
 		return false
 	}
