@@ -57,6 +57,9 @@ export function useSettingsUserKeysRuntime(options: SettingsUserKeysRuntimeOptio
 
   function openUserKeyCreateModal() {
     resetUserKeyForm()
+    // Prevent a previously generated one-time key from being mistaken for the
+    // key produced by the next create operation.
+    newUserKey.value = ''
     userKeyModal.value = 'create'
   }
 
@@ -94,10 +97,12 @@ export function useSettingsUserKeysRuntime(options: SettingsUserKeysRuntimeOptio
 
   async function createUserKey() {
     userKeyBusy.value = 'create'
+    newUserKey.value = ''
     try {
       const response = await userKeysApi.create(userKeyForm.value.name.trim())
-      userKeys.value = response.items || []
-      newUserKey.value = response.key || ''
+      userKeys.value = Array.isArray(response.items) ? response.items : []
+      newUserKey.value = typeof response.key === 'string' ? response.key : ''
+      if (!newUserKey.value) throw new Error('服务器未返回新密钥，请刷新后重试')
       toast.success('用户密钥已创建')
       userKeyModal.value = ''
       resetUserKeyForm()
