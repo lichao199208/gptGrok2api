@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -214,10 +215,16 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	results = make([]ImageResult, 0, len(imageRefs))
 	seen := map[string]bool{}
 	inputFileIDs := map[string]bool{}
+	inputContentHashes := map[[sha256.Size]byte]bool{}
 	var lastDownloadErr error
 	for _, ref := range references {
 		if ref.FileID != "" {
 			inputFileIDs[ref.FileID] = true
+		}
+	}
+	for _, input := range inputs {
+		if len(input.Data) > 0 {
+			inputContentHashes[sha256.Sum256(input.Data)] = true
 		}
 	}
 	// Upstream may return the uploaded input assets together with generated
@@ -238,6 +245,11 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 		raw, mime, err := o.downloadImageRefWithRetry(ctx, account, conversationID, imageRef)
 		if err != nil {
 			lastDownloadErr = err
+			continue
+		}
+		// Some upstream replies mark echoed product/reference images as tool
+		// assets. Byte-identical content is still an input, never a result.
+		if inputContentHashes[sha256.Sum256(raw)] {
 			continue
 		}
 		notifyOpenAIImageStage(ctx, "download_ms", downloadStarted)
