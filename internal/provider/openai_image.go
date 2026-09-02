@@ -197,10 +197,10 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	if conversationID == "" && len(imageRefs) == 0 {
 		return nil, fmt.Errorf("OpenAI image stream returned no conversation id")
 	}
-	if len(imageRefs) == 0 {
-		if conversationID == "" {
-			return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
-		}
+	// The create-stream echoes the uploaded input asset pointers before the
+	// image is ready. Those pointers are not generated results, so when a
+	// conversation ID is available always resolve the final conversation.
+	if conversationID != "" {
 		stageStarted = time.Now()
 		imageRefs, err = o.pollConversation(ctx, account, conversationID)
 		if err != nil {
