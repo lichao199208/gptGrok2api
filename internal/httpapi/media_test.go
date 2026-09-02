@@ -300,6 +300,8 @@ func TestImageGenerationsRunsOpenAIBatchesConcurrently(t *testing.T) {
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			inflight.Add(-1)
+		case "/backend-api/conversation/conversation-1":
+			writeHTTPAPIGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
 		case "/blob":
@@ -375,6 +377,8 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://%s\",\"file-service://%s\"]}}}\n\n", fileIDs[0], fileIDs[1])
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-1":
+			writeHTTPAPIGeneratedImageConversation(w, fileIDs...)
 		case "/backend-api/files/" + fileIDs[0] + "/download", "/backend-api/files/" + fileIDs[1] + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
 		case "/blob":
@@ -443,4 +447,15 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 	if stored != 2 {
 		t.Fatalf("expected one persisted image per request, got %d total", stored)
 	}
+}
+
+func writeHTTPAPIGeneratedImageConversation(w http.ResponseWriter, fileIDs ...string) {
+	parts := make([]any, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		parts = append(parts, map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fileID})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"tool-message": map[string]any{"message": map[string]any{
+		"author": map[string]any{"role": "tool"}, "create_time": 1,
+		"metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": parts},
+	}}}})
 }

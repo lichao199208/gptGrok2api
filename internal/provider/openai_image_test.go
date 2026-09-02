@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -328,6 +329,8 @@ func TestOpenAIImageGenerationFlow(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-1":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/blob":
@@ -372,6 +375,8 @@ func TestOpenAIImageGenerationFlowConversationIDVariant(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversationId\":\"conversation-2\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-2":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/blob":
@@ -449,6 +454,82 @@ func TestOpenAIImageGenerationPollsAndDownloadsSedimentAttachment(t *testing.T) 
 	}
 }
 
+func TestOpenAIImageGenerationDownloadsAssistantOutputInsteadOfEchoedReference(t *testing.T) {
+	referenceID := "file_00000000111111111111111111111111"
+	generatedID := "file_00000000222222222222222222222222"
+	referenceBytes := onePixelPNG(t)
+	generatedBytes := []byte("generated-image-output")
+	var referenceDownloads atomic.Int32
+	var generatedDownloads atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/files":
+			_ = json.NewEncoder(w).Encode(map[string]any{"file_id": referenceID, "upload_url": serverURL(r) + "/reference-upload"})
+		case r.Method == http.MethodPut && r.URL.Path == "/reference-upload":
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/backend-api/files/"+referenceID+"/uploaded":
+			w.WriteHeader(http.StatusOK)
+		case r.URL.Path == "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case r.URL.Path == "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case r.URL.Path == "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case r.URL.Path == "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-reference\",\"message\":{\"author\":{\"role\":\"user\"},\"content\":{\"parts\":[{\"asset_pointer\":\"file-service://%s\"}]}}}\n\n", referenceID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case r.URL.Path == "/backend-api/conversation/conversation-reference":
+			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{
+				"user": map[string]any{"message": map[string]any{
+					"author": map[string]any{"role": "user"}, "create_time": 1,
+					"content": map[string]any{"parts": []any{map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + referenceID}}},
+				}},
+				"assistant": map[string]any{"message": map[string]any{
+					"author": map[string]any{"role": "assistant"}, "create_time": 2,
+					"content": map[string]any{"parts": []any{map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + generatedID}}},
+				}},
+			}})
+		case r.URL.Path == "/backend-api/files/"+referenceID+"/download":
+			referenceDownloads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/reference-blob"})
+		case r.URL.Path == "/backend-api/files/"+generatedID+"/download":
+			generatedDownloads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/generated-blob"})
+		case r.URL.Path == "/reference-blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(referenceBytes)
+		case r.URL.Path == "/generated-blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(generatedBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	account := accounts.Account{Token: "jwt.header.payload", Fields: map[string]any{"source_type": "chatgpt_web"}}
+	results, err := client.Generate(context.Background(), account, "按参考图生成", "gpt-image-2", "1024x1024", "auto", []OpenAIImageInput{{Name: "reference.png", MIME: "image/png", Data: referenceBytes}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one generated image, got %#v", results)
+	}
+	raw, err := base64.StdEncoding.DecodeString(results[0].Base64)
+	if err != nil || !bytes.Equal(raw, generatedBytes) {
+		t.Fatalf("returned bytes are not the generated output: raw=%q err=%v", raw, err)
+	}
+	if referenceDownloads.Load() != 0 || generatedDownloads.Load() != 1 {
+		t.Fatalf("unexpected downloads: reference=%d generated=%d", referenceDownloads.Load(), generatedDownloads.Load())
+	}
+}
+
 func TestOpenAIImageGenerationKeepsDownloadableResultWhenAnotherFileHasNoURL(t *testing.T) {
 	goodFileID := "file_000000001234567890abcdef12345678"
 	staleFileID := "file_000000009999999999abcdef12345678"
@@ -469,6 +550,8 @@ func TestOpenAIImageGenerationKeepsDownloadableResultWhenAnotherFileHasNoURL(t *
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-mixed\",\"message\":{\"content\":{\"parts\":[\"file-service://" + goodFileID + "\",\"file-service://" + staleFileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-mixed":
+			writeGeneratedImageConversation(w, goodFileID, staleFileID)
 		case "/backend-api/files/" + goodFileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
 		case "/backend-api/files/" + staleFileID + "/download":
@@ -511,6 +594,8 @@ func TestOpenAIImageGenerationFailsWhenEveryFileHasNoURL(t *testing.T) {
 			w.Header().Set("Content-Type", "text/event-stream")
 			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-stale\",\"message\":{\"content\":{\"parts\":[\"file-service://" + fileID + "\"]}}}\n\n"))
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-stale":
+			writeGeneratedImageConversation(w, fileID)
 		case "/backend-api/files/" + fileID + "/download":
 			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
 		default:
@@ -610,23 +695,45 @@ func TestCollectOpenAIImageRefsAcceptsSedimentPointer(t *testing.T) {
 	}
 }
 
-func TestCollectOpenAIGeneratedImageRefsIgnoresUserAsset(t *testing.T) {
+func TestCollectOpenAIGeneratedImageRefsUsesOnlyOrderedOutputRecords(t *testing.T) {
 	conversationID := ""
 	refs := []string{}
 	collectOpenAIGeneratedImageRefs(map[string]any{
 		"conversation_id": "conversation-generated",
-		"user_message": map[string]any{
-			"author":        map[string]any{"role": "user"},
-			"asset_pointer": "sediment://file_reference",
-		},
-		"tool_message": map[string]any{
-			"author":        map[string]any{"role": "tool"},
-			"asset_pointer": "sediment://file_generated",
+		"mapping": map[string]any{
+			"user-message": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "user"}, "create_time": 1,
+				"content": map[string]any{"asset_pointer": "sediment://file_reference"},
+			}},
+			"assistant-text": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "assistant"}, "create_time": 2,
+				"content": map[string]any{"parts": []any{"unrelated file_00000000999999999999999999999999"}},
+			}},
+			"later-assistant-image": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "assistant"}, "create_time": 4,
+				"content": map[string]any{"asset_pointer": "sediment://assistant_generated"},
+			}},
+			"earlier-tool-image": map[string]any{"message": map[string]any{
+				"author": map[string]any{"role": "tool"}, "create_time": 3,
+				"metadata": map[string]any{"async_task_type": "image_gen"},
+				"content":  map[string]any{"asset_pointer": "sediment://tool_generated"},
+			}},
 		},
 	}, &conversationID, &refs)
-	if conversationID != "conversation-generated" || len(refs) != 1 || refs[0] != "sediment://file_generated" {
+	if conversationID != "conversation-generated" || len(refs) != 2 || refs[0] != "sediment://tool_generated" || refs[1] != "sediment://assistant_generated" {
 		t.Fatalf("unexpected generated refs: conversation=%q refs=%#v", conversationID, refs)
 	}
+}
+
+func writeGeneratedImageConversation(w http.ResponseWriter, fileIDs ...string) {
+	parts := make([]any, 0, len(fileIDs))
+	for _, fileID := range fileIDs {
+		parts = append(parts, map[string]any{"content_type": "image_asset_pointer", "asset_pointer": "file-service://" + fileID})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{"tool-message": map[string]any{"message": map[string]any{
+		"author": map[string]any{"role": "tool"}, "create_time": 1,
+		"metadata": map[string]any{"async_task_type": "image_gen"}, "content": map[string]any{"parts": parts},
+	}}}})
 }
 
 func onePixelPNG(t *testing.T) []byte {
