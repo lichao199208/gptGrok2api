@@ -350,6 +350,93 @@ func TestOpenAIImageGenerationFlow(t *testing.T) {
 	}
 }
 
+func TestOpenAIImageDownloadFileRetriesPreferredRouteWhenURLIsPending(t *testing.T) {
+	fileID := "file_000000001234567890abcdef12345678"
+	pngBytes := onePixelPNG(t)
+	var preferredAttempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/files/download/" + fileID:
+			wantTargetRoute := "/backend-api/files/download/" + fileID
+			if got := r.Header.Get("X-OpenAI-Target-Path"); got != wantTargetRoute {
+				t.Fatalf("unexpected target path: %q", got)
+			}
+			if got := r.Header.Get("X-OpenAI-Target-Route"); got != wantTargetRoute {
+				t.Fatalf("unexpected target route: %q", got)
+			}
+			if got := r.URL.Query().Get("post_id"); got != "" {
+				t.Fatalf("unexpected post_id query value: %q", got)
+			}
+			if got := r.URL.Query().Get("inline"); got != "false" {
+				t.Fatalf("unexpected inline query value: %q", got)
+			}
+			if preferredAttempts.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
+		case "/backend-api/files/" + fileID + "/download":
+			t.Fatal("legacy file download route should not be needed when the preferred route becomes ready")
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	raw, mime, err := client.downloadFile(context.Background(), accounts.Account{}, fileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preferredAttempts.Load() != 2 {
+		t.Fatalf("preferred route attempts = %d, want 2", preferredAttempts.Load())
+	}
+	if !bytes.Equal(raw, pngBytes) || mime != "image/png" {
+		t.Fatalf("unexpected image download: mime=%q bytes=%d", mime, len(raw))
+	}
+}
+
+func TestOpenAIImageDownloadFileFallsBackToLegacyRouteWhenPreferredRouteIsUnavailable(t *testing.T) {
+	fileID := "file_000000009876543210fedcba98765432"
+	pngBytes := onePixelPNG(t)
+	var preferredAttempts atomic.Int32
+	var legacyAttempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/files/download/" + fileID:
+			preferredAttempts.Add(1)
+			http.NotFound(w, r)
+		case "/backend-api/files/" + fileID + "/download":
+			legacyAttempts.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	raw, mime, err := client.downloadFile(context.Background(), accounts.Account{}, fileID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preferredAttempts.Load() != 1 || legacyAttempts.Load() != 1 {
+		t.Fatalf("unexpected route attempts: preferred=%d legacy=%d", preferredAttempts.Load(), legacyAttempts.Load())
+	}
+	if !bytes.Equal(raw, pngBytes) || mime != "image/png" {
+		t.Fatalf("unexpected image download: mime=%q bytes=%d", mime, len(raw))
+	}
+}
+
 func TestOpenAIImageGenerationNeverDownloadsUserAttachment(t *testing.T) {
 	inputFileID := "file_00000000aaaaaaaaaaaaaaaaaaaaaaaa"
 	generatedFileID := "file_00000000bbbbbbbbbbbbbbbbbbbbbbbb"
