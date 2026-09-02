@@ -354,6 +354,10 @@ def _extract_message(messages: list[dict]) -> tuple[str, list[str]]:
                     if text:
                         parts.append(f"[{role}]: {text}")
                 elif btype == "image_url":
+                    # Assistant history may contain generated image URLs. They
+                    # are output artifacts, not user reference uploads.
+                    if role != "user":
+                        continue
                     url = (block.get("image_url") or {}).get("url", "")
                     if url:
                         files.append(url)
