@@ -90,6 +90,8 @@ func notifyOpenAIImageEgress(ctx context.Context, proxyURL string) {
 	}
 }
 
+var errOpenAIImageDownloadURLMissing = errors.New("OpenAI image download returned no URL")
+
 const openAIImageDefaultPollTimeout = 3 * time.Minute
 const openAIImageUploadAttemptTimeout = 60 * time.Second
 const openAIImagePollAttemptTimeout = 20 * time.Second
@@ -920,11 +922,53 @@ func (o *OpenAIImage) downloadImageRefWithRetry(ctx context.Context, account acc
 }
 
 func (o *OpenAIImage) downloadFile(ctx context.Context, account accounts.Account, fileID string) ([]byte, string, error) {
-	response, err := o.do(ctx, http.MethodGet, "/backend-api/files/"+url.PathEscape(fileID)+"/download", account, nil, nil, false)
-	if err != nil {
-		return nil, "", err
+	escapedFileID := url.PathEscape(fileID)
+	canonicalPath := "/backend-api/files/download/" + escapedFileID
+	paths := []string{
+		canonicalPath + "?post_id=&inline=false",
+		"/backend-api/files/" + escapedFileID + "/download",
 	}
-	return o.readImageDownloadResponse(ctx, account, response)
+	headers := map[string]string{
+		"Accept":                "application/json, image/*, */*",
+		"X-OpenAI-Target-Path":  canonicalPath,
+		"X-OpenAI-Target-Route": canonicalPath,
+	}
+
+	var lastErr error
+	for _, path := range paths {
+		for attempt := 0; attempt < 2; attempt++ {
+			response, err := o.do(ctx, http.MethodGet, path, account, nil, headers, false)
+			if err == nil {
+				var raw []byte
+				var mime string
+				raw, mime, err = o.readImageDownloadResponse(ctx, account, response)
+				if err == nil {
+					return raw, mime, nil
+				}
+			}
+			lastErr = err
+
+			// The backend can acknowledge a generated file before its signed
+			// download URL is available. Retry that transient response once,
+			// then continue with the compatibility route below.
+			if errors.Is(err, errOpenAIImageDownloadURLMissing) && attempt == 0 {
+				continue
+			}
+			if isOpenAIImageDownloadRouteFallbackError(err) {
+				break
+			}
+			return nil, "", err
+		}
+	}
+	return nil, "", lastErr
+}
+
+func isOpenAIImageDownloadRouteFallbackError(err error) bool {
+	if errors.Is(err, errOpenAIImageDownloadURLMissing) {
+		return true
+	}
+	var upstream *protocol.UpstreamError
+	return errors.As(err, &upstream) && upstream.Status == http.StatusNotFound
 }
 
 func (o *OpenAIImage) downloadImageRef(ctx context.Context, account accounts.Account, conversationID, imageRef string) ([]byte, string, error) {
@@ -960,7 +1004,7 @@ func (o *OpenAIImage) readImageDownloadResponse(ctx context.Context, account acc
 		}
 		downloadURL := firstStringValue(value, "download_url", "url")
 		if downloadURL == "" {
-			return nil, "", fmt.Errorf("OpenAI image download returned no URL")
+			return nil, "", errOpenAIImageDownloadURLMissing
 		}
 		response, err = o.doAbsolute(ctx, http.MethodGet, downloadURL, account, nil, nil, false)
 		if err != nil {
