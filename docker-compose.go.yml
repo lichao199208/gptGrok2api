@@ -10,7 +10,7 @@ services:
   app:
     build:
       context: .
-      dockerfile: Dockerfile.golang
+      dockerfile: Dockerfile
     image: ${CHATGPT2API_GO_IMAGE:-gptgrok2api-go:local}
     container_name: gptgrok2api-go
     restart: unless-stopped
