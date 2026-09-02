@@ -209,3 +209,80 @@ func TestAccountSnapshotUsesCopyOnWriteAndFlushesRuntimeUpdates(t *testing.T) {
 		t.Fatalf("runtime update was not flushed: %#v", persisted)
 	}
 }
+
+func TestRotatedAccessTokenAliasPreservesInFlightImageAccounting(t *testing.T) {
+	root := t.TempDir()
+	accountPath := filepath.Join(root, "accounts.json")
+	repository := New(accountPath, filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if _, _, _, err := repository.AddAccounts(nil, []map[string]any{{
+		"access_token":        "old-access",
+		"refresh_token":       "old-refresh",
+		"quota":               1,
+		"image_quota_unknown": false,
+		"status":              "正常",
+		"source_type":         "oauth",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.RotateAccountTokens("old-access", "new-access", "new-refresh", "", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate a worker that reserved the old access token before the OAuth
+	// rotation and finishes image generation afterwards.
+	if _, err := repository.RecordAccountImageConsumption("old-access", nil); err != nil {
+		t.Fatalf("old in-flight token must resolve to rotated account: %v", err)
+	}
+	if _, err := repository.RecordAccountImageResult("old-access", true, nil); err != nil {
+		t.Fatalf("old in-flight token must retain its final result: %v", err)
+	}
+
+	// Quota consumption is deliberately synchronous. It must survive a new
+	// Store instance without relying on the normal delayed runtime flush.
+	reloaded := New(accountPath, filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	items, err := reloaded.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected reloaded accounts: %#v, %v", items, err)
+	}
+	if got := accountToken(items[0]); got != "new-access" {
+		t.Fatalf("expected rotated token, got %q", got)
+	}
+	if got := nonNegativeAccountCount(items[0]["quota"]); got != 0 {
+		t.Fatalf("quota was not synchronously persisted: got %d", got)
+	}
+	if err := repository.FlushAccounts(); err != nil {
+		t.Fatal(err)
+	}
+	items, err = repository.AccountList()
+	if err != nil || nonNegativeAccountCount(items[0]["success"]) != 1 {
+		t.Fatalf("in-flight success was not attached to current account: %#v, %v", items, err)
+	}
+}
+
+func TestCredentialGenerationRejectsStaleRefreshWrite(t *testing.T) {
+	root := t.TempDir()
+	repository := New(filepath.Join(root, "accounts.json"), filepath.Join(root, "auth_keys.json"), filepath.Join(root, "config.json"))
+	if _, _, _, err := repository.AddAccounts(nil, []map[string]any{{
+		"access_token": "old-access", "refresh_token": "old-refresh", "status": "正常", "source_type": "oauth",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	_, _, generation, err := repository.CredentialSnapshot("old-access")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := repository.RotateAccountTokens("old-access", "new-access", "new-refresh", "", map[string]any{"status": "正常"}); err != nil {
+		t.Fatal(err)
+	}
+
+	updated, applied, err := repository.UpdateAccountIfCredentials("old-access", generation, map[string]any{"status": "异常", "last_token_refresh_error": "stale error"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if applied {
+		t.Fatalf("stale refresh outcome unexpectedly overwrote current credentials: %#v", updated)
+	}
+	if accountToken(updated) != "new-access" || updated["status"] != "正常" || updated["last_token_refresh_error"] != nil {
+		t.Fatalf("expected current rotated account to be retained, got %#v", updated)
+	}
+}

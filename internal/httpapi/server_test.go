@@ -93,6 +93,16 @@ func TestMonitorRequestShapeAcceptsWrappedJSONObject(t *testing.T) {
 	}
 }
 
+func TestMonitorRequestShapeIncludesRequestedImageCount(t *testing.T) {
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"make two","n":2}`))
+	request.Header.Set("Content-Type", "application/json")
+	_, _, shape := monitorRequestShape(request)
+	shapeMap, ok := shape.(map[string]any)
+	if !ok || intValue(shapeMap["requested_n"]) != 2 {
+		t.Fatalf("requested image count was not recorded: %#v", shape)
+	}
+}
+
 func TestUnwrapDoubleEncodedJSONObjectRejectsOversizedPayload(t *testing.T) {
 	wrapped, err := json.Marshal("{" + strings.Repeat("x", maxWrappedJSONBodyBytes) + "}")
 	if err != nil {
@@ -310,6 +320,42 @@ func TestAccountAutoRemoveInvalidRequiresDefinitiveExpiredToken(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if got := accountAutoRemoveInvalid(test.item); got != test.want {
 				t.Fatalf("accountAutoRemoveInvalid() = %v, want %v: %#v", got, test.want, test.item)
+			}
+		})
+	}
+}
+
+func TestAccountStatusCategoryTreatsKnownExhaustedQuotaAsLimited(t *testing.T) {
+	tests := []struct {
+		name string
+		item map[string]any
+		want string
+	}{
+		{
+			name: "zero quota",
+			item: map[string]any{"status": "正常", "quota": 0, "image_quota_unknown": false},
+			want: "limited",
+		},
+		{
+			name: "negative quota",
+			item: map[string]any{"status": "正常", "quota": -21, "image_quota_unknown": false},
+			want: "limited",
+		},
+		{
+			name: "unknown quota remains normal",
+			item: map[string]any{"status": "正常", "quota": 0, "image_quota_unknown": true},
+			want: "normal",
+		},
+		{
+			name: "missing quota remains normal",
+			item: map[string]any{"status": "正常", "image_quota_unknown": false},
+			want: "normal",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := accountStatusCategory(test.item); got != test.want {
+				t.Fatalf("accountStatusCategory() = %q, want %q: %#v", got, test.want, test.item)
 			}
 		})
 	}

@@ -494,6 +494,11 @@ func extractImageQuota(items []any) (int, any, bool) {
 	return 0, nil, true
 }
 
+// AccessTokenNeedsRefresh reports whether a JWT access token expires within the
+// next 24 hours. Opaque browser/session tokens are deliberately left alone.
+func AccessTokenNeedsRefresh(token string) bool {
+	return tokenNeedsRefresh(token)
+}
 func tokenNeedsRefresh(token string) bool {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {

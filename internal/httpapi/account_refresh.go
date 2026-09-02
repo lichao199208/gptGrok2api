@@ -51,16 +51,11 @@ func (s *Server) accountAccessTokenRefresh(w http.ResponseWriter, r *http.Reques
 			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(err)})
 			continue
 		}
-		oldToken := accountToken(account)
 		ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
-		result, refreshErr := s.openAIAccountClient().RefreshAccessToken(ctx, account)
+		_, refreshErr := s.refreshOpenAIAccountTokens(ctx, openAIAccountFromFields(account))
 		cancel()
 		if refreshErr != nil {
 			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(refreshErr)})
-			continue
-		}
-		if _, _, err = s.store.RotateAccountTokens(oldToken, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields); err != nil {
-			errorsOut = append(errorsOut, map[string]any{"token": tokenPreview(ref), "error": safeRefreshError(err)})
 			continue
 		}
 		updated++
@@ -196,15 +191,32 @@ func (s *Server) refreshOneAccount(parent context.Context, progressID, ref strin
 		return
 	}
 	token := accountToken(account)
+	resolvedToken, current, generation, snapshotErr := s.store.CredentialSnapshot(token)
+	if snapshotErr != nil {
+		s.recordRefreshError(progressID, ref, snapshotErr)
+		return
+	}
+	account = current
+	active := openAIAccountFromFields(current)
+	if canRefreshOpenAIAccessToken(active) {
+		refreshed, refreshErr := s.refreshOpenAIAccountTokens(ctx, active)
+		if refreshErr != nil {
+			s.recordRefreshError(progressID, ref, refreshErr)
+			return
+		}
+		s.recordRefreshSuccess(progressID)
+		s.updateRefreshStatus(progressID, refreshed.Fields)
+		return
+	}
 	result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
 	if err != nil {
 		if updates := accountRefreshFailureUpdates(err); len(updates) > 0 {
-			_, _, _ = s.store.UpdateAccount(token, updates)
+			_, _, _ = s.store.UpdateAccountIfCredentials(resolvedToken, generation, updates)
 		}
 		s.recordRefreshError(progressID, ref, err)
 		return
 	}
-	updated, _, updateErr := s.store.RotateAccountTokens(token, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields)
+	updated, applied, updateErr := s.store.RotateAccountTokensIfCredentials(resolvedToken, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields, generation)
 	if updateErr != nil {
 		s.recordRefreshError(progressID, ref, updateErr)
 		return
@@ -213,6 +225,9 @@ func (s *Server) refreshOneAccount(parent context.Context, progressID, ref strin
 		s.recordRefreshError(progressID, ref, errors.New("account update returned empty result"))
 		return
 	}
+	// A concurrent refresh already won. Treat the current persisted account as
+	// the result rather than allowing this stale probe to overwrite it.
+	_ = applied
 	s.recordRefreshSuccess(progressID)
 	s.updateRefreshStatus(progressID, updated)
 }

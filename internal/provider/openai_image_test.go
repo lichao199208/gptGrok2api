@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -437,6 +438,37 @@ func TestOpenAIImageDownloadFileFallsBackToLegacyRouteWhenPreferredRouteIsUnavai
 	}
 }
 
+func TestOpenAIImageDownloadRetriesSignedURLAfterTransientFailure(t *testing.T) {
+	fileID := "file_000000001234567890abcdef12345678"
+	var blobAttempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/backend-api/files/download/" + fileID:
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
+		case "/blob":
+			if blobAttempts.Add(1) == 1 {
+				http.Error(w, "temporary signed asset failure", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(onePixelPNG(t))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 5*time.Second)
+	raw, mime, err := client.downloadFile(context.Background(), accounts.Account{}, fileID)
+	if err != nil || len(raw) == 0 || mime != "image/png" {
+		t.Fatalf("expected signed URL retry to recover, mime=%q bytes=%d err=%v", mime, len(raw), err)
+	}
+	if blobAttempts.Load() != 2 {
+		t.Fatalf("expected two signed URL download attempts, got %d", blobAttempts.Load())
+	}
+}
+
 func TestOpenAIImageGenerationNeverDownloadsUserAttachment(t *testing.T) {
 	inputFileID := "file_00000000aaaaaaaaaaaaaaaaaaaaaaaa"
 	generatedFileID := "file_00000000bbbbbbbbbbbbbbbbbbbbbbbb"
@@ -678,6 +710,189 @@ func TestOpenAIImageGenerationFailsWhenEveryFileHasNoURL(t *testing.T) {
 	_, err := client.Generate(context.Background(), account, "一只猫", "gpt-image-2", "1024x1024", "auto", nil)
 	if err == nil || !strings.Contains(err.Error(), "download returned no URL") {
 		t.Fatalf("expected no URL error, got %v", err)
+	}
+}
+
+func TestOpenAIImageGenerationRecoversDownloadFailureFromSameConversation(t *testing.T) {
+	initialFileID := "file_000000009999999999abcdef12345678"
+	recoveredFileID := "file_000000001111111111abcdef12345678"
+	pngBytes := onePixelPNG(t)
+	var conversationPolls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-recover\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"parts\":[\"file-service://%s\"]}}}\n\n", initialFileID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-recover":
+			if conversationPolls.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"mapping": map[string]any{"message": map[string]any{
+						"author":   map[string]any{"role": "tool"},
+						"metadata": map[string]any{"async_task_type": "image_gen"},
+						"content":  map[string]any{"parts": []any{"file-service://" + initialFileID}},
+					}},
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"mapping": map[string]any{"message": map[string]any{
+					"author":   map[string]any{"role": "tool"},
+					"metadata": map[string]any{"async_task_type": "image_gen"},
+					"content":  map[string]any{"parts": []any{"file-service://" + recoveredFileID}},
+				}},
+			})
+		case "/backend-api/files/" + initialFileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		case "/backend-api/files/" + recoveredFileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": serverURL(r) + "/blob"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(pngBytes)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 10*time.Second)
+	account := accounts.Account{Token: "jwt.header.payload", Fields: map[string]any{"source_type": "chatgpt_web"}}
+	results, err := client.Generate(context.Background(), account, "一只猫", "gpt-image-2", "1024x1024", "auto", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Base64 == "" {
+		t.Fatalf("expected recovered downloadable image, got %#v", results)
+	}
+	if conversationPolls.Load() < 2 {
+		t.Fatalf("expected same conversation recovery polling, polls=%d", conversationPolls.Load())
+	}
+}
+
+func TestOpenAIImagePollBackoffUsesRetryAfterOrExponentialDelay(t *testing.T) {
+	tests := []struct {
+		name       string
+		attempt    int
+		retryAfter time.Duration
+		set        bool
+		want       time.Duration
+	}{
+		{name: "first transient failure", attempt: 0, want: time.Second},
+		{name: "second transient failure", attempt: 1, want: 2 * time.Second},
+		{name: "capped transient failure", attempt: 8, want: 16 * time.Second},
+		{name: "retry after zero", attempt: 3, retryAfter: 0, set: true, want: 0},
+		{name: "retry after header", attempt: 1, retryAfter: 7 * time.Second, set: true, want: 7 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := openAIImagePollBackoff(tt.attempt, tt.retryAfter, tt.set); got != tt.want {
+				t.Fatalf("openAIImagePollBackoff(%d, %s, %t) = %s, want %s", tt.attempt, tt.retryAfter, tt.set, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadOpenAIHTTPErrorPreservesRetryAfterHeader(t *testing.T) {
+	response := &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     http.Header{"Retry-After": []string{"3"}},
+		Body:       io.NopCloser(strings.NewReader("rate limited")),
+	}
+	err := readOpenAIHTTPError(response, "image conversation")
+	var upstream *protocol.UpstreamError
+	if !errors.As(err, &upstream) {
+		t.Fatalf("expected UpstreamError, got %T: %v", err, err)
+	}
+	if !upstream.HasRetryAfter || upstream.RetryAfter != 3*time.Second {
+		t.Fatalf("retry-after not preserved: %+v", upstream)
+	}
+}
+
+func TestOpenAIImagePollUsesInitialWaitBackoffAndSettleConfirmation(t *testing.T) {
+	fileID := "file_000000001234567890abcdef12345678"
+	var polls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/conversation/conversation-poll" {
+			http.NotFound(w, r)
+			return
+		}
+		switch polls.Add(1) {
+		case 1:
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+		case 2:
+			_ = json.NewEncoder(w).Encode(map[string]any{"mapping": map[string]any{}})
+		case 3, 4:
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"mapping": map[string]any{"message": map[string]any{
+					"author":   map[string]any{"role": "tool"},
+					"metadata": map[string]any{"async_task_type": "image_gen"},
+					"content":  map[string]any{"parts": []any{"file-service://" + fileID}},
+				}},
+			})
+		}
+	}))
+	defer server.Close()
+
+	client := NewOpenAIImage(server.URL, server.Client(), nil, 30*time.Second)
+	waits := []time.Duration{}
+	client.pollJitter = func() time.Duration { return 0 }
+	client.pollSleep = func(_ context.Context, wait time.Duration) error {
+		waits = append(waits, wait)
+		return nil
+	}
+	account := accounts.Account{Token: "jwt.header.payload"}
+	got, err := client.pollConversation(context.Background(), account, "conversation-poll")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0] != fileID {
+		t.Fatalf("unexpected image refs: %#v", got)
+	}
+	wantWaits := []time.Duration{5 * time.Second, time.Second, 5 * time.Second, 2 * time.Second}
+	if len(waits) != len(wantWaits) {
+		t.Fatalf("poll waits = %#v, want %#v", waits, wantWaits)
+	}
+	for i := range wantWaits {
+		if waits[i] != wantWaits[i] {
+			t.Fatalf("poll wait %d = %s, want %s; all waits=%#v", i, waits[i], wantWaits[i], waits)
+		}
+	}
+}
+
+func TestOpenAIImagePollStillConsumesShortInitialBudgetBeforeFirstRequest(t *testing.T) {
+	var polls atomic.Int32
+	client := NewOpenAIImage("https://example.invalid", &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		polls.Add(1)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"mapping":{}}`)),
+			Request:    request,
+		}, nil
+	})}, nil, 2*time.Second)
+	waits := []time.Duration{}
+	client.pollJitter = func() time.Duration { return 0 }
+	client.pollSleep = func(_ context.Context, wait time.Duration) error {
+		waits = append(waits, wait)
+		return nil
+	}
+	_, _ = client.pollConversation(context.Background(), accounts.Account{}, "conversation-short-budget")
+	if len(waits) == 0 || waits[0] != openAIImagePollInitialWait {
+		t.Fatalf("initial wait = %#v, want %s", waits, openAIImagePollInitialWait)
+	}
+	if polls.Load() == 0 {
+		t.Fatal("poll request was never made")
 	}
 }
 

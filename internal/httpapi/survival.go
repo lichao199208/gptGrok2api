@@ -60,7 +60,10 @@ func (s *Server) executeOpenAISurvival() {
 	var wg sync.WaitGroup
 	for _, account := range items {
 		account := account
-		if strings.TrimSpace(accountToken(account)) == "" {
+		// This scheduler probes ChatGPT endpoints. Explicitly exclude Grok/XAI
+		// credentials so a GPT maintenance run cannot mark unrelated accounts as
+		// invalid merely because their tokens are not valid at chatgpt.com.
+		if !isOpenAIAccountFields(account) {
 			continue
 		}
 		wg.Add(1)
@@ -149,23 +152,30 @@ func (s *Server) survivalProbe(account map[string]any, refreshFirst bool) string
 	if token == "" {
 		return "no_token"
 	}
-	active := account
-	refreshed := false
-	if refreshFirst && !strings.EqualFold(stringValue(account["source_type"]), "chatgpt_web") && stringValue(account["refresh_token"]) != "" {
-		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-		result, err := s.openAIAccountClient().RefreshAccount(ctx, account)
-		cancel()
-		if err == nil {
-			updated, _, updateErr := s.store.RotateAccountTokens(token, result.AccessToken, result.RefreshToken, result.IDToken, result.Fields)
-			if updateErr == nil && updated != nil {
-				active = updated
-				refreshed = true
-			}
-		}
+	resolvedToken, current, generation, snapshotErr := s.store.CredentialSnapshot(token)
+	if snapshotErr != nil {
+		return "error"
 	}
-	if refreshed {
-		if status := strings.ToLower(firstNonEmpty(stringValue(active["type"]), "free")); isHealthyOpenAIPlan(status) {
-			_, _, _ = s.store.UpdateAccount(accountToken(active), map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_plan_type": status, "survival_check_error": nil})
+	active := current
+	if refreshFirst {
+		refreshAccount := openAIAccountFromFields(current)
+		if canRefreshOpenAIAccessToken(refreshAccount) {
+			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+			// Survival is a conditional maintenance path, not an explicit admin
+			// action. It must respect a recent transient-refresh backoff.
+			refreshed, err := s.ensureOpenAIAccessToken(ctx, refreshAccount)
+			cancel()
+			if err != nil {
+				status := "error"
+				if strings.Contains(strings.ToLower(err.Error()), "invalid") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
+					status = "token_dead"
+				}
+				_, _, _ = s.store.UpdateAccountIfCredentials(resolvedToken, generation, map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_check_error": safeRefreshError(err), "last_remote_checked_at": time.Now().UTC().Format(time.RFC3339), "last_remote_check_status": status, "last_remote_check_error": safeRefreshError(err)})
+				return status
+			}
+			active = refreshed.Fields
+			status := strings.ToLower(firstNonEmpty(stringValue(active["type"]), "free"))
+			_, _, _ = s.store.UpdateAccountIfCredentials(resolvedToken, generation, map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": isHealthyOpenAIPlan(status), "survival_plan_type": status, "survival_check_error": nil, "last_remote_checked_at": time.Now().UTC().Format(time.RFC3339), "last_remote_check_status": "ok", "last_remote_check_error": nil})
 			return status
 		}
 	}
@@ -177,12 +187,15 @@ func (s *Server) survivalProbe(account map[string]any, refreshFirst bool) string
 		if strings.Contains(strings.ToLower(err.Error()), "invalid") || strings.Contains(strings.ToLower(err.Error()), "unauthorized") {
 			status = "token_dead"
 		}
-		_, _, _ = s.store.UpdateAccount(accountToken(active), map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_check_error": safeRefreshError(err)})
+		_, _, _ = s.store.UpdateAccountIfCredentials(resolvedToken, generation, map[string]any{"survival_status": status, "survival_last_probe_status": status, "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_check_error": safeRefreshError(err), "last_remote_checked_at": time.Now().UTC().Format(time.RFC3339), "last_remote_check_status": status, "last_remote_check_error": safeRefreshError(err)})
 		return status
 	}
-	updated, _, updateErr := s.store.RotateAccountTokens(accountToken(active), result.AccessToken, result.RefreshToken, result.IDToken, map[string]any{"survival_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_probe_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_plan_type": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_check_error": nil})
+	updated, applied, updateErr := s.store.RotateAccountTokensIfCredentials(resolvedToken, result.AccessToken, result.RefreshToken, result.IDToken, map[string]any{"survival_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_probe_status": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_last_checked_at": time.Now().UTC().Format(time.RFC3339), "survival_alive": true, "survival_plan_type": firstNonEmpty(stringValue(result.Fields["type"]), "free"), "survival_check_error": nil, "last_remote_checked_at": time.Now().UTC().Format(time.RFC3339), "last_remote_check_status": "ok", "last_remote_check_error": nil}, generation)
 	if updateErr != nil || updated == nil {
 		return "error"
+	}
+	if !applied {
+		return firstNonEmpty(strings.ToLower(stringValue(updated["type"])), "free")
 	}
 	return firstNonEmpty(strings.ToLower(stringValue(result.Fields["type"])), "free")
 }

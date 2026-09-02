@@ -350,7 +350,7 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 
 	server := New(cfg)
 	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
-		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic"},
+		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic", "quota": 3, "image_quota_unknown": false},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -442,5 +442,261 @@ func TestOpenAIImageRequestsPersistOnlyReturnedImageCount(t *testing.T) {
 	}
 	if stored != 2 {
 		t.Fatalf("expected one persisted image per request, got %d total", stored)
+	}
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	if got := intValue(items[0]["success"]); got != 2 {
+		t.Fatalf("each completed image request must count exactly once, got success=%d: %#v", got, items[0])
+	}
+	if got := intValue(items[0]["quota"]); got != 1 {
+		t.Fatalf("each completed image request must consume one known quota, got quota=%d: %#v", got, items[0])
+	}
+}
+
+func TestOpenAIImageResolveFailureConsumesQuotaWithoutCountingSuccess(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig()
+	cfg.RootDir = root
+	cfg.DataDir = root
+	cfg.ConfigPath = filepath.Join(root, "config.json")
+	cfg.AccountsPath = filepath.Join(root, "accounts.json")
+	cfg.AuthKeysPath = filepath.Join(root, "auth_keys.json")
+	// Resolve must fail only after Generate has downloaded the image successfully.
+	// A regular file cannot be used as the media directory, so MkdirAll fails.
+	cfg.ImageDataDir = filepath.Join(root, "blocked-image-dir")
+	cfg.ChatMaxRetries = 0
+
+	server := New(cfg)
+	if err := os.WriteFile(cfg.ImageDataDir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
+		"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic", "quota": 1, "image_quota_unknown": false,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID := "file_000000001234567890abcdef12345678"
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://%s\"}]}}}\n\n", fileID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/files/" + fileID + "/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(tinyPNG)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	server.openAIImage = provider.NewOpenAIImage(upstream.URL, upstream.Client(), nil, 30*time.Second)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"一只猫","n":1,"response_format":"url"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer api-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("expected local resolve failure status %d, got %d: %s", http.StatusBadGateway, response.Code, response.Body.String())
+	}
+
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	item := items[0]
+	if got := intValue(item["success"]); got != 0 {
+		t.Fatalf("resolve failure must not count a returned image as success, got %d: %#v", got, item)
+	}
+	if got := intValue(item["fail"]); got != 0 {
+		t.Fatalf("a local delivery failure must not degrade account health, got fail=%d: %#v", got, item)
+	}
+	if got := intValue(item["quota"]); got != 0 || stringValue(item["status"]) != "限流" {
+		t.Fatalf("a completed upstream generation must consume its known quota: %#v", item)
+	}
+}
+
+func TestOpenAIImageDeliveryFailureDoesNotRetryWithAnotherAccount(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig()
+	cfg.RootDir = root
+	cfg.DataDir = root
+	cfg.ConfigPath = filepath.Join(root, "config.json")
+	cfg.AccountsPath = filepath.Join(root, "accounts.json")
+	cfg.AuthKeysPath = filepath.Join(root, "auth_keys.json")
+	cfg.ImageDataDir = filepath.Join(root, "images")
+	cfg.ChatMaxRetries = 2
+
+	server := New(cfg)
+	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{
+		{"access_token": "jwt.header.payload", "email": "a@example.test", "pool": "basic", "quota": 1, "image_quota_unknown": false},
+		{"access_token": "jwt.header.payload2", "email": "b@example.test", "pool": "basic", "quota": 1, "image_quota_unknown": false},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	fileID := "file_000000001234567890abcdef12345678"
+	var generationCalls atomic.Int32
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			generationCalls.Add(1)
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = fmt.Fprintf(w, "data: {\"conversation_id\":\"conversation-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://%s\"}]}}}\n\n", fileID)
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/conversation/conversation-1":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"conversation_id":"conversation-1","message":{"author":{"role":"tool"},"metadata":{"async_task_type":"image_gen"},"content":{"content_type":"multimodal_text","parts":[{"content_type":"image_asset_pointer","asset_pointer":"file-service://%s"}]}}}`, fileID)
+		case "/backend-api/files/download/" + fileID, "/backend-api/files/" + fileID + "/download":
+			// The upstream has acknowledged the generated asset, but its signed URL
+			// is not available yet. The provider must recover in this conversation
+			// rather than making the account-level retry loop regenerate it.
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "pending"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	server.openAIImage = provider.NewOpenAIImage(upstream.URL, upstream.Client(), nil, 20*time.Second)
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"一只猫","n":1,"response_format":"url"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer api-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadGateway {
+		t.Fatalf("expected delivery failure status %d, got %d: %s", http.StatusBadGateway, response.Code, response.Body.String())
+	}
+	if generationCalls.Load() != 1 {
+		t.Fatalf("delivery failure must not regenerate with another account, generation calls=%d", generationCalls.Load())
+	}
+
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 2 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	failed := 0
+	for _, item := range items {
+		failed += intValue(item["fail"])
+	}
+	if failed != 0 {
+		t.Fatalf("delivery failure must not degrade account health, accounts=%#v", items)
+	}
+}
+
+func TestOpenAIImageRequestRefreshesExpiringOAuthToken(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig()
+	cfg.RootDir = root
+	cfg.DataDir = root
+	cfg.ConfigPath = filepath.Join(root, "config.json")
+	cfg.AccountsPath = filepath.Join(root, "accounts.json")
+	cfg.AuthKeysPath = filepath.Join(root, "auth_keys.json")
+	cfg.ImageDataDir = filepath.Join(root, "images")
+	cfg.RequestTimeout = 30 * time.Second
+
+	var oauthCalls atomic.Int32
+	var upstream *httptest.Server
+	upstream = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oauth/token" {
+			oauthCalls.Add(1)
+			if err := r.ParseForm(); err != nil || r.Form.Get("refresh_token") != "refresh-token" {
+				t.Fatalf("unexpected OAuth refresh request: %v / %q", err, r.Form.Encode())
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "fresh-access", "refresh_token": "rotated-refresh"})
+			return
+		}
+		if r.URL.Path != "/blob" && r.Header.Get("Authorization") != "Bearer fresh-access" {
+			http.Error(w, "expired access token", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/backend-api/me":
+			_ = json.NewEncoder(w).Encode(map[string]any{"email": "oauth@example.test", "id": "oauth-user-1"})
+		case "/backend-api/conversation/init":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"limits_progress": []any{map[string]any{"feature_name": "image_gen", "remaining": 2, "reset_after": "2026-09-02T23:00:00Z"}},
+			})
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			_ = json.NewEncoder(w).Encode(map[string]any{"accounts": map[string]any{"default": map[string]any{"account": map[string]any{"plan_type": "plus"}}}})
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			_, _ = w.Write([]byte(`<html data-build="test-build"><script src="/static/app.js"></script></html>`))
+		case "/backend-api/sentinel/chat-requirements/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"prepare_token": "prepare-token"})
+		case "/backend-api/sentinel/chat-requirements/finalize":
+			_ = json.NewEncoder(w).Encode(map[string]any{"token": "requirements-token"})
+		case "/backend-api/f/conversation/prepare":
+			_ = json.NewEncoder(w).Encode(map[string]any{"conduit_token": "conduit-token"})
+		case "/backend-api/f/conversation":
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = w.Write([]byte("data: {\"conversation_id\":\"conversation-1\",\"message\":{\"author\":{\"role\":\"tool\"},\"metadata\":{\"async_task_type\":\"image_gen\"},\"content\":{\"content_type\":\"multimodal_text\",\"parts\":[{\"content_type\":\"image_asset_pointer\",\"asset_pointer\":\"file-service://file_000000001234567890abcdef12345678\"}]}}}\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+		case "/backend-api/files/file_000000001234567890abcdef12345678/download":
+			_ = json.NewEncoder(w).Encode(map[string]any{"download_url": upstream.URL + "/blob"})
+		case "/blob":
+			w.Header().Set("Content-Type", "image/png")
+			_, _ = w.Write(tinyPNG)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+	cfg.OpenAIBaseURL = upstream.URL
+	cfg.OpenAIOAuthURL = upstream.URL + "/oauth/token"
+
+	server := New(cfg)
+	expiring := "header." + base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, time.Now().Add(time.Hour).Unix()))) + ".signature"
+	if _, _, _, err := server.store.AddAccounts(nil, []map[string]any{{
+		"access_token": expiring, "refresh_token": "refresh-token", "source_type": "oauth", "pool": "basic", "quota": 2,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"gpt-image-2","prompt":"一只猫","response_format":"url"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Authorization", "Bearer api-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected successful request after automatic token refresh, got %d: %s", response.Code, response.Body.String())
+	}
+	if oauthCalls.Load() != 1 {
+		t.Fatalf("expected one OAuth refresh, got %d", oauthCalls.Load())
+	}
+	items, err := server.store.AccountList()
+	if err != nil || len(items) != 1 {
+		t.Fatalf("unexpected account list: %#v, %v", items, err)
+	}
+	if items[0]["access_token"] != "fresh-access" || items[0]["refresh_token"] != "rotated-refresh" {
+		t.Fatalf("refreshed credentials were not persisted: %#v", items[0])
 	}
 }

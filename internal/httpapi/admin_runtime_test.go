@@ -53,6 +53,59 @@ func TestRuntimeMonitorLifecycle(t *testing.T) {
 	}
 }
 
+func TestRuntimeMonitorInitializesAllMetrics(t *testing.T) {
+	server := New(adminTestConfig(t.TempDir()))
+	server.monitor.start("call-all-metrics", "/v1/images/edits", "gpt-image-2", "test")
+
+	record, ok := server.monitor.detail("call-all-metrics")
+	if !ok {
+		t.Fatal("monitor record missing")
+	}
+	for _, key := range monitorMonitorMetricKeys {
+		value, exists := record.Metrics[key]
+		if !exists {
+			t.Fatalf("metric %q was not initialized: %#v", key, record.Metrics)
+		}
+		if monitorNumber(value) != 0 {
+			t.Fatalf("metric %q should start at zero, got %v", key, value)
+		}
+	}
+
+	server.monitor.finish("call-all-metrics", "success", "gpt-image-2", "test", "")
+	summary := mapValue(server.monitorSnapshotWithHistory()["summary"])
+	p95 := mapValue(summary["metric_p95"])
+	for _, key := range monitorMonitorMetricKeys {
+		if value, exists := p95[key]; !exists || monitorNumber(value) != 0 {
+			t.Fatalf("summary metric_p95[%q] should be present at zero, got %#v", key, p95)
+		}
+	}
+}
+
+func TestShouldMonitorAllPublicV1PostRoutes(t *testing.T) {
+	server := &Server{}
+	for _, path := range []string{
+		"/v1/chat/completions",
+		"/v1/responses",
+		"/v1/messages",
+		"/v1/images/generations",
+		"/v1/images/edits",
+		"/v1/videos",
+		"/v1/search",
+		"/v1/ppt/generations",
+		"/v1/psd/generations",
+		"/v1/future-endpoint",
+		"/upimg/v1/files/image",
+	} {
+		request := httptest.NewRequest(http.MethodPost, path, nil)
+		if !server.shouldMonitorRequest(request) {
+			t.Errorf("%s should be monitored", path)
+		}
+	}
+	if server.shouldMonitorRequest(httptest.NewRequest(http.MethodGet, "/v1/models", nil)) {
+		t.Error("GET /v1/models should not be monitored")
+	}
+}
+
 func TestRequestMonitorEnrichmentUpdatesLiveEgressAndAccount(t *testing.T) {
 	server := &Server{monitor: newRuntimeMonitor()}
 	server.monitor.start("call-egress", "/v1/images/generations", "gpt-image-2", "test")
@@ -253,6 +306,73 @@ func TestDashboardRouteDisablesCaching(t *testing.T) {
 	}
 	if payload["generated_at"] == nil || mapValue(payload["accounts"])["providers"] == nil || mapValue(payload["logs"])["trend"] == nil {
 		t.Fatalf("dashboard payload is incomplete: %#v", payload)
+	}
+}
+
+func TestRunImageTaskRecordsRealtimeMonitorAndCallLog(t *testing.T) {
+	root := t.TempDir()
+	server := New(adminTestConfig(root))
+	task := &imageTaskState{
+		ID:     "task-monitor-regression",
+		Status: "queued",
+		Mode:   "generate",
+		Model:  "__monitor_invalid_model__",
+		Prompt: "monitor regression",
+		N:      1,
+		Size:   "1024x1024",
+	}
+
+	server.runImageTask(task, "Bearer admin-secret", "")
+
+	if task.Status != "error" {
+		t.Fatalf("expected task error, got %q (%s)", task.Status, task.Error)
+	}
+	record, ok := server.monitor.detail(task.ID)
+	if !ok {
+		t.Fatal("async image task was not recorded by realtime monitor")
+	}
+	if record.Endpoint != "/v1/images/generations" || record.Status != "failed" {
+		t.Fatalf("unexpected async monitor record: %#v", record)
+	}
+	if record.Error == "" || record.Duration < 0 {
+		t.Fatalf("monitor failure details missing: %#v", record)
+	}
+
+	snapshot := server.monitorSnapshotWithHistory()
+	summary := mapValue(snapshot["summary"])
+	if intValue(summary["completed"]) != 1 || intValue(summary["failed"]) != 1 {
+		t.Fatalf("async task missing from realtime summary: %#v", summary)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(server.cfg.DataDir, "logs.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), task.ID) {
+		t.Fatalf("async task was not persisted to call log: %s", raw)
+	}
+}
+
+func TestRunImageTaskUsesEditEndpointForAsyncEdits(t *testing.T) {
+	root := t.TempDir()
+	server := New(adminTestConfig(root))
+	task := &imageTaskState{
+		ID:         "task-edit-monitor-regression",
+		Status:     "queued",
+		Mode:       "edit",
+		Model:      "__monitor_invalid_model__",
+		Prompt:     "edit monitor regression",
+		N:          1,
+		Size:       "1024x1024",
+		Images:     [][]byte{[]byte("not-a-real-image")},
+		ImageNames: []string{"input.png"},
+	}
+
+	server.runImageTask(task, "Bearer admin-secret", "")
+
+	record, ok := server.monitor.detail(task.ID)
+	if !ok || record.Endpoint != "/v1/images/edits" || record.Status != "failed" {
+		t.Fatalf("unexpected async edit monitor record: %#v %v", record, ok)
 	}
 }
 

@@ -1,3 +1,0 @@
-Artifacts: docker-compose.go.yml, docker-compose.go-image.yml, README.md
-Defaults: IMAGE_GATEWAY_WORKERS=8; IMAGE_GATEWAY_MAX_BODY_MB=25
-Validation: docker compose -f docker-compose.go.yml config --quiet (exit 0)

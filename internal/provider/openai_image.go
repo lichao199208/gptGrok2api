@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -40,6 +41,8 @@ type OpenAIImage struct {
 	RequestTimeout time.Duration
 	browserMu      sync.Mutex
 	browsers       map[string]*browserHTTP
+	pollSleep      func(context.Context, time.Duration) error
+	pollJitter     func() time.Duration
 }
 
 type OpenAIImageInput struct {
@@ -92,10 +95,44 @@ func notifyOpenAIImageEgress(ctx context.Context, proxyURL string) {
 
 var errOpenAIImageDownloadURLMissing = errors.New("OpenAI image download returned no URL")
 
+// ImageDeliveryError means the upstream generation produced an asset, but the
+// local process could not deliver its bytes. It must not be treated as an
+// account-generation failure by the request retry loop.
+type ImageDeliveryError struct {
+	Err error
+}
+
+func (e *ImageDeliveryError) Error() string {
+	if e == nil || e.Err == nil {
+		return "OpenAI image delivery failed"
+	}
+	return e.Err.Error()
+}
+
+func (e *ImageDeliveryError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsImageDeliveryError(err error) bool {
+	var deliveryErr *ImageDeliveryError
+	return errors.As(err, &deliveryErr)
+}
+
 const openAIImageDefaultPollTimeout = 3 * time.Minute
 const openAIImageUploadAttemptTimeout = 60 * time.Second
 const openAIImagePollAttemptTimeout = 20 * time.Second
 const openAIImageReferenceUploadConcurrency = 3
+
+const (
+	openAIImagePollInitialWait = 5 * time.Second
+	openAIImagePollInterval    = 5 * time.Second
+	openAIImagePollSettle      = 2 * time.Second
+	openAIImagePollMaxBackoff  = 16 * time.Second
+	openAIImagePollJitterMax   = 500 * time.Millisecond
+)
 
 const (
 	openAIImageSlowUpload       = 30 * time.Second
@@ -118,6 +155,10 @@ func NewOpenAIImage(baseURL string, client *http.Client, proxy *proxyruntime.Man
 		Proxy:          proxy,
 		RequestTimeout: timeout,
 		browsers:       map[string]*browserHTTP{},
+		pollSleep:      sleepOpenAIImagePoll,
+		pollJitter: func() time.Duration {
+			return time.Duration(mathrand.Float64() * float64(openAIImagePollJitterMax))
+		},
 	}
 }
 
@@ -247,13 +288,69 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 	if len(results) > 0 {
 		notifyOpenAIImageStage(ctx, "total_ms", inputStarted)
 	}
+	// A generated file can be visible in the first conversation snapshot before
+	// its downloadable asset is committed. Follow the same conversation once
+	// more before giving the request layer a chance to switch accounts and
+	// regenerate the image.
+	if len(results) == 0 && conversationID != "" && lastDownloadErr != nil {
+		if recovered, recoveryErr := o.recoverImageDownload(ctx, account, conversationID, imageRefs, inputFileIDs); recoveryErr == nil {
+			results = recovered
+		} else {
+			lastDownloadErr = recoveryErr
+		}
+	}
 	if len(results) == 0 {
 		if lastDownloadErr != nil {
-			return nil, lastDownloadErr
+			return nil, &ImageDeliveryError{Err: lastDownloadErr}
 		}
 		return nil, fmt.Errorf("OpenAI image generation returned no downloadable files")
 	}
 	return results, nil
+}
+
+func (o *OpenAIImage) recoverImageDownload(ctx context.Context, account accounts.Account, conversationID string, initialRefs []string, inputFileIDs map[string]bool) ([]ImageResult, error) {
+	refs := append([]string(nil), initialRefs...)
+	seen := make(map[string]bool, len(refs))
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			wait := 2 * time.Second
+			if attempt > 1 {
+				wait = 4 * time.Second
+			}
+			if err := o.sleepPoll(ctx, wait); err != nil {
+				return nil, err
+			}
+			value, err := o.pollConversationOnce(ctx, account, conversationID)
+			if err == nil {
+				var polledConversationID string
+				polledRefs := []string{}
+				collectOpenAIImageRefs(value, &polledConversationID, &polledRefs)
+				refs = append(refs, polledRefs...)
+			}
+		}
+		for _, imageRef := range uniqueStrings(refs) {
+			fileID := strings.TrimPrefix(imageRef, "file-service://")
+			if imageRef == "" || seen[imageRef] || inputFileIDs[fileID] {
+				continue
+			}
+			seen[imageRef] = true
+			raw, mime, err := o.downloadImageRefWithRetry(ctx, account, conversationID, imageRef)
+			if err != nil {
+				lastErr = err
+				delete(seen, imageRef)
+				continue
+			}
+			return []ImageResult{{
+				Base64: base64.StdEncoding.EncodeToString(raw),
+				MIME:   mime,
+			}}, nil
+		}
+	}
+	if lastErr == nil {
+		lastErr = errors.New("OpenAI image recovery returned no downloadable files")
+	}
+	return nil, lastErr
 }
 
 func (o *OpenAIImage) uploadInputs(ctx context.Context, account accounts.Account, inputs []OpenAIImageInput) ([]openAIImageReference, error) {
@@ -571,6 +668,13 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 	}
 	deadline := time.Now().Add(timeout)
 	var lastErr error
+	var retryAttempt int
+	lastHitKey := ""
+	if timeout > openAIImagePollInitialWait {
+		if err := o.sleepPollUntil(ctx, deadline, openAIImagePollInitialWait, true); err != nil {
+			return nil, err
+		}
+	}
 	for time.Now().Before(deadline) {
 		value, err := o.pollConversationOnce(ctx, account, conversationID)
 		if err == nil {
@@ -578,7 +682,16 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 			ids := []string{}
 			collectOpenAIImageRefs(value, &id, &ids)
 			if len(ids) > 0 {
-				return uniqueStrings(ids), nil
+				ids = uniqueStrings(ids)
+				hitKey := strings.Join(ids, "\x00")
+				if hitKey == lastHitKey {
+					return ids, nil
+				}
+				lastHitKey = hitKey
+				if err := o.sleepPollUntil(ctx, deadline, openAIImagePollSettle, false); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			if terminal := openAIImageTerminalError(value); terminal != nil {
 				return nil, terminal
@@ -589,16 +702,19 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 		} else {
 			lastErr = err
 		}
-		wait := 5 * time.Second
-		if remaining := time.Until(deadline); remaining < wait {
-			wait = remaining
-		}
-		if wait > 0 {
-			select {
-			case <-ctx.Done():
-				return nil, fmt.Errorf("OpenAI image result polling deadline exceeded (last poll error: %s): %w", openAIImagePollErrorSummary(lastErr), ctx.Err())
-			case <-time.After(wait):
+		wait := openAIImagePollInterval
+		if err != nil {
+			if retryAfter, ok := openAIImageRetryAfter(err); ok {
+				wait = retryAfter
+			} else {
+				wait = openAIImagePollBackoff(retryAttempt, 0, false)
+				retryAttempt++
 			}
+		} else {
+			retryAttempt = 0
+		}
+		if err := o.sleepPollUntil(ctx, deadline, wait, err != nil); err != nil {
+			return nil, fmt.Errorf("OpenAI image result polling deadline exceeded (last poll error: %s): %w", openAIImagePollErrorSummary(lastErr), err)
 		}
 	}
 	message := "OpenAI image result polling timed out"
@@ -606,6 +722,67 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 		message += " (last poll error: " + openAIImagePollErrorSummary(lastErr) + ")"
 	}
 	return nil, &protocol.UpstreamError{Status: http.StatusGatewayTimeout, Message: message, Body: message}
+}
+
+func openAIImagePollBackoff(attempt int, retryAfter time.Duration, hasRetryAfter bool) time.Duration {
+	if hasRetryAfter {
+		if retryAfter < 0 {
+			return 0
+		}
+		return retryAfter
+	}
+	if attempt < 0 {
+		attempt = 0
+	}
+	if attempt >= 4 {
+		return openAIImagePollMaxBackoff
+	}
+	return time.Duration(1<<attempt) * time.Second
+}
+
+func openAIImageRetryAfter(err error) (time.Duration, bool) {
+	var upstream *protocol.UpstreamError
+	if !errors.As(err, &upstream) || !upstream.HasRetryAfter {
+		return 0, false
+	}
+	return upstream.RetryAfter, true
+}
+
+func (o *OpenAIImage) sleepPoll(ctx context.Context, wait time.Duration) error {
+	if wait <= 0 {
+		return nil
+	}
+	if o.pollSleep != nil {
+		return o.pollSleep(ctx, wait)
+	}
+	return sleepOpenAIImagePoll(ctx, wait)
+}
+
+func (o *OpenAIImage) sleepPollUntil(ctx context.Context, deadline time.Time, wait time.Duration, addJitter bool) error {
+	if remaining := time.Until(deadline); remaining < wait {
+		wait = remaining
+	}
+	if wait <= 0 {
+		return nil
+	}
+	if o.pollJitter != nil && addJitter {
+		wait += o.pollJitter()
+	}
+	if remaining := time.Until(deadline); remaining < wait {
+		wait = remaining
+	}
+	return o.sleepPoll(ctx, wait)
+}
+
+func sleepOpenAIImagePoll(ctx context.Context, wait time.Duration) error {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (o *OpenAIImage) pollConversationOnce(ctx context.Context, account accounts.Account, conversationID string) (any, error) {
@@ -939,9 +1116,11 @@ func (o *OpenAIImage) downloadFile(ctx context.Context, account accounts.Account
 			lastErr = err
 
 			// The backend can acknowledge a generated file before its signed
-			// download URL is available. Retry that transient response once,
-			// then continue with the compatibility route below.
-			if errors.Is(err, errOpenAIImageDownloadURLMissing) && attempt == 0 {
+			// download URL is available. Retry that specific transient response
+			// once. Transport errors belong to the outer proxy retry layer, while
+			// a missing preferred route should immediately use the compatibility
+			// route below.
+			if attempt == 0 && errors.Is(err, errOpenAIImageDownloadURLMissing) {
 				continue
 			}
 			if isOpenAIImageDownloadRouteFallbackError(err) {
@@ -996,14 +1175,21 @@ func (o *OpenAIImage) readImageDownloadResponse(ctx context.Context, account acc
 		if downloadURL == "" {
 			return nil, "", errOpenAIImageDownloadURLMissing
 		}
-		response, err = o.doAbsolute(ctx, http.MethodGet, downloadURL, account, nil, nil, false)
-		if err != nil {
-			return nil, "", err
+		var lastErr error
+		for attempt := 0; attempt < 2; attempt++ {
+			response, err = o.doAbsolute(ctx, http.MethodGet, downloadURL, account, nil, nil, false)
+			if err == nil {
+				raw, err = io.ReadAll(io.LimitReader(response.Body, 64<<20))
+				_ = response.Body.Close()
+				if err == nil && len(raw) > 0 {
+					lastErr = nil
+					break
+				}
+			}
+			lastErr = err
 		}
-		raw, err = io.ReadAll(io.LimitReader(response.Body, 64<<20))
-		_ = response.Body.Close()
-		if err != nil {
-			return nil, "", err
+		if lastErr != nil {
+			return nil, "", lastErr
 		}
 	}
 	if len(raw) == 0 {
@@ -1160,7 +1346,14 @@ func readOpenAIHTTPError(response *http.Response, target string) error {
 	if message == "" {
 		message = fmt.Sprintf("OpenAI endpoint %s returned HTTP %d", target, response.StatusCode)
 	}
-	return &protocol.UpstreamError{Status: response.StatusCode, Message: message, Body: message}
+	upstreamErr := &protocol.UpstreamError{Status: response.StatusCode, Message: message, Body: message}
+	if rawRetryAfter := strings.TrimSpace(response.Header.Get("Retry-After")); rawRetryAfter != "" {
+		if seconds, err := strconv.Atoi(rawRetryAfter); err == nil && seconds >= 0 {
+			upstreamErr.RetryAfter = time.Duration(seconds) * time.Second
+			upstreamErr.HasRetryAfter = true
+		}
+	}
+	return upstreamErr
 }
 
 func scanOpenAISSE(reader io.Reader, onPayload func([]byte) bool) error {

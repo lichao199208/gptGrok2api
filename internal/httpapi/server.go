@@ -73,6 +73,8 @@ type Server struct {
 	external           *externalManager
 	refreshMu          sync.RWMutex
 	refreshProgress    map[string]*accountRefreshProgress
+	tokenRefreshMu     sync.Mutex
+	tokenRefreshes     map[string]*accessTokenRefreshCall
 	survivalMu         sync.RWMutex
 	survivalStatus     map[string]any
 	survivalRunning    bool
@@ -123,6 +125,7 @@ func New(cfg config.Config) *Server {
 		schedulerLeases:    map[string]map[string]any{},
 		external:           newExternalManager(cfg.DataDir),
 		refreshProgress:    map[string]*accountRefreshProgress{},
+		tokenRefreshes:     map[string]*accessTokenRefreshCall{},
 		survivalStatus:     map[string]any{"running": false, "last_started_at": "", "last_finished_at": "", "last_error": "", "last_summary": map[string]any{}, "next_run_at": ""},
 		survivalWake:       make(chan struct{}, 1),
 		probeStop:          make(chan struct{}),
@@ -442,7 +445,10 @@ func (s *Server) shouldMonitorRequest(r *http.Request) bool {
 		return false
 	}
 	path := strings.TrimRight(r.URL.Path, "/")
-	return path == "/v1/images/generations" || path == "/v1/images/edits" || path == "/v1/chat/completions"
+	// Monitor every authenticated public API POST, not just the routes known
+	// today. This keeps the four realtime panels complete when a downstream
+	// client uses a newly added /v1 endpoint or the legacy upload prefix.
+	return strings.HasPrefix(path, "/v1/") || strings.HasPrefix(path, "/upimg/v1/")
 }
 
 func (s *Server) withRequestMonitor(w http.ResponseWriter, r *http.Request, next http.Handler) {
@@ -630,7 +636,8 @@ func monitorRequestShape(r *http.Request) (string, string, any) {
 		for _, key := range imageEditReferenceFields {
 			count += len(r.MultipartForm.File[key]) + len(values[key])
 		}
-		return modelName, summary, map[string]any{"content_type": "multipart/form-data", "image_url_parts": count, "data_url_images": count, "size": firstFormValue(values, "size")}
+		n := positiveInt(firstFormValue(values, "n"), 1)
+		return modelName, summary, map[string]any{"content_type": "multipart/form-data", "image_url_parts": count, "data_url_images": count, "size": firstFormValue(values, "size"), "requested_n": n}
 	}
 	if r.Body == nil || (r.ContentLength > maxJSONBodyBytes && r.ContentLength != -1) {
 		return "", "", "application/json"
@@ -666,7 +673,11 @@ func monitorRequestShape(r *http.Request) (string, string, any) {
 		summary = summary[:180]
 	}
 	urlParts, dataURLs := imageReferenceStats(payload)
-	return modelName, summary, map[string]any{"content_type": "application/json", "image_url_parts": urlParts, "data_url_images": dataURLs, "size": stringValue(payload["size"])}
+	n := intValue(payload["n"])
+	if n < 1 {
+		n = 1
+	}
+	return modelName, summary, map[string]any{"content_type": "application/json", "image_url_parts": urlParts, "data_url_images": dataURLs, "size": stringValue(payload["size"]), "requested_n": n}
 }
 
 func imageReferenceStats(value any) (int, int) {
@@ -2034,6 +2045,15 @@ func accountStatusCategory(account map[string]any) string {
 	}
 	if status == "limited" || status == "rate_limited" || status == "cooling" || status == "backoff" || status == "限流" {
 		return "limited"
+	}
+	// A confirmed exhausted image quota is a limited state. Runtime updates
+	// normally set status to "限流" at zero, but imported/legacy records or
+	// later status updates can otherwise leave zero/negative quota as "正常".
+	// Explicitly unknown or absent quota must not be inferred as exhausted.
+	if !boolValue(account["image_quota_unknown"], false) {
+		if quota, ok := account["quota"]; ok && quota != nil && intValue(quota) <= 0 {
+			return "limited"
+		}
 	}
 	switch reason {
 	case "pro_cooldown", "video_cooldown", "lane_backoff", "lane_degraded", "image_generation_unavailable", "image_quota_exhausted", "text_pending":

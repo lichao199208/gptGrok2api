@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 )
 
 type Message struct {
@@ -47,9 +48,11 @@ type UpstreamEvent struct {
 }
 
 type UpstreamError struct {
-	Status  int
-	Message string
-	Body    string
+	Status        int
+	Message       string
+	Body          string
+	RetryAfter    time.Duration
+	HasRetryAfter bool
 }
 
 func (e *UpstreamError) Error() string {

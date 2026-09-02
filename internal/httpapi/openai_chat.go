@@ -26,7 +26,7 @@ func (s *Server) completeOpenAIChat(w http.ResponseWriter, r *http.Request, requ
 	var text, thinking string
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isOpenAIAccount)
+		lease, err := s.reserveOpenAIAccount(r.Context(), route.PoolCandidates, excluded, 0)
 		if err != nil {
 			lastErr = err
 			break
@@ -77,7 +77,7 @@ func (s *Server) streamOpenAIChat(w http.ResponseWriter, r *http.Request, reques
 	emitted := false
 	var lastErr error
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
-		lease, err := s.accountPool.ReserveMatching(r.Context(), route.PoolCandidates, excluded, isOpenAIAccount)
+		lease, err := s.reserveOpenAIAccount(r.Context(), route.PoolCandidates, excluded, 0)
 		if err != nil {
 			lastErr = err
 			break
@@ -148,6 +148,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	excluded := map[string]bool{}
 	var images []provider.ImageResult
 	var selected accounts.Account
+	var selectedLease *accounts.Lease
 	var lastErr error
 	inputStarted := time.Now()
 	inputs := make([]provider.OpenAIImageInput, 0)
@@ -172,7 +173,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	s.stageRequestMonitor(r, "image_getting_account", 35, nil)
 	for attempt := 0; attempt <= s.cfg.ChatMaxRetries; attempt++ {
 		accountStarted := time.Now()
-		lease, err := s.accountPool.ReserveMatchingLimit(r.Context(), []string{"basic", "super", "heavy"}, excluded, isOpenAIAccount, s.cfg.ImageAccountLimit)
+		lease, err := s.reserveOpenAIImageAccount(r.Context(), []string{"basic", "super", "heavy"}, excluded, s.cfg.ImageAccountLimit)
 		if err != nil {
 			lastErr = err
 			break
@@ -180,10 +181,9 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		s.enrichMonitorAccount(r, lease.Account)
 		s.stageRequestMonitor(r, "image_getting_account", 35, map[string]any{"account_wait_ms": time.Since(accountStarted).Milliseconds()})
 		images, err = s.openAIImage.Generate(imageContext, lease.Account, prompt, request.Model, size, "auto", inputs)
-		selected = lease.Account
-		s.accountPool.Release(lease)
 		if err != nil {
 			s.accountPool.Feedback(lease.Account, upstreamStatus(err), err)
+			s.accountPool.Release(lease)
 			excluded[lease.Account.Token] = true
 			lastErr = err
 			if s.shouldRetry(upstreamStatus(err), attempt) {
@@ -191,7 +191,15 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 			}
 			break
 		}
-		s.accountPool.Feedback(lease.Account, http.StatusOK, nil)
+		// Keep the lease until the image has been resolved and recorded. This
+		// ensures a newly awakened request sees the consumed quota.
+		if consumeErr := s.accountPool.RecordImageConsumption(lease.Account); consumeErr != nil {
+			s.accountPool.Release(lease)
+			lastErr = fmt.Errorf("persist consumed image quota: %w", consumeErr)
+			break
+		}
+		selected = lease.Account
+		selectedLease = lease
 		lastErr = nil
 		break
 	}
@@ -205,6 +213,7 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		item, localURL, resolveErr := s.openAIImage.Resolve(r.Context(), selected, image, "url", s.cfg.ImageDataDir, requestPublicBase(r))
 		if resolveErr != nil {
 			s.accountPool.Feedback(selected, upstreamStatus(resolveErr), resolveErr)
+			s.accountPool.Release(selectedLease)
 			writeError(w, upstreamStatus(resolveErr), resolveErr.Error(), "upstream_error")
 			return
 		}
@@ -214,8 +223,9 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 		// assistant image. Do not persist extra upstream references.
 		break
 	}
+	s.accountPool.FeedbackImageSuccess(selected)
+	s.accountPool.Release(selectedLease)
 	s.stageRequestMonitor(r, "image_download_done", 95, map[string]any{"total_ms": time.Since(started).Milliseconds()})
-	s.accountPool.Feedback(selected, http.StatusOK, nil)
 	content := strings.Join(parts, "\n")
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": newChatID(), "object": "chat.completion", "created": time.Now().Unix(), "model": request.Model,

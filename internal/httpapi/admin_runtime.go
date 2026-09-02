@@ -62,7 +62,11 @@ func (m *runtimeMonitor) start(id, endpoint, model, summary string) {
 	}
 	now := time.Now().UnixMilli()
 	m.mu.Lock()
-	m.active[id] = &monitorRecord{CallID: id, Endpoint: endpoint, Model: model, Summary: summary, Status: "running", Stage: "handler_submitted", StartedAt: now, UpdatedAt: now, Events: []map[string]any{{"event": "handler_submitted", "label": monitorStageLabel("handler_submitted"), "stage": "handler_submitted", "status": "running", "time": time.Now().UTC()}}}
+	metrics := make(map[string]any, len(monitorMonitorMetricKeys))
+	for _, key := range monitorMonitorMetricKeys {
+		metrics[key] = int64(0)
+	}
+	m.active[id] = &monitorRecord{CallID: id, Endpoint: endpoint, Model: model, Summary: summary, Status: "running", Stage: "handler_submitted", StartedAt: now, UpdatedAt: now, Metrics: metrics, Events: []map[string]any{{"event": "handler_submitted", "label": monitorStageLabel("handler_submitted"), "stage": "handler_submitted", "status": "running", "time": time.Now().UTC()}}}
 	m.mu.Unlock()
 }
 
@@ -530,9 +534,6 @@ func (s *Server) monitorSnapshotWithHistory() map[string]any {
 			continue
 		}
 		p95 := monitorPercentile(values, 0.95)
-		if p95 <= 0 {
-			continue
-		}
 		metricP95[key] = p95
 		metricLabels[key] = monitorMetricLabel(key)
 		if p95 > bottleneckValue {
@@ -774,8 +775,7 @@ func monitorPercentile(values []int64, percentile float64) int64 {
 func monitorMetricValues(items []map[string]any, key string) []int64 {
 	values := make([]int64, 0, len(items))
 	for _, item := range items {
-		value := monitorMetricValue(item, key)
-		if value > 0 {
+		if value, ok := monitorMetricValueOK(item, key); ok {
 			values = append(values, value)
 		}
 	}
@@ -791,23 +791,28 @@ func monitorMetricValuesMap(items []map[string]any, keys []string) map[string][]
 }
 
 func monitorMetricValue(item map[string]any, key string) int64 {
+	value, _ := monitorMetricValueOK(item, key)
+	return value
+}
+
+func monitorMetricValueOK(item map[string]any, key string) (int64, bool) {
 	if item == nil {
-		return 0
+		return 0, false
 	}
-	if value := monitorNumber(item[key]); value > 0 {
-		return value
+	if raw, exists := item[key]; exists {
+		return monitorNumber(raw), true
 	}
 	if metrics := mapValue(item["metrics"]); len(metrics) > 0 {
-		if value := monitorNumber(metrics[key]); value > 0 {
-			return value
+		if raw, exists := metrics[key]; exists {
+			return monitorNumber(raw), true
 		}
 	}
 	if perf := mapValue(item["perf"]); len(perf) > 0 {
-		if value := monitorNumber(perf[key]); value > 0 {
-			return value
+		if raw, exists := perf[key]; exists {
+			return monitorNumber(raw), true
 		}
 	}
-	return 0
+	return 0, false
 }
 
 func monitorCountsByField(items []map[string]any, valueFn func(map[string]any) string) map[string]any {
@@ -911,7 +916,7 @@ func (s *Server) appendCallLog(record monitorRecord, statusCode int, requestShap
 		detail["key_id"] = record.KeyID
 	}
 	if shape, ok := requestShape.(map[string]any); ok {
-		detail["request_meta"] = map[string]any{"size": shape["size"], "image_url_parts": shape["image_url_parts"], "data_url_images": shape["data_url_images"]}
+		detail["request_meta"] = map[string]any{"size": shape["size"], "image_url_parts": shape["image_url_parts"], "data_url_images": shape["data_url_images"], "requested_n": shape["requested_n"]}
 	}
 	if record.RequestMeta != nil {
 		detail["request_meta"] = record.RequestMeta

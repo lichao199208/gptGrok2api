@@ -732,6 +732,61 @@ func (s *Server) imageTaskEdits(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runImageTask(task *imageTaskState, authHeader, apiKey string) {
+	endpoint := "/v1/images/generations"
+	if task.Mode == "edit" {
+		endpoint = "/v1/images/edits"
+	}
+	requestShape := map[string]any{
+		"content_type":    "application/json",
+		"image_url_parts": 0,
+		"data_url_images": 0,
+		"size":            task.Size,
+	}
+	if task.Mode == "edit" {
+		requestShape["content_type"] = "multipart/form-data"
+		requestShape["image_url_parts"] = len(task.Images)
+		requestShape["data_url_images"] = len(task.Images)
+	}
+
+	// Async image tasks do not pass through Handler's monitoring middleware.
+	// Start the same monitor lifecycle here so they appear in realtime monitor,
+	// receive the stage/account/egress updates emitted by imageGenerations, and
+	// are persisted to logs.jsonl after completion.
+	s.monitor.start(task.ID, endpoint, task.Model, task.Prompt)
+	proxySnapshot := map[string]any{}
+	if s.proxyManager != nil {
+		proxySnapshot = s.proxyManager.Snapshot()
+	}
+	meta := map[string]any{
+		"model":         task.Model,
+		"endpoint":      endpoint,
+		"has_proxy":     boolValue(proxySnapshot["proxy_configured"], false),
+		"egress_mode":   stringValue(proxySnapshot["mode"]),
+		"request_shape": requestShape,
+	}
+	if meta["has_proxy"] == true {
+		meta["proxy_source"] = "default"
+	} else {
+		meta["proxy_source"] = "direct"
+	}
+	if s.auth != nil {
+		token := strings.TrimSpace(apiKey)
+		if token == "" {
+			parts := strings.SplitN(strings.TrimSpace(authHeader), " ", 2)
+			if len(parts) == 2 && strings.EqualFold(parts[0], "bearer") {
+				token = strings.TrimSpace(parts[1])
+			}
+		}
+		if identity, ok := s.auth.Identity(token); ok {
+			meta["key_id"] = identity.ID
+			meta["key_name"] = identity.Name
+			meta["role"] = identity.Role
+		}
+	}
+	s.monitor.enrich(task.ID, meta)
+	s.monitor.update(task.ID, "handler_started", 10, "")
+	s.monitor.enrich(task.ID, map[string]any{"metrics": map[string]any{"handler_queue_ms": 0}})
+
 	var req *http.Request
 	var target string
 	var body io.Reader
@@ -752,6 +807,7 @@ func (s *Server) runImageTask(task *imageTaskState, authHeader, apiKey string) {
 			part, err := writer.CreateFormFile("image[]", name)
 			if err != nil {
 				s.finishImageTaskError(task, err.Error())
+				s.finishImageTaskMonitor(task, http.StatusInternalServerError, nil, err.Error(), requestShape)
 				return
 			}
 			_, _ = part.Write(raw)
@@ -767,6 +823,7 @@ func (s *Server) runImageTask(task *imageTaskState, authHeader, apiKey string) {
 	}
 	parsed, _ := url.Parse(target)
 	req = &http.Request{Method: http.MethodPost, URL: parsed, Header: make(http.Header), Body: io.NopCloser(body), ContentLength: -1}
+	req = req.WithContext(context.WithValue(req.Context(), monitorCallIDKey{}, task.ID))
 	req.Header.Set("Content-Type", contentType)
 	if authHeader != "" {
 		req.Header.Set("Authorization", authHeader)
@@ -775,39 +832,78 @@ func (s *Server) runImageTask(task *imageTaskState, authHeader, apiKey string) {
 		req.Header.Set("X-API-Key", apiKey)
 	}
 	recorder := &responseCapture{header: make(http.Header)}
-	s.imageGenerations(recorder, req)
-	s.imageTaskMu.Lock()
-	defer s.imageTaskMu.Unlock()
-	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	if recorder.status >= 200 && recorder.status < 300 {
+	if task.Mode == "edit" {
+		s.imageEdits(recorder, req)
+	} else {
+		s.imageGenerations(recorder, req)
+	}
+	statusCode := recorder.status
+	if statusCode == 0 {
+		statusCode = http.StatusOK
+	}
+	monitorError := ""
+	if statusCode >= 400 {
+		monitorError = monitorResponseErrorText(recorder.body.Bytes(), statusCode)
+	}
+
+	taskStatus := "success"
+	taskError := ""
+	var taskData []map[string]any
+	if statusCode >= 200 && statusCode < 300 {
 		var result map[string]any
 		if json.Unmarshal(recorder.body.Bytes(), &result) == nil {
 			if data, ok := result["data"].([]any); ok {
 				for _, value := range data {
 					if item, ok := value.(map[string]any); ok {
-						task.Data = append(task.Data, item)
+						taskData = append(taskData, item)
 					}
 				}
 			}
-			task.Status = "success"
 		} else {
-			task.Status = "error"
-			task.Error = "invalid image response"
+			taskStatus = "error"
+			taskError = "invalid image response"
 		}
 	} else {
-		task.Status = "error"
+		taskStatus = "error"
 		var result map[string]any
 		if json.Unmarshal(recorder.body.Bytes(), &result) == nil {
 			if value, ok := result["error"].(map[string]any); ok {
-				task.Error = stringValue(value["message"])
+				taskError = stringValue(value["message"])
 			}
 		}
-		if task.Error == "" {
-			task.Error = strings.TrimSpace(recorder.body.String())
+		if taskError == "" {
+			taskError = strings.TrimSpace(recorder.body.String())
 		}
-		if task.Error == "" {
-			task.Error = "image generation failed"
+		if taskError == "" {
+			taskError = "image generation failed"
 		}
+	}
+	if taskStatus != "success" {
+		monitorError = firstNonEmpty(taskError, monitorError)
+	}
+
+	s.imageTaskMu.Lock()
+	task.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	task.Status = taskStatus
+	task.Error = taskError
+	if taskStatus == "success" {
+		task.Data = append(task.Data, taskData...)
+	}
+	s.imageTaskMu.Unlock()
+	s.finishImageTaskMonitor(task, statusCode, recorder.body.Bytes(), monitorError, requestShape)
+}
+
+func (s *Server) finishImageTaskMonitor(task *imageTaskState, statusCode int, responseBody []byte, errorText string, requestShape any) {
+	if task == nil {
+		return
+	}
+	status := "success"
+	if statusCode >= 400 || strings.TrimSpace(errorText) != "" {
+		status = "failed"
+	}
+	s.monitor.finish(task.ID, status, task.Model, task.Prompt, errorText)
+	if record, ok := s.monitor.detail(task.ID); ok {
+		s.appendCallLog(record, statusCode, requestShape, responseBody, errorText)
 	}
 }
 

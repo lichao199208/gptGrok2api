@@ -37,6 +37,19 @@ type Store struct {
 	accountsRevision uint64
 	accountsDirty    bool
 	accountsTimer    *time.Timer
+	// tokenAliases retains the in-process lineage for rotated OAuth access
+	// tokens. The verified reference implementation resolves an old lease
+	// through this alias chain before it records task feedback.
+	tokenAliases map[string]string
+}
+
+// CredentialGeneration identifies one concrete OAuth credential set. It
+// mirrors the reference account service: stale refresh responses/errors may
+// only update storage when all three values still match.
+type CredentialGeneration struct {
+	AccessToken        string
+	RefreshToken       string
+	LastTokenRefreshAt string
 }
 
 const accountRuntimeFlushDelay = time.Second
@@ -47,6 +60,7 @@ func New(accountsPath, authKeysPath, configPath string) *Store {
 		deletedPath:  filepath.Join(filepath.Dir(accountsPath), "deleted_accounts.json"),
 		authKeysPath: authKeysPath,
 		configPath:   configPath,
+		tokenAliases: map[string]string{},
 	}
 }
 
@@ -315,6 +329,35 @@ func (s *Store) AccountList() ([]map[string]any, error) {
 	return s.LoadAccounts()
 }
 
+// ResolveAccount returns the current account for token. A token from an
+// in-flight lease may have rotated while the request was running; aliases make
+// that lease resolve to the current persisted account rather than silently
+// losing counters or quota updates.
+func (s *Store) ResolveAccount(token string) (string, map[string]any, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return "", nil, err
+	}
+	resolved := s.resolveAccountTokenLocked(token)
+	index, ok := s.accountsIndex[resolved]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return resolved, nil, os.ErrNotExist
+	}
+	return resolved, cloneMap(s.accountsCache[index]), nil
+}
+
+// CredentialSnapshot returns the active account and the generation used for a
+// refresh attempt. Callers must use the same generation when applying the
+// outcome so an old refresh token cannot overwrite newer credentials.
+func (s *Store) CredentialSnapshot(token string) (string, map[string]any, CredentialGeneration, error) {
+	resolved, account, err := s.ResolveAccount(token)
+	if err != nil {
+		return resolved, nil, CredentialGeneration{}, err
+	}
+	return resolved, account, credentialGeneration(resolved, account), nil
+}
+
 func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, int, []map[string]any, error) {
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
@@ -344,6 +387,11 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 			skipped++
 			continue
 		}
+		if s.resolveAccountTokenLocked(token) != token {
+			// Do not recreate a former access token after an OAuth rotation.
+			skipped++
+			continue
+		}
 		if _, ok := byToken[token]; ok {
 			skipped++
 			continue
@@ -360,6 +408,10 @@ func (s *Store) AddAccounts(tokens []string, payloads []map[string]any) (int, in
 			continue
 		}
 		if deleted[tokenHash(token)] {
+			skipped++
+			continue
+		}
+		if s.resolveAccountTokenLocked(token) != token {
 			skipped++
 			continue
 		}
@@ -406,6 +458,9 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 	for _, token := range tokens {
 		if clean := normalizeToken(token); clean != "" {
 			targets[clean] = struct{}{}
+			if resolved := s.resolveAccountTokenLocked(clean); resolved != "" {
+				targets[resolved] = struct{}{}
+			}
 		}
 	}
 	for token := range targets {
@@ -425,6 +480,7 @@ func (s *Store) DeleteAccounts(tokens []string) (int, []map[string]any, error) {
 			return 0, nil, err
 		}
 		s.replaceAccountsLocked(filtered)
+		s.removeAccountTokenAliasesLocked(targets)
 		s.accountsDirty = false
 	}
 	if len(targets) > 0 {
@@ -480,19 +536,41 @@ func writeDeletedTokens(path string, deleted map[string]bool) error {
 }
 
 func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]any, []map[string]any, error) {
+	updated, items, _, err := s.updateAccount(token, updates, nil)
+	return updated, items, err
+}
+
+// UpdateAccountIfCredentials applies updates only if the account still owns
+// expected. It is the compare-and-swap counterpart used for OAuth refresh
+// errors, copied from the verified reference service's credential-generation
+// guard. A false applied result means another refresh already won the race.
+func (s *Store) UpdateAccountIfCredentials(token string, expected CredentialGeneration, updates map[string]any) (map[string]any, bool, error) {
+	updated, _, applied, err := s.updateAccount(token, updates, &expected)
+	return updated, applied, err
+}
+
+func (s *Store) updateAccount(token string, updates map[string]any, expected *CredentialGeneration) (map[string]any, []map[string]any, bool, error) {
 	s.accountsWriteMu.Lock()
 	defer s.accountsWriteMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.loadAccountsLocked(); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
-	accounts, next, ok := s.updatedAccountsLocked(token, updates)
+	resolved := s.resolveAccountTokenLocked(token)
+	index, ok := s.accountsIndex[resolved]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return nil, cloneAccountList(s.accountsCache), false, os.ErrNotExist
+	}
+	if expected != nil && credentialGeneration(resolved, s.accountsCache[index]) != *expected {
+		return cloneMap(s.accountsCache[index]), cloneAccountList(s.accountsCache), false, nil
+	}
+	accounts, next, ok := s.updatedAccountsLocked(resolved, updates)
 	if !ok {
-		return nil, cloneAccountList(s.accountsCache), os.ErrNotExist
+		return nil, cloneAccountList(s.accountsCache), false, os.ErrNotExist
 	}
 	if err := writeJSON(s.accountsPath, accounts); err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
 	}
 	s.replaceAccountsLocked(accounts)
 	s.accountsDirty = false
@@ -500,7 +578,7 @@ func (s *Store) UpdateAccount(token string, updates map[string]any) (map[string]
 	for key, value := range updates {
 		result[key] = value
 	}
-	return result, cloneAccountList(accounts), nil
+	return result, cloneAccountList(accounts), true, nil
 }
 
 // UpdateAccountRuntime updates request-derived status immediately in memory
@@ -531,31 +609,106 @@ func (s *Store) UpdateAccountRuntime(token string, updates map[string]any) (map[
 // while holding the account cache lock so concurrent task completions cannot
 // lose each other's success/failure counts.
 func (s *Store) RecordAccountRequestResult(token string, successful bool, updates map[string]any) (map[string]any, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if err := s.loadAccountsLocked(); err != nil {
-		return nil, err
-	}
-	index, ok := s.accountsIndex[strings.TrimSpace(token)]
-	if !ok || index < 0 || index >= len(s.accountsCache) {
-		return nil, os.ErrNotExist
-	}
+	updated, _, err := s.recordAccountResultIfCredentials(token, CredentialGeneration{}, successful, updates, false)
+	return updated, err
+}
 
+// RecordAccountRequestResultIfCredentials records task counters for the current
+// account, but applies health updates only if the request used the account's
+// current credential generation. This lets an in-flight old token report its
+// outcome without poisoning a newer token that replaced it meanwhile.
+func (s *Store) RecordAccountRequestResultIfCredentials(token string, expected CredentialGeneration, successful bool, updates map[string]any) (map[string]any, bool, error) {
+	return s.recordAccountResultIfCredentials(token, expected, successful, updates, false)
+}
+
+// RecordAccountImageResult records one final image outcome. It intentionally
+// does not change quota: upstream quota is consumed as soon as image generation
+// completes, which can be before the local download/resolve step succeeds.
+func (s *Store) RecordAccountImageResult(token string, successful bool, updates map[string]any) (map[string]any, error) {
+	updated, _, err := s.recordAccountResultIfCredentials(token, CredentialGeneration{}, successful, updates, false)
+	return updated, err
+}
+
+// RecordAccountImageResultIfCredentials is the image counterpart to
+// RecordAccountRequestResultIfCredentials.
+func (s *Store) RecordAccountImageResultIfCredentials(token string, expected CredentialGeneration, successful bool, updates map[string]any) (map[string]any, bool, error) {
+	return s.recordAccountResultIfCredentials(token, expected, successful, updates, false)
+}
+
+// RecordAccountImageConsumption synchronously persists image quota before the
+// lease is released. Unlike ordinary runtime counters this accounting cannot be
+// delayed: a process restart must not put an already-consumed image slot back
+// into service.
+func (s *Store) RecordAccountImageConsumption(token string, updates map[string]any) (map[string]any, error) {
+	updated, _, err := s.recordAccountMutation(token, updates, true, true, CredentialGeneration{})
+	return updated, err
+}
+
+func (s *Store) recordAccountResultIfCredentials(token string, expected CredentialGeneration, successful bool, updates map[string]any, consumeImageQuota bool) (map[string]any, bool, error) {
 	runtimeUpdates := cloneMap(updates)
 	counter := "fail"
 	if successful {
 		counter = "success"
 	}
-	runtimeUpdates[counter] = nonNegativeAccountCount(s.accountsCache[index][counter]) + 1
+	return s.recordAccountMutation(token, runtimeUpdates, consumeImageQuota, false, expected, counter)
+}
 
-	accounts, next, ok := s.updatedAccountsLocked(token, runtimeUpdates)
+func (s *Store) recordAccountMutation(token string, updates map[string]any, consumeImageQuota, persist bool, expected CredentialGeneration, counters ...string) (map[string]any, bool, error) {
+	if persist {
+		s.accountsWriteMu.Lock()
+		defer s.accountsWriteMu.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return nil, false, err
+	}
+	resolved := s.resolveAccountTokenLocked(token)
+	index, ok := s.accountsIndex[resolved]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return nil, false, os.ErrNotExist
+	}
+	credentialUpdatesApplied := expected == (CredentialGeneration{}) || credentialGeneration(resolved, s.accountsCache[index]) == expected
+
+	runtimeUpdates := map[string]any{}
+	if credentialUpdatesApplied {
+		runtimeUpdates = cloneMap(updates)
+	}
+	if len(counters) > 0 {
+		counter := counters[0]
+		if counter != "" {
+			runtimeUpdates[counter] = nonNegativeAccountCount(s.accountsCache[index][counter]) + 1
+		}
+	}
+	if consumeImageQuota && !boolValue(s.accountsCache[index]["image_quota_unknown"], false) {
+		quota := nonNegativeAccountCount(s.accountsCache[index]["quota"])
+		if quota > 0 {
+			quota--
+			runtimeUpdates["quota"] = quota
+			if quota == 0 {
+				runtimeUpdates["status"] = "限流"
+				runtimeUpdates["status_reason_code"] = "image_quota_pending_confirmation"
+				runtimeUpdates["image_quota_pending_confirmation"] = true
+			}
+		}
+	}
+
+	accounts, next, ok := s.updatedAccountsLocked(resolved, runtimeUpdates)
 	if !ok {
-		return nil, os.ErrNotExist
+		return nil, false, os.ErrNotExist
+	}
+	if persist {
+		if err := writeJSON(s.accountsPath, accounts); err != nil {
+			return nil, false, err
+		}
+		s.replaceAccountsLocked(accounts)
+		s.accountsDirty = false
+		return cloneMap(next), credentialUpdatesApplied, nil
 	}
 	s.replaceAccountsLocked(accounts)
 	s.accountsDirty = true
 	s.scheduleAccountFlushLocked(accountRuntimeFlushDelay)
-	return cloneMap(next), nil
+	return cloneMap(next), credentialUpdatesApplied, nil
 }
 
 func nonNegativeAccountCount(value any) int {
@@ -577,6 +730,19 @@ func (s *Store) FlushAccounts() error {
 // the lookup key. Keeping this operation in Store avoids a race between a
 // refresh-token rotation and another concurrent account update.
 func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken string, fields map[string]any) (map[string]any, []map[string]any, error) {
+	updated, items, _, err := s.rotateAccountTokens(oldToken, newToken, refreshToken, idToken, fields, nil)
+	return updated, items, err
+}
+
+// RotateAccountTokensIfCredentials is the credential-generation guarded form
+// of token rotation. If another request has already rotated this account, the
+// stale OAuth result is discarded and current account data is returned.
+func (s *Store) RotateAccountTokensIfCredentials(oldToken, newToken, refreshToken, idToken string, fields map[string]any, expected CredentialGeneration) (map[string]any, bool, error) {
+	updated, _, applied, err := s.rotateAccountTokens(oldToken, newToken, refreshToken, idToken, fields, &expected)
+	return updated, applied, err
+}
+
+func (s *Store) rotateAccountTokens(oldToken, newToken, refreshToken, idToken string, fields map[string]any, expected *CredentialGeneration) (map[string]any, []map[string]any, bool, error) {
 	updates := cloneMap(fields)
 	if strings.TrimSpace(newToken) != "" {
 		updates["access_token"] = strings.TrimSpace(newToken)
@@ -590,26 +756,53 @@ func (s *Store) RotateAccountTokens(oldToken, newToken, refreshToken, idToken st
 	updates["last_token_refresh_at"] = time.Now().UTC().Format(time.RFC3339)
 	updates["last_token_refresh_error"] = nil
 	updates["last_token_refresh_error_at"] = nil
+	updates["next_token_refresh_at"] = nil
+	updates["image_quota_pending_confirmation"] = nil
 	updates["invalid_count"] = 0
 	updates["cooldown_until"] = nil
 	updates["next_retry_at"] = nil
-	// A successful remote refresh supersedes every error marker left by an
-	// earlier refresh or request attempt. Keeping any of these fields makes the
-	// admin status endpoint classify an otherwise healthy account as abnormal.
 	for _, key := range []string{
-		"last_refresh_error",
-		"last_refresh_error_at",
-		"last_refresh_warning",
-		"last_refresh_warning_at",
-		"last_error_kind",
-		"last_error_status",
-		"last_error_message",
-		"last_error_at",
-		"status_reason_code",
+		"last_refresh_error", "last_refresh_error_at", "last_refresh_warning",
+		"last_refresh_warning_at", "last_error_kind", "last_error_status",
+		"last_error_message", "last_error_at", "status_reason_code",
 	} {
 		updates[key] = nil
 	}
-	return s.UpdateAccount(oldToken, updates)
+
+	s.accountsWriteMu.Lock()
+	defer s.accountsWriteMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if err := s.loadAccountsLocked(); err != nil {
+		return nil, nil, false, err
+	}
+	resolved := s.resolveAccountTokenLocked(oldToken)
+	index, ok := s.accountsIndex[resolved]
+	if !ok || index < 0 || index >= len(s.accountsCache) {
+		return nil, cloneAccountList(s.accountsCache), false, os.ErrNotExist
+	}
+	if expected != nil && credentialGeneration(resolved, s.accountsCache[index]) != *expected {
+		return cloneMap(s.accountsCache[index]), cloneAccountList(s.accountsCache), false, nil
+	}
+	aliasSources := s.tokenAliasSourcesLocked(resolved)
+	accounts, next, ok := s.updatedAccountsLocked(resolved, updates)
+	if !ok {
+		return nil, cloneAccountList(s.accountsCache), false, os.ErrNotExist
+	}
+	if err := writeJSON(s.accountsPath, accounts); err != nil {
+		return nil, nil, false, err
+	}
+	s.replaceAccountsLocked(accounts)
+	activeToken := accountToken(next)
+	if activeToken != "" && activeToken != resolved {
+		s.moveAccountTokenAliasesLocked(activeToken, aliasSources)
+	}
+	s.accountsDirty = false
+	result := cloneMap(next)
+	for key, value := range updates {
+		result[key] = value
+	}
+	return result, cloneAccountList(accounts), true, nil
 }
 
 func (s *Store) loadAccountsLocked() error {
@@ -632,9 +825,119 @@ func (s *Store) replaceAccountsLocked(items []map[string]any) {
 	s.accountsIndex = accountIndex(items)
 	s.accountsLoaded = true
 	s.accountsRevision++
+	s.pruneTokenAliasesLocked()
+}
+
+func credentialAccessToken(token string, account map[string]any) string {
+	if active := accountToken(account); active != "" {
+		return active
+	}
+	return strings.TrimSpace(token)
+}
+
+// CredentialGenerationForAccount captures the credential generation represented
+// by an account snapshot. Pool leases retain it so stale request feedback cannot
+// modify health state after an OAuth rotation.
+func CredentialGenerationForAccount(token string, account map[string]any) CredentialGeneration {
+	return CredentialGeneration{
+		AccessToken:        credentialAccessToken(token, account),
+		RefreshToken:       strings.TrimSpace(stringValue(account["refresh_token"])),
+		LastTokenRefreshAt: strings.TrimSpace(stringValue(account["last_token_refresh_at"])),
+	}
+}
+
+func credentialGeneration(token string, account map[string]any) CredentialGeneration {
+	return CredentialGenerationForAccount(token, account)
+}
+
+func (s *Store) resolveAccountTokenLocked(token string) string {
+	current := strings.TrimSpace(token)
+	seen := map[string]struct{}{}
+	for current != "" {
+		if _, ok := s.accountsIndex[current]; ok {
+			return current
+		}
+		next, ok := s.tokenAliases[current]
+		if !ok {
+			break
+		}
+		if _, loop := seen[current]; loop {
+			break
+		}
+		seen[current] = struct{}{}
+		current = next
+	}
+	return current
+}
+
+func (s *Store) tokenAliasSourcesLocked(token string) map[string]struct{} {
+	sources := map[string]struct{}{token: {}}
+	for source := range s.tokenAliases {
+		if s.resolveAccountTokenLocked(source) == token {
+			sources[source] = struct{}{}
+		}
+	}
+	return sources
+}
+
+func (s *Store) moveAccountTokenAliasesLocked(newToken string, sources map[string]struct{}) {
+	if s.tokenAliases == nil {
+		s.tokenAliases = map[string]string{}
+	}
+	for source := range sources {
+		if source != newToken {
+			s.tokenAliases[source] = newToken
+		}
+	}
+	s.pruneTokenAliasesLocked()
+}
+
+func (s *Store) removeAccountTokenAliasesLocked(tokens map[string]struct{}) {
+	for source, target := range s.tokenAliases {
+		if _, removed := tokens[source]; removed {
+			delete(s.tokenAliases, source)
+			continue
+		}
+		if _, removed := tokens[target]; removed {
+			delete(s.tokenAliases, source)
+		}
+	}
+	s.pruneTokenAliasesLocked()
+}
+
+func (s *Store) pruneTokenAliasesLocked() {
+	if len(s.tokenAliases) == 0 {
+		return
+	}
+	compacted := make(map[string]string, len(s.tokenAliases))
+	for source := range s.tokenAliases {
+		current := source
+		seen := map[string]struct{}{}
+		for {
+			if _, ok := s.accountsIndex[current]; ok {
+				break
+			}
+			next, ok := s.tokenAliases[current]
+			if !ok {
+				current = ""
+				break
+			}
+			if _, loop := seen[current]; loop {
+				current = ""
+				break
+			}
+			seen[current] = struct{}{}
+			current = next
+		}
+		if current != "" && current != source {
+			compacted[source] = current
+		}
+	}
+	s.tokenAliases = compacted
 }
 
 func (s *Store) updatedAccountsLocked(token string, updates map[string]any) ([]map[string]any, map[string]any, bool) {
+	token = s.resolveAccountTokenLocked(token)
 	index, ok := s.accountsIndex[strings.TrimSpace(token)]
 	if !ok || index < 0 || index >= len(s.accountsCache) {
 		return nil, nil, false

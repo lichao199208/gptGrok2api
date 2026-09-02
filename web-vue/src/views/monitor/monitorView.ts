@@ -145,8 +145,9 @@ const RECORD_SIGNATURE_METRIC_KEYS = [
 ] as const
 
 export function formatMs(value: unknown) {
-  const ms = Number(value || 0)
-  if (!Number.isFinite(ms) || ms <= 0) return '-'
+  if (value === undefined || value === null || value === '') return '-'
+  const ms = Number(value)
+  if (!Number.isFinite(ms) || ms < 0) return '-'
   if (ms >= 60_000) return `${(ms / 60_000).toFixed(1)}m`
   if (ms >= 1000) return `${(ms / 1000).toFixed(1)}s`
   return `${Math.round(ms)}ms`

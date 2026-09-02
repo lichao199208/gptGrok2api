@@ -1,3 +1,0 @@
-# Deprecated: image gateway is consolidated into docker-compose.go.yml.
-# Use: docker compose -f docker-compose.go.yml up -d --build
-services: {}
