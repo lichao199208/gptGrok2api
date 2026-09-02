@@ -610,6 +610,25 @@ func TestCollectOpenAIImageRefsAcceptsSedimentPointer(t *testing.T) {
 	}
 }
 
+func TestCollectOpenAIGeneratedImageRefsIgnoresUserAsset(t *testing.T) {
+	conversationID := ""
+	refs := []string{}
+	collectOpenAIGeneratedImageRefs(map[string]any{
+		"conversation_id": "conversation-generated",
+		"user_message": map[string]any{
+			"author":        map[string]any{"role": "user"},
+			"asset_pointer": "sediment://file_reference",
+		},
+		"tool_message": map[string]any{
+			"author":        map[string]any{"role": "tool"},
+			"asset_pointer": "sediment://file_generated",
+		},
+	}, &conversationID, &refs)
+	if conversationID != "conversation-generated" || len(refs) != 1 || refs[0] != "sediment://file_generated" {
+		t.Fatalf("unexpected generated refs: conversation=%q refs=%#v", conversationID, refs)
+	}
+}
+
 func onePixelPNG(t *testing.T) []byte {
 	t.Helper()
 	var buffer bytes.Buffer
