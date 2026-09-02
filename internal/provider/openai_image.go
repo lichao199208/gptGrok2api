@@ -580,11 +580,6 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 			id := ""
 			ids := []string{}
 			collectOpenAIGeneratedImageRefs(value, &id, &ids)
-			// Keep compatibility with older upstream responses that do not attach
-			// generation metadata to the final asset.
-			if len(ids) == 0 {
-				collectOpenAIImageRefs(value, &id, &ids)
-			}
 			if len(ids) > 0 {
 				return uniqueStrings(ids), nil
 			}
@@ -1221,15 +1216,27 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 // generation metadata. Conversation responses also include the user's uploaded
 // references, which have asset pointers but no generation metadata.
 func collectOpenAIGeneratedImageRefs(value any, conversationID *string, fileIDs *[]string) {
+	collectOpenAIGeneratedImageRefsInContext(value, conversationID, fileIDs, false)
+}
+
+func collectOpenAIGeneratedImageRefsInContext(value any, conversationID *string, fileIDs *[]string, toolContext bool) {
 	switch typed := value.(type) {
 	case map[string]any:
+		authorRole := ""
+		if author, ok := typed["author"].(map[string]any); ok {
+			authorRole = stringValue(author["role"])
+		}
+		if strings.EqualFold(strings.TrimSpace(stringValue(typed["role"])), "tool") ||
+			strings.EqualFold(strings.TrimSpace(authorRole), "tool") {
+			toolContext = true
+		}
 		for key, item := range typed {
 			if strings.EqualFold(strings.TrimSpace(key), "conversation_id") && *conversationID == "" {
 				*conversationID = stringValue(item)
 			}
 		}
 		pointer := stringValue(typed["asset_pointer"])
-		if pointer != "" && hasOpenAIImageGenerationMetadata(typed["metadata"]) {
+		if pointer != "" && (toolContext || hasOpenAIImageGenerationMetadata(typed["metadata"])) {
 			if strings.HasPrefix(pointer, "file-service://") {
 				*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
 			} else if strings.HasPrefix(pointer, "sediment://") {
@@ -1237,11 +1244,11 @@ func collectOpenAIGeneratedImageRefs(value any, conversationID *string, fileIDs 
 			}
 		}
 		for _, item := range typed {
-			collectOpenAIGeneratedImageRefs(item, conversationID, fileIDs)
+			collectOpenAIGeneratedImageRefsInContext(item, conversationID, fileIDs, toolContext)
 		}
 	case []any:
 		for _, item := range typed {
-			collectOpenAIGeneratedImageRefs(item, conversationID, fileIDs)
+			collectOpenAIGeneratedImageRefsInContext(item, conversationID, fileIDs, toolContext)
 		}
 	}
 }
