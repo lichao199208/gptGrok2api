@@ -220,7 +220,12 @@ func (o *OpenAIImage) Generate(ctx context.Context, account accounts.Account, pr
 			inputFileIDs[ref.FileID] = true
 		}
 	}
-	for _, imageRef := range imageRefs {
+	// Upstream may return the uploaded input assets together with generated
+	// assets, and some responses use different pointer forms for the same
+	// input. Generated assets are emitted after the inputs, so resolve newest
+	// references first; the input-ID filter below still removes exact echoes.
+	for index := len(imageRefs) - 1; index >= 0; index-- {
+		imageRef := imageRefs[index]
 		fileID := strings.TrimPrefix(imageRef, "file-service://")
 		// The upstream SSE/poll response can echo uploaded reference assets.
 		// Those are inputs, not generated outputs, and must never be returned or
