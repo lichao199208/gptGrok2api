@@ -17,7 +17,7 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /gptgrok2api ./cmd/gptgrok2api
 
-FROM alpine:3.21
+FROM alpine:3.21 AS app
 RUN adduser -D -H -u 10001 app
 WORKDIR /app
 COPY --from=go-build /gptgrok2api /app/gptgrok2api

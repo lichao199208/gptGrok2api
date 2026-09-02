@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.4-go - 2026-09-02
+
++ [修复] 为 Dockerfile 最终运行阶段补充 `app` 名称，使 GitHub Actions 能正确构建并发布 GHCR 多架构镜像与 GitHub Release。
+
 ## 1.2.3-go - 2026-09-02
 
 + [修复] ChatGPT 图片下载严格按 conversation `mapping` 中的 `tool` / `assistant` 图片输出记录选择结果，忽略用户上传的参考图、普通文本文件 ID 和 SSE 输入回显，避免参考图被保存或返回为生成结果。

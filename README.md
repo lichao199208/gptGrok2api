@@ -2,7 +2,7 @@
 
 GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关，使用 Go 运行时接入 OpenAI/ChatGPT JWT 账号池、Grok SSO/OAuth 账号池和代理出口，并提供 Web 控制台、账号调度、图片存储、实时监控与日志管理。
 
-当前版本：`1.2.3-go`
+当前版本：`1.2.4-go`
 
 ## 能力
 
@@ -36,7 +36,7 @@ CHATGPT2API_AUTH_KEY=change-this-api-key
 CHATGPT2API_ADMIN_KEY=change-this-admin-key
 CHATGPT2API_GO_PORT=8000
 GO_PUBLIC_BASE_URL=http://your-server-ip:8000
-GO_VERSION=1.2.3-go
+GO_VERSION=1.2.4-go
 ~~~
 
 启动 Go 版：
@@ -189,7 +189,7 @@ curl http://127.0.0.1:8000/v1/images/edits \
 | `GO_PROXY_URL` | 空 | 默认代理 |
 | `GO_PROXY_POOL` | 空 | 逗号分隔代理池 |
 | `GO_OPENAI_BASE_URL` | `https://chatgpt.com` | ChatGPT 上游 |
-| `GO_VERSION` | `1.2.3-go` | 版本标识 |
+| `GO_VERSION` | `1.2.4-go` | 版本标识 |
 | `GO_IMAGE_RETENTION_DAYS` | `1` | 本地图片和元数据保留天数 |
 | `GO_IMAGE_CLEANUP_INTERVAL_SECONDS` | `3600` | 自动清理检查间隔，最少 60 秒 |
 
@@ -213,7 +213,7 @@ CHATGPT2API_AUTH_KEY=replace-with-a-long-random-key
 CHATGPT2API_ADMIN_KEY=replace-with-a-different-admin-key
 CHATGPT2API_GO_PORT=8000
 GO_PUBLIC_BASE_URL=https://gpt.qkmss.com
-GO_VERSION=1.2.3-go
+GO_VERSION=1.2.4-go
 ~~~
 
 更新前备份 `/opt/gpt2api-go/data`，更新后检查 `/health`、`/v1/models` 和 `/v1/files/image?id=...`。
