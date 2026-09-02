@@ -152,6 +152,13 @@ func (s *Server) completeOpenAIImageChat(w http.ResponseWriter, r *http.Request,
 	inputStarted := time.Now()
 	inputs := make([]provider.OpenAIImageInput, 0)
 	for _, message := range request.Messages {
+		// Only client-provided user messages may contribute reference images.
+		// Assistant history can contain generated image URLs; treating those as
+		// inputs causes subsequent /v1/chat/completions requests to feed the
+		// previous output back downstream as a reference image.
+		if !strings.EqualFold(strings.TrimSpace(message.Role), "user") {
+			continue
+		}
 		parsed, err := s.imageInputsFromChatContent(r.Context(), message.Content)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error(), "invalid_request_error")
