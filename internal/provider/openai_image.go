@@ -579,7 +579,12 @@ func (o *OpenAIImage) pollConversation(ctx context.Context, account accounts.Acc
 		if err == nil {
 			id := ""
 			ids := []string{}
-			collectOpenAIImageRefs(value, &id, &ids)
+			collectOpenAIGeneratedImageRefs(value, &id, &ids)
+			// Keep compatibility with older upstream responses that do not attach
+			// generation metadata to the final asset.
+			if len(ids) == 0 {
+				collectOpenAIImageRefs(value, &id, &ids)
+			}
 			if len(ids) > 0 {
 				return uniqueStrings(ids), nil
 			}
@@ -1210,6 +1215,45 @@ func collectOpenAIImageRefs(value any, conversationID *string, fileIDs *[]string
 			}
 		}
 	}
+}
+
+// collectOpenAIGeneratedImageRefs only collects asset pointers bearing image
+// generation metadata. Conversation responses also include the user's uploaded
+// references, which have asset pointers but no generation metadata.
+func collectOpenAIGeneratedImageRefs(value any, conversationID *string, fileIDs *[]string) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, item := range typed {
+			if strings.EqualFold(strings.TrimSpace(key), "conversation_id") && *conversationID == "" {
+				*conversationID = stringValue(item)
+			}
+		}
+		pointer := stringValue(typed["asset_pointer"])
+		if pointer != "" && hasOpenAIImageGenerationMetadata(typed["metadata"]) {
+			if strings.HasPrefix(pointer, "file-service://") {
+				*fileIDs = append(*fileIDs, strings.TrimPrefix(pointer, "file-service://"))
+			} else if strings.HasPrefix(pointer, "sediment://") {
+				*fileIDs = append(*fileIDs, pointer)
+			}
+		}
+		for _, item := range typed {
+			collectOpenAIGeneratedImageRefs(item, conversationID, fileIDs)
+		}
+	case []any:
+		for _, item := range typed {
+			collectOpenAIGeneratedImageRefs(item, conversationID, fileIDs)
+		}
+	}
+}
+
+func hasOpenAIImageGenerationMetadata(value any) bool {
+	metadata, ok := value.(map[string]any)
+	if !ok {
+		return false
+	}
+	_, hasGeneration := metadata["generation"]
+	_, hasDalle := metadata["dalle"]
+	return hasGeneration || hasDalle
 }
 
 func isOpenAIImageFileID(value string) bool {
