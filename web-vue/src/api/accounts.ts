@@ -352,6 +352,20 @@ function backendStatusToFrontend(item: BackendAccount): Pick<
     }
   }
 
+  // Credential failure takes precedence over a stale limited/quota marker.
+  // The backend follows the same effective-status rule as the reference
+  // service, so a record carrying both "限流" and confirmed auth failure must
+  // be rendered as invalid rather than cooling.
+  if (category === 'abnormal') {
+    return {
+      enabled: true,
+      status: 'invalid',
+      status_reason: lastRefreshError || '账号鉴权异常',
+      status_reason_code: 'account_invalid',
+      last_error_kind: 'auth_invalid',
+    }
+  }
+
   if (category === 'normal') {
     return {
       enabled: true,

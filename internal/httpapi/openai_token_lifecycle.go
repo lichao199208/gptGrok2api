@@ -215,10 +215,16 @@ func accountTokenRefreshFailureUpdates(err error) (map[string]any, int) {
 	if terminalTokenRefreshError(lower) {
 		return map[string]any{
 			"status":                      "异常",
+			"quota":                       0,
 			"status_reason_code":          "account_invalid",
 			"last_error_kind":             "auth_invalid",
 			"last_token_refresh_error":    message,
 			"last_token_refresh_error_at": now.Format(time.RFC3339),
+			"last_remote_check_status":    "token_dead",
+			"last_remote_check_error":     message,
+			"last_remote_checked_at":      now.Format(time.RFC3339),
+			"last_invalid_at":             now.Format(time.RFC3339),
+			"image_quota_unknown":         true,
 			"next_token_refresh_at":       nil,
 		}, http.StatusUnauthorized
 	}
@@ -238,6 +244,10 @@ func terminalTokenRefreshError(message string) bool {
 		"refresh_token_invalidated",
 		"refresh token has expired",
 		"refresh token is expired",
+		"access token is invalid",
+		"invalid access token",
+		"unauthorized",
+		"http 401",
 	} {
 		if strings.Contains(message, marker) {
 			return true

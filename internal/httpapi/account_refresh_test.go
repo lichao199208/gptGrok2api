@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/auucoder/gptgrok2api-go/internal/config"
+	"github.com/auucoder/gptgrok2api-go/internal/provider"
 )
 
 func TestAccountRefreshHTTPFlowPersistsRemoteFieldsAndRedactsSecrets(t *testing.T) {
@@ -248,6 +249,22 @@ func TestAccountRefreshTransientErrorKeepsAccountNormal(t *testing.T) {
 	}
 	if stringValue(items[0]["last_refresh_warning"]) == "" || stringValue(items[0]["last_refresh_error"]) != "" {
 		t.Fatalf("transient refresh error fields were not classified safely: %#v", items[0])
+	}
+}
+
+func TestAccountRefreshInvalidTokenPersistsRemoteInvalidMarkers(t *testing.T) {
+	updates := accountRefreshFailureUpdates(provider.ErrInvalidAccessToken)
+	if stringValue(updates["status"]) != "异常" {
+		t.Fatalf("invalid token must mark account abnormal: %#v", updates)
+	}
+	if stringValue(updates["last_remote_check_status"]) != "token_dead" {
+		t.Fatalf("invalid token must persist token_dead remote status: %#v", updates)
+	}
+	if stringValue(updates["last_error_kind"]) != "auth_invalid" || stringValue(updates["status_reason_code"]) != "account_invalid" {
+		t.Fatalf("invalid token markers missing: %#v", updates)
+	}
+	if _, ok := updates["last_invalid_at"]; !ok {
+		t.Fatalf("invalid token must persist last_invalid_at: %#v", updates)
 	}
 }
 

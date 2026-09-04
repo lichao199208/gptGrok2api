@@ -2040,11 +2040,28 @@ func accountStatusCategory(account map[string]any) string {
 	status := strings.ToLower(strings.TrimSpace(stringValue(account["status"])))
 	reason := strings.ToLower(strings.TrimSpace(stringValue(account["status_reason_code"])))
 	errorKind := strings.ToLower(strings.TrimSpace(stringValue(account["last_error_kind"])))
+	remoteStatus := strings.ToLower(strings.TrimSpace(firstNonEmpty(
+		stringValue(account["last_remote_check_status"]),
+		stringValue(account["last_remote_check_result"]),
+	)))
+	if reason == "auth_invalid" || reason == "account_invalid" || errorKind == "auth_invalid" ||
+		remoteStatus == "token_dead" || remoteStatus == "invalid" {
+		if !boolValue(account["enabled"], true) || status == "disabled" || status == "auto_disabled" || status == "禁用" || reason == "disabled" {
+			return "disabled"
+		}
+		return "abnormal"
+	}
 	if !boolValue(account["enabled"], true) || status == "disabled" || status == "auto_disabled" || status == "禁用" || reason == "disabled" {
 		return "disabled"
 	}
 	if status == "limited" || status == "rate_limited" || status == "cooling" || status == "backoff" || status == "限流" {
 		return "limited"
+	}
+	// Do not let stale quota or survival fields erase an explicitly persisted
+	// abnormal state. The reference service keeps the backend abnormal marker
+	// authoritative unless a successful refresh clears it.
+	if status == "abnormal" || status == "invalid" || status == "error" || status == "incomplete" || status == "异常" {
+		return "abnormal"
 	}
 	// A confirmed exhausted image quota is a limited state. Runtime updates
 	// normally set status to "限流" at zero, but imported/legacy records or
@@ -2063,12 +2080,6 @@ func accountStatusCategory(account map[string]any) string {
 	case "quota_exhausted", "media_pending", "media_generation_unavailable", "media_degraded", "lane_degraded", "text_pending":
 		return "limited"
 	case "auth_invalid", "parse_failure":
-		return "abnormal"
-	}
-	if status == "abnormal" || status == "invalid" || status == "error" || status == "incomplete" || status == "异常" {
-		if intValue(account["quota"]) > 0 || boolValue(account["survival_alive"], false) {
-			return "normal"
-		}
 		return "abnormal"
 	}
 	return "normal"

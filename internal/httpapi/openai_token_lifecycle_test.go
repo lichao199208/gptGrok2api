@@ -174,6 +174,7 @@ func TestAccountTokenRefreshFailureUpdatesClassifiesTerminalRefreshErrors(t *tes
 		"oauth refresh HTTP 400: invalid_grant",
 		"oauth refresh HTTP 400: The refresh token is invalid",
 		"oauth refresh HTTP 400: refresh token has expired",
+		"新 access token 验证失败: openai access token is invalid",
 	} {
 		updates, status := accountTokenRefreshFailureUpdates(fmt.Errorf("%s", message))
 		if status != http.StatusUnauthorized {
@@ -181,6 +182,9 @@ func TestAccountTokenRefreshFailureUpdatesClassifiesTerminalRefreshErrors(t *tes
 		}
 		if stringValue(updates["status"]) != "异常" || stringValue(updates["status_reason_code"]) != "account_invalid" {
 			t.Fatalf("%q did not produce terminal account updates: %#v", message, updates)
+		}
+		if stringValue(updates["last_remote_check_status"]) != "token_dead" {
+			t.Fatalf("%q did not persist token_dead remote status: %#v", message, updates)
 		}
 	}
 	updates, status := accountTokenRefreshFailureUpdates(fmt.Errorf("oauth refresh HTTP 503: temporarily unavailable"))

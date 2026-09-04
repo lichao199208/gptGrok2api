@@ -361,6 +361,47 @@ func TestAccountStatusCategoryTreatsKnownExhaustedQuotaAsLimited(t *testing.T) {
 	}
 }
 
+func TestAccountStatusCategoryPrioritizesConfirmedCredentialFailureOverLimit(t *testing.T) {
+	account := map[string]any{
+		"status":                   "限流",
+		"quota":                    0,
+		"image_quota_unknown":      false,
+		"last_remote_check_status": "token_dead",
+		"survival_status":          "token_dead",
+		"last_remote_check_error":  "openai access token is invalid",
+		"survival_check_error":     "openai access token is invalid",
+	}
+	if category := accountStatusCategory(account); category != "abnormal" {
+		t.Fatalf("confirmed invalid credentials must outrank exhausted quota, got %q", category)
+	}
+}
+
+func TestAccountStatusCategoryRecognizesOpenAIInvalidTokenErrorAsAbnormal(t *testing.T) {
+	account := map[string]any{
+		"status":              "限流",
+		"quota":               0,
+		"image_quota_unknown": false,
+		"last_refresh_error":  "openai access token is invalid",
+		"last_error_kind":     "auth_invalid",
+		"status_reason_code":  "account_invalid",
+		"last_error_status":   401,
+	}
+	if category := accountStatusCategory(account); category != "abnormal" {
+		t.Fatalf("invalid access token must outrank exhausted quota, got %q", category)
+	}
+}
+
+func TestAccountStatusCategoryKeepsPersistedAbnormalStatusAbnormal(t *testing.T) {
+	account := map[string]any{
+		"status":         "异常",
+		"quota":          12,
+		"survival_alive": true,
+	}
+	if category := accountStatusCategory(account); category != "abnormal" {
+		t.Fatalf("persisted abnormal status must remain abnormal, got %q", category)
+	}
+}
+
 func TestAccountStatusCategoryDoesNotTreatTransientMarkersAsAbnormal(t *testing.T) {
 	account := map[string]any{
 		"status": "正常", "quota": 7, "last_error_kind": "upstream_error",

@@ -342,12 +342,18 @@ func accountRefreshFailureUpdates(err error) map[string]any {
 		strings.Contains(lower, "invalid access token") ||
 		strings.Contains(lower, "access token invalid") {
 		return map[string]any{
-			"status":                "异常",
-			"last_refresh_error":    message,
-			"last_refresh_error_at": now,
-			"last_error_kind":       "auth_invalid",
-			"last_error_status":     401,
-			"status_reason_code":    "account_invalid",
+			"status":                   "异常",
+			"quota":                    0,
+			"last_refresh_error":       message,
+			"last_refresh_error_at":    now,
+			"last_remote_check_status": "token_dead",
+			"last_remote_check_error":  message,
+			"last_remote_checked_at":   now,
+			"last_error_kind":          "auth_invalid",
+			"last_error_status":        401,
+			"status_reason_code":       "account_invalid",
+			"last_invalid_at":          now,
+			"image_quota_unknown":      true,
 		}
 	}
 	if strings.Contains(lower, "http 429") ||
