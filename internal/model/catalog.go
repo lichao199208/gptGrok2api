@@ -57,6 +57,7 @@ func Catalog() []Spec {
 		{"grok-4.3-beta", "Grok 4.3 Beta", "xai", created, Chat, true},
 		{"grok-imagine-image-lite", "Grok Imagine Image Lite", "xai", created, Image, true},
 		{"gpt-image-2", "GPT Image 2", "openai-compatible", created, Image, true},
+		{"gpt-image-2.5", "GPT Image 2.5", "openai-compatible", created, Image | ImageEdit, true},
 		{"grok-imagine-image", "Grok Imagine Image", "xai", created, Image, true},
 		{"grok-imagine-image-pro", "Grok Imagine Image Pro", "xai", created, Image, true},
 		{"grok-imagine-image-edit", "Grok Imagine Image Edit", "xai", created, ImageEdit, true},

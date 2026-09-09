@@ -1373,8 +1373,14 @@ func isOpenAIImageFileID(value string) bool {
 }
 
 func openAIImageModel(model string) string {
-	if strings.EqualFold(strings.TrimSpace(model), "gpt-image-2") {
+	switch strings.ToLower(strings.TrimSpace(model)) {
+	case "gpt-image-2":
 		return "gpt-5-3"
+	case "gpt-image-2.5":
+		// The web endpoint expects a conversation model, not an Image API ID.
+		// Its picture_v2 tool selects the image backend available to the account.
+		// Follow the current web default instead of pinning the legacy model.
+		return "auto"
 	}
 	return strings.TrimSpace(model)
 }

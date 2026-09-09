@@ -9,7 +9,7 @@ GPTGrok2API Go 是一个自托管的 OpenAI 兼容网关。它使用 Go 运行�
 ## 能力概览
 
 - OpenAI 兼容接口：Chat Completions、Responses、Anthropic Messages、搜索、图片、视频和可编辑文件任务。
-- OpenAI 图片：<code>gpt-image-2</code> 文生图、图生图和多参考图编辑。
+- OpenAI 图片：<code>gpt-image-2.5</code>、<code>gpt-image-2</code> 文生图、图生图和多参考图编辑，使用现有 ChatGPT 网页账号池。
 - Grok：文本、Grok Imagine 图片、图片编辑、视频，以及 Console/Thinking 模型。
 - 多账号池：JWT、OAuth refresh token、Grok SSO/OAuth、账号分组、失败换号、限流冷却和并发调度。
 - 代理出口：默认代理、代理池、代理组、订阅导入、节点健康检测和图片任务专用并发限制。
@@ -118,7 +118,7 @@ Authorization: Bearer <api-key>
 | <code>POST</code> | <code>/v1/editable-file-tasks</code> | 创建 PPT/PSD 等可编辑文件任务 |
 | <code>GET</code> | <code>/files/{path}</code> | 下载可编辑文件产物 |
 
-可用模型以 <code>/v1/models</code> 返回值和账号实际权限为准。当前目录按能力分为 OpenAI GPT 文本、Grok 文本、<code>gpt-image-2</code>/Grok Imagine 图片、Grok Imagine 视频和 Grok Console/Thinking 模型，不建议在客户端硬编码完整模型清单。
+可用模型以 <code>/v1/models</code> 返回值和账号实际权限为准。当前目录按能力分为 OpenAI GPT 文本、Grok 文本、<code>gpt-image-2.5</code>/<code>gpt-image-2</code>/Grok Imagine 图片、Grok Imagine 视频和 Grok Console/Thinking 模型，不建议在客户端硬编码完整模型清单。
 
 ### 文本聊天
 
@@ -131,6 +131,14 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 
 ## 图片生成、编辑与参考图逻辑
 
+### GPT Image 2.5 网页兼容入口
+
+客户端可指定 <code>model=gpt-image-2.5</code>，继续使用已有的 ChatGPT JWT/OAuth 账号池、代理和图片存储。该模型出现在 <code>/v1/models</code>、控制台图片模型列表和图片编辑列表中，并支持下面的生成、编辑和图片聊天接口。已有 <code>gpt-image-2</code> 调用和默认值保留。
+
+<code>gpt-image-2.5</code> 是本网关的网页兼容别名：上游会话使用 <code>model=auto</code> 和 <code>picture_v2</code> 图片工具，跟随 ChatGPT 当前的图片能力，避免固定到旧的 <code>gpt-5-3</code> 会话模型。实际图片版本和额度由 ChatGPT 对账号的开放情况决定；模型出现在本网关目录中不代表账号已获授权，也不能通过这个别名强制锁定底层图片版本。
+
+[OpenAI 官方图片 API 文档](https://developers.openai.com/api/docs/guides/image-generation)中的 <code>gpt-image-2.5-sunburst</code> 与 <code>gpt-image-2.5-flare</code> 是官方 API 型号。本次网页适配未将这两个后缀注册成可单独选择的模型。
+
 ### 调用示例
 
 文生图：
@@ -139,7 +147,7 @@ curl http://127.0.0.1:3000/v1/chat/completions \
 curl http://127.0.0.1:3000/v1/images/generations \
   -H 'Authorization: Bearer your-api-key' \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gpt-image-2","prompt":"一只漂浮在太空里的猫","size":"1024x1024","n":1}'
+  -d '{"model":"gpt-image-2.5","prompt":"一只漂浮在太空里的猫","size":"1024x1024","n":1}'
 ~~~
 
 图片编辑使用 <code>multipart/form-data</code>，可以提交一张或多张 <code>image</code>：
@@ -147,12 +155,19 @@ curl http://127.0.0.1:3000/v1/images/generations \
 ~~~bash
 curl http://127.0.0.1:3000/v1/images/edits \
   -H 'Authorization: Bearer your-api-key' \
-  -F 'model=gpt-image-2' \
+  -F 'model=gpt-image-2.5' \
   -F 'prompt=保留主体，把背景改成蓝色' \
   -F 'image=@reference.png;type=image/png'
 ~~~
 
-<code>gpt-image-2</code> 也可以通过 <code>/v1/chat/completions</code> 调用。纯文本 content 是提示词；只有 <code>image_url</code>、<code>input_image</code> 或 <code>image</code> 内容块会被当作参考图输入。
+<code>gpt-image-2.5</code> 与 <code>gpt-image-2</code> 也可以通过 <code>/v1/chat/completions</code> 调用，兼容 <code>stream=true</code>。纯文本 content 是提示词；只有 <code>image_url</code>、<code>input_image</code> 或 <code>image</code> 内容块会被当作参考图输入。
+
+~~~bash
+curl http://127.0.0.1:3000/v1/chat/completions \
+  -H 'Authorization: Bearer your-api-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"gpt-image-2.5","messages":[{"role":"user","content":"画一只漂浮在太空里的猫"}],"stream":true}'
+~~~
 
 ### 结果筛选规则
 

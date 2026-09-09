@@ -17,7 +17,7 @@ func ResolveChat(id string) (ChatRoute, bool) {
 	}
 	// Keep the legacy chat-completions compatibility path for image clients,
 	// while the model remains hidden from the normal chat catalog.
-	if id == "gpt-image-2" {
+	if IsOpenAIImage(id) {
 		return ChatRoute{OpenAI: true, Image: true, PoolCandidates: []string{"basic", "super", "heavy"}}, true
 	}
 	if isOpenAIChatModel(id) {

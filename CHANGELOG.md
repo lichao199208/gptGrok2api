@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
++ [新增] <code>gpt-image-2.5</code> ChatGPT 网页兼容入口，覆盖模型目录、控制台图片选项、文生图、JSON/multipart 参考图编辑和流式/非流式图片聊天，复用现有账号池。
++ [适配] 新入口使用 <code>auto</code> 会话模型与 <code>picture_v2</code> 图片工具；旧 <code>gpt-image-2</code> 路由和默认值保留。实际底层图片版本由上游账号权限与发布情况决定。
++ [测试] 增加新旧模型路由、URL/Base64 结果、参考图上传、多图数量、图片聊天和账号池隔离的模拟上游回归测试。
+
 ## 1.2.4-go - 2026-09-02
 
 + [修复] 为 Dockerfile 最终运行阶段补充 `app` 名称，使 GitHub Actions 能正确构建并发布 GHCR 多架构镜像与 GitHub Release。
