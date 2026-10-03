@@ -32,6 +32,7 @@ flowchart LR
   Gateway[可选图片队列网关] --> Queue
   Gateway --> API
 ~~~
+跑图站:https://qkmss.com/login?ref=BDEAQH2P
 
 ## Docker 快速开始
 
